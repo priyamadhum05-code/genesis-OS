@@ -9,6 +9,33 @@ pub const PSCI_CPU_ON_64: u64 = 0xC400_0003;
 
 pub static ONLINE_CPUS: AtomicU64 = AtomicU64::new(1); // CPU 0 is online initially
 
+pub static SMP_WORK_READY: AtomicU64 = AtomicU64::new(0);
+pub static SMP_WORK_DONE: AtomicU64 = AtomicU64::new(0);
+pub static SMP_WORK_FN: AtomicU64 = AtomicU64::new(0);
+pub static SMP_WORK_ARG: AtomicU64 = AtomicU64::new(0);
+
+/// Dispatches work function `func(cpu_id, arg)` across all 4 SMP cores in parallel.
+/// Cores 1..=3 run via the secondary worker loop, while CPU 0 executes inline.
+pub fn dispatch_smp_work(func: extern "C" fn(u64, u64), arg: u64) {
+    SMP_WORK_FN.store(func as usize as u64, Ordering::Release);
+    SMP_WORK_ARG.store(arg, Ordering::Release);
+    SMP_WORK_DONE.store(0, Ordering::Release);
+    SMP_WORK_READY.fetch_add(1, Ordering::Release);
+
+    #[cfg(target_os = "uefi")]
+    unsafe {
+        core::arch::asm!("sev", options(nomem, nostack));
+    }
+
+    // CPU 0 executes its partition
+    func(0, arg);
+
+    // Wait for secondary cores (cores 1, 2, 3) to complete
+    while SMP_WORK_DONE.load(Ordering::Acquire) < 3 {
+        core::hint::spin_loop();
+    }
+}
+
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
 pub struct SecondaryBootArgs {
@@ -152,11 +179,23 @@ pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
     // 4. Atomically increment ONLINE_CPUS
     ONLINE_CPUS.fetch_add(1, Ordering::SeqCst);
 
-    // 5. Park secondary core in WFI loop
+    // 5. Wait for SMP work in WFE loop
+    let mut last_gen = 0u64;
     loop {
+        let cur_gen = SMP_WORK_READY.load(Ordering::Acquire);
+        if cur_gen != last_gen {
+            last_gen = cur_gen;
+            let fn_ptr = SMP_WORK_FN.load(Ordering::Acquire);
+            if fn_ptr != 0 {
+                let func: extern "C" fn(u64, u64) = unsafe { core::mem::transmute(fn_ptr) };
+                let arg = SMP_WORK_ARG.load(Ordering::Acquire);
+                func(cpu_id, arg);
+            }
+            SMP_WORK_DONE.fetch_add(1, Ordering::Release);
+        }
         #[cfg(target_os = "uefi")]
         unsafe {
-            core::arch::asm!("wfi", options(nomem, nostack));
+            core::arch::asm!("wfe", options(nomem, nostack));
         }
         #[cfg(not(target_os = "uefi"))]
         core::hint::spin_loop();

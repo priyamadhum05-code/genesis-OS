@@ -84,6 +84,10 @@ pub struct VirtIOBlockDevice {
     pub queue_size: u16,
     pub queue_pa: u64,
     pub queue_va: u64,
+    pub req_pa: u64,
+    pub req_va: u64,
+    pub avail_idx: u16,
+    pub last_used_idx: u16,
 }
 
 impl VirtIOBlockDevice {
@@ -106,6 +110,10 @@ impl VirtIOBlockDevice {
             queue_size: 16,
             queue_pa,
             queue_va,
+            req_pa: 0,
+            req_va: 0,
+            avail_idx: 0,
+            last_used_idx: 0,
         };
 
         let magic = dev.read32(VIRTIO_REG_MAGIC);
@@ -189,47 +197,64 @@ impl VirtIOBlockDevice {
         Ok(dev)
     }
 
-    /// Synchronously reads Sector 0 (512 bytes) from the block device.
-    /// `req_pa` / `req_va` must point to an allocated 4 KiB physical page for the request buffers.
-    pub unsafe fn read_sector_0(&self, req_pa: u64, req_va: u64) -> Result<u16, &'static str> {
+    pub fn set_req_buffer(&mut self, req_pa: u64, req_va: u64) {
+        self.req_pa = req_pa;
+        self.req_va = req_va;
+    }
+
+    /// Synchronously reads `count` consecutive 512-byte sectors starting from `lba`
+    /// into caller-provided buffer at `buf_pa` / `buf_va`.
+    pub unsafe fn read_sectors(
+        &mut self,
+        lba: u64,
+        count: u16,
+        buf_pa: u64,
+        buf_va: u64,
+    ) -> Result<(), &'static str> {
+        if self.req_va == 0 || self.req_pa == 0 {
+            return Err("Request buffer not set for VirtIOBlockDevice");
+        }
+        if count == 0 {
+            return Ok(());
+        }
+
         let q_num = self.queue_size as usize;
         let avail_offset = 16 * q_num;
-        let used_offset = if self.version == 1 { 4096 } else { 4096 };
+        let used_offset = 4096;
 
-        // Zero out request buffers
-        core::ptr::write_bytes(req_va as *mut u8, 0, 4096);
-
-        // Header at req_va + 0x000 (16 bytes)
-        let header = req_va as *mut VirtIOBlkReqHeader;
+        // Header at req_va (16 bytes)
+        let header = self.req_va as *mut VirtIOBlkReqHeader;
         (*header).type_ = VIRTIO_BLK_T_IN;
         (*header).reserved = 0;
-        (*header).sector = 0;
+        (*header).sector = lba;
 
-        // Status byte at req_va + 0x300 (1 byte, initialized to 0xFF)
-        core::ptr::write_volatile((req_va + 0x300) as *mut u8, 0xFF);
+        // Status byte at req_va + 16 (1 byte, initialized to 0xFF)
+        let status_ptr = (self.req_va + 16) as *mut u8;
+        core::ptr::write_volatile(status_ptr, 0xFF);
 
         // Populate descriptor chain at queue_va + 0x000
         let desc_table = self.queue_va as *mut VirtqDesc;
 
         // Desc 0: Header (Read by device)
         *desc_table.add(0) = VirtqDesc {
-            addr: req_pa,
+            addr: self.req_pa,
             len: 16,
             flags: VIRTQ_DESC_F_NEXT,
             next: 1,
         };
 
         // Desc 1: Data Buffer (Written by device)
+        let total_bytes = (count as u32) * 512;
         *desc_table.add(1) = VirtqDesc {
-            addr: req_pa + 0x100,
-            len: 512,
+            addr: buf_pa,
+            len: total_bytes,
             flags: VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
             next: 2,
         };
 
         // Desc 2: Status Byte (Written by device)
         *desc_table.add(2) = VirtqDesc {
-            addr: req_pa + 0x300,
+            addr: self.req_pa + 16,
             len: 1,
             flags: VIRTQ_DESC_F_WRITE,
             next: 0,
@@ -237,20 +262,22 @@ impl VirtIOBlockDevice {
 
         // Add to Available ring at queue_va + avail_offset
         let avail = (self.queue_va + avail_offset as u64) as *mut VirtqAvail<128>;
-        let cur_avail_idx = core::ptr::read_volatile(&(*avail).idx);
+        let cur_avail_idx = self.avail_idx;
         core::ptr::write_volatile(
             &mut (*avail).ring[(cur_avail_idx as usize) % q_num],
             0, // Descriptor 0 is head
         );
 
-        core::ptr::write_volatile(&mut (*avail).idx, cur_avail_idx.wrapping_add(1));
+        let new_avail_idx = cur_avail_idx.wrapping_add(1);
+        self.avail_idx = new_avail_idx;
+        core::ptr::write_volatile(&mut (*avail).idx, new_avail_idx);
 
         #[cfg(target_os = "uefi")]
         {
             for p in (0..4096).step_by(64) {
                 core::arch::asm!("dc cvac, {0}", in(reg) (self.queue_va + p), options(nomem, nostack));
-                core::arch::asm!("dc cvac, {0}", in(reg) (req_va + p), options(nomem, nostack));
             }
+            core::arch::asm!("dc cvac, {0}", in(reg) self.req_va, options(nomem, nostack));
             core::arch::asm!("dsb sy", options(nomem, nostack));
         }
 
@@ -259,12 +286,15 @@ impl VirtIOBlockDevice {
 
         // Wait for device to finish processing in Used ring at queue_va + used_offset
         let used = (self.queue_va + used_offset as u64) as *const VirtqUsed<128>;
-        let target_idx = cur_avail_idx.wrapping_add(1);
+        let target_idx = new_avail_idx;
 
         let mut spins = 0u64;
         while spins < 50_000_000 {
             #[cfg(target_os = "uefi")]
-            core::arch::asm!("dc ivac, {0}", in(reg) (self.queue_va + used_offset as u64), options(nomem, nostack));
+            {
+                core::arch::asm!("dc ivac, {0}", in(reg) (self.queue_va + used_offset as u64), options(nomem, nostack));
+                core::arch::asm!("dsb sy", options(nomem, nostack));
+            }
 
             if core::ptr::read_volatile(&(*used).idx) == target_idx {
                 break;
@@ -277,15 +307,21 @@ impl VirtIOBlockDevice {
             return Err("VirtIO request timed out");
         }
 
+        self.last_used_idx = target_idx;
+
         #[cfg(target_os = "uefi")]
         {
-            for p in (0..1024).step_by(64) {
-                core::arch::asm!("dc ivac, {0}", in(reg) (req_va + p), options(nomem, nostack));
+            for p in (0..total_bytes as u64).step_by(64) {
+                core::arch::asm!("dc ivac, {0}", in(reg) (buf_va + p), options(nomem, nostack));
             }
+            core::arch::asm!("dc ivac, {0}", in(reg) (self.req_va + 16), options(nomem, nostack));
             core::arch::asm!("dsb sy", options(nomem, nostack));
         }
 
-        let status = core::ptr::read_volatile((req_va + 0x300) as *const u8);
+        #[cfg(not(target_os = "uefi"))]
+        let _ = buf_va;
+
+        let status = core::ptr::read_volatile(status_ptr);
         if status != 0 {
             if status == 1 {
                 return Err("VirtIO request returned VIRTIO_BLK_S_IOERR (1)");
@@ -296,8 +332,19 @@ impl VirtIOBlockDevice {
             }
         }
 
-        let b510 = core::ptr::read_volatile((req_va + 0x100 + 510) as *const u8);
-        let b511 = core::ptr::read_volatile((req_va + 0x100 + 511) as *const u8);
+        Ok(())
+    }
+
+    /// Synchronously reads Sector 0 (512 bytes) from the block device.
+    /// `req_pa` / `req_va` must point to an allocated 4 KiB physical page for the request buffers.
+    pub unsafe fn read_sector_0(&mut self, req_pa: u64, req_va: u64) -> Result<u16, &'static str> {
+        self.set_req_buffer(req_pa, req_va);
+        let buf_pa = req_pa + 0x100;
+        let buf_va = req_va + 0x100;
+        self.read_sectors(0, 1, buf_pa, buf_va)?;
+
+        let b510 = core::ptr::read_volatile((buf_va + 510) as *const u8);
+        let b511 = core::ptr::read_volatile((buf_va + 511) as *const u8);
         let sig = ((b510 as u16) << 8) | (b511 as u16);
 
         Ok(sig)

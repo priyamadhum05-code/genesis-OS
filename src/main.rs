@@ -6,12 +6,14 @@ use alloc::{boxed::Box, vec::Vec};
 
 use core::{arch::asm, panic::PanicInfo, ptr, sync::atomic::{AtomicBool, AtomicU64, Ordering}};
 use genesis_stage1::{
+    ai::{scalar_matmul, smp_matmul_worker, verify_matrices, MATMUL_N},
     arch::{
-        parse_fdt_devices, psci_cpu_on, secondary_boot_stub, secondary_main,
+        dispatch_smp_work, parse_fdt_devices, psci_cpu_on, secondary_boot_stub, secondary_main,
         stage4_arm_timer_interval, stage4_arm_timer_ticks, stage4_get_ticks, stage4_init_runtime,
         stage4_vectors_va, ArmTimer, Gicv3, SecondaryBootArgs, ONLINE_CPUS,
     },
     drivers::{VirtIOBlockDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC},
+    fs::{locate_volume, FatVolume},
     memory_map,
     mm::heap::SpinLock,
     pmm::{self, PhysicalPageAllocator, ReservedRange, KERNEL_PMM_WORDS},
@@ -1035,7 +1037,14 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
                 stack_va,
                 entry_va: secondary_main as *const () as u64,
             };
-            asm!("dc cvac, {0}", "dsb sy", in(reg) args_va, options(nomem, nostack));
+            asm!(
+                "dc cvac, {0}",
+                "dc cvac, {1}",
+                "dsb sy",
+                in(reg) args_va,
+                in(reg) (args_va + 64),
+                options(nomem, nostack)
+            );
 
             let psci_res = psci_cpu_on(core_id as u64, stub_pa, args_pa);
             if psci_res < 0 {
@@ -1157,7 +1166,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         let q_va = HHDM_BASE + q_pa;
         core::ptr::write_bytes(q_va as *mut u8, 0, 8192);
 
-        let blk_dev = match VirtIOBlockDevice::init(blk_va, q_pa, q_va) {
+        let mut blk_dev = match VirtIOBlockDevice::init(blk_va, q_pa, q_va) {
             Ok(dev) => dev,
             Err(_) => {
                 serial_write(uart, b"STAGE6_VIRTIO_BLK_INIT_FAIL\r\n");
@@ -1192,6 +1201,114 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
 
         serial_write(uart, b"GENESIS: stage6 virtio-blk sector0 ok (sig=0x55aa)\r\n");
         serial_write(uart, b"GENESIS: stage6 milestone complete\r\n");
+
+        // ====================================================================
+        // Stage 7: FAT32 Filesystem, Multi-Core SMP Compute, and NEON MatMul
+        // ====================================================================
+        serial_write(uart, b"GENESIS: stage7 starting (fat32, smp compute & neon matmul)\r\n");
+
+        // 1. Mount FAT filesystem from VirtIO-Blk
+        let scratch_pa = mapper.pmm_mut().allocate_page().unwrap();
+        let scratch_va = HHDM_BASE + scratch_pa;
+
+        // Read Sector 0 to locate volume
+        if let Err(e) = blk_dev.read_sectors(0, 1, scratch_pa, scratch_va) {
+            serial_write(uart, b"STAGE7_READ_SEC0_FAIL: ");
+            serial_write(uart, e.as_bytes());
+            serial_write(uart, b"\r\n");
+            halt();
+        }
+
+        let sec0_slice = core::slice::from_raw_parts(scratch_va as *const u8, 512);
+        let vol_lba = match locate_volume(sec0_slice.try_into().unwrap()) {
+            Ok(lba) => lba,
+            Err(e) => {
+                serial_write(uart, b"STAGE7_LOCATE_VOL_FAIL: ");
+                serial_write(uart, e.as_bytes());
+                serial_write(uart, b"\r\n");
+                halt();
+            }
+        };
+
+        // Read BPB sector
+        if let Err(e) = blk_dev.read_sectors(vol_lba, 1, scratch_pa, scratch_va) {
+            serial_write(uart, b"STAGE7_READ_BPB_FAIL: ");
+            serial_write(uart, e.as_bytes());
+            serial_write(uart, b"\r\n");
+            halt();
+        }
+
+        let bpb_slice = core::slice::from_raw_parts(scratch_va as *const u8, 512);
+        let volume = match FatVolume::parse_bpb(vol_lba, bpb_slice.try_into().unwrap()) {
+            Ok(v) => v,
+            Err(e) => {
+                serial_write(uart, b"STAGE7_PARSE_BPB_FAIL: ");
+                serial_write(uart, e.as_bytes());
+                serial_write(uart, b"\r\n");
+                halt();
+            }
+        };
+
+        // 2. Read WEIGHTS.BIN into HUGEPAGE_VA
+        let file_bytes = match volume.read_file(
+            &mut blk_dev,
+            "WEIGHTS.BIN",
+            hugepage_pa,
+            HUGEPAGE_VA,
+            2 * 1024 * 1024,
+            scratch_pa,
+            scratch_va,
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                serial_write(uart, b"STAGE7_READ_FILE_FAIL: ");
+                serial_write(uart, e.as_bytes());
+                serial_write(uart, b"\r\n");
+                halt();
+            }
+        };
+
+        serial_write(uart, b"GENESIS: stage7 fat32 read ok (bytes=");
+        serial_decimal(uart, file_bytes as u64);
+        serial_write(uart, b")\r\n");
+
+        // 3. Multi-Core SMP Parallel NEON MatMul
+        let a_slice = core::slice::from_raw_parts(HUGEPAGE_VA as *const f32, MATMUL_N * MATMUL_N);
+        let b_slice = core::slice::from_raw_parts(
+            (HUGEPAGE_VA + (MATMUL_N * MATMUL_N * 4) as u64) as *const f32,
+            MATMUL_N * MATMUL_N,
+        );
+        let c_neon_slice = core::slice::from_raw_parts_mut(
+            (HUGEPAGE_VA + (MATMUL_N * MATMUL_N * 8) as u64) as *mut f32,
+            MATMUL_N * MATMUL_N,
+        );
+        let c_ref_slice = core::slice::from_raw_parts_mut(
+            (HUGEPAGE_VA + (MATMUL_N * MATMUL_N * 12) as u64) as *mut f32,
+            MATMUL_N * MATMUL_N,
+        );
+
+        // Compute scalar reference
+        scalar_matmul(a_slice, b_slice, c_ref_slice, MATMUL_N);
+
+        // Read cycle counter before parallel dispatch
+        let t0: u64;
+        let t1: u64;
+        asm!("mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
+
+        // Dispatch parallel NEON matmul across all 4 SMP cores
+        dispatch_smp_work(smp_matmul_worker, HUGEPAGE_VA);
+
+        asm!("mrs {}, cntvct_el0", out(reg) t1, options(nomem, nostack));
+        let _elapsed = t1.saturating_sub(t0);
+
+        // Verify NEON result against scalar reference
+        if !verify_matrices(c_neon_slice, c_ref_slice, MATMUL_N) {
+            serial_write(uart, b"STAGE7_MATMUL_VERIFY_FAIL\r\n");
+            halt();
+        }
+
+        serial_write(uart, b"GENESIS: stage7 smp neon matmul ok (cores=4)\r\n");
+        serial_write(uart, b"GENESIS: stage7 milestone complete\r\n");
 
         halt();
     }

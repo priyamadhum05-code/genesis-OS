@@ -55,9 +55,23 @@ impl Task {
     }
 }
 
+#[inline]
+pub fn current_cpu_id() -> usize {
+    #[cfg(target_os = "uefi")]
+    {
+        let mpidr: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
+        }
+        (mpidr & 0xFF) as usize
+    }
+    #[cfg(not(target_os = "uefi"))]
+    0
+}
+
 pub struct Scheduler {
     pub tasks: [Task; MAX_TASKS],
-    pub current: usize,
+    pub current: [usize; 4],
     pub active: bool,
     pub ticks: u64,
 }
@@ -75,7 +89,7 @@ impl Scheduler {
                 Task::empty(),
                 Task::empty(),
             ],
-            current: 0,
+            current: [0; 4],
             active: false,
             ticks: 0,
         }
@@ -89,7 +103,7 @@ pub fn init_scheduler(main_stack_top: u64) {
     sched.tasks[0].id = 0;
     sched.tasks[0].state = TaskState::Running;
     sched.tasks[0].stack_top = main_stack_top;
-    sched.current = 0;
+    sched.current = [0; 4];
     sched.active = true;
     sched.ticks = 0;
 }
@@ -184,13 +198,22 @@ pub unsafe fn restore_fp_context(ctx: &TaskFpContext) {
 }
 
 pub fn scheduler_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
+    scheduler_tick_opt(current_frame, false)
+}
+
+pub fn scheduler_tick_to_main(current_frame: *mut TrapFrame) -> *mut TrapFrame {
+    scheduler_tick_opt(current_frame, true)
+}
+
+pub fn scheduler_tick_opt(current_frame: *mut TrapFrame, force_main: bool) -> *mut TrapFrame {
     let mut sched = SCHEDULER.lock();
     if !sched.active {
         return current_frame;
     }
     sched.ticks += 1;
 
-    let cur_idx = sched.current;
+    let cpu = current_cpu_id().min(3);
+    let cur_idx = sched.current[cpu];
     sched.tasks[cur_idx].sp = current_frame as u64;
 
     #[cfg(target_os = "uefi")]
@@ -202,22 +225,35 @@ pub fn scheduler_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
         sched.tasks[cur_idx].state = TaskState::Ready;
     }
 
-    // Round-robin selection
-    let mut next_idx = cur_idx;
-    for i in 1..=MAX_TASKS {
-        let cand = (cur_idx + i) % MAX_TASKS;
-        if sched.tasks[cand].state == TaskState::Ready {
-            next_idx = cand;
-            break;
+    let next_idx = if force_main {
+        0
+    } else {
+        // Round-robin selection
+        let mut n = cur_idx;
+        for i in 1..=MAX_TASKS {
+            let cand = (cur_idx + i) % MAX_TASKS;
+            if sched.tasks[cand].state == TaskState::Ready {
+                n = cand;
+                break;
+            }
         }
-    }
+        n
+    };
 
-    sched.current = next_idx;
+    sched.current[cpu] = next_idx;
     sched.tasks[next_idx].state = TaskState::Running;
 
     #[cfg(target_os = "uefi")]
     unsafe {
         restore_fp_context(&sched.tasks[next_idx].fp_ctx);
+    }
+
+    if force_main {
+        #[cfg(target_os = "uefi")]
+        unsafe {
+            crate::arch::timer::ArmTimer::disable();
+            core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+        }
     }
 
     sched.tasks[next_idx].sp as *mut TrapFrame
@@ -226,7 +262,8 @@ pub fn scheduler_tick(current_frame: *mut TrapFrame) -> *mut TrapFrame {
 pub extern "C" fn task_exit_trampoline() -> ! {
     {
         let mut sched = SCHEDULER.lock();
-        let cur = sched.current;
+        let cpu = current_cpu_id().min(3);
+        let cur = sched.current[cpu];
         sched.tasks[cur].state = TaskState::Finished;
     }
     loop {

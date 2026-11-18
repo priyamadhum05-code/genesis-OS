@@ -82,10 +82,7 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
             }
 
             if max_ticks > 0 && count >= max_ticks {
-                unsafe {
-                    crate::arch::timer::ArmTimer::disable();
-                    core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
-                }
+                return crate::sched::scheduler_tick_to_main(frame as *mut TrapFrame);
             }
 
             return crate::sched::scheduler_tick(frame as *mut TrapFrame);

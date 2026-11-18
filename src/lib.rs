@@ -1,7 +1,9 @@
 #![no_std]
 
+pub mod ai;
 pub mod arch;
 pub mod drivers;
+pub mod fs;
 pub mod memory_map;
 pub mod mm;
 pub mod pmm;
