@@ -19,15 +19,21 @@ pub struct TrapFrame {
 
 static STAGE4_TICKS: AtomicU64 = AtomicU64::new(0);
 static STAGE4_TIMER_INTERVAL: AtomicU64 = AtomicU64::new(0);
+static STAGE4_MAX_TICKS: AtomicU64 = AtomicU64::new(5);
 static STAGE4_UART_VA: AtomicU64 = AtomicU64::new(0);
 
 pub fn stage4_init_runtime(uart_va: u64) {
     STAGE4_UART_VA.store(uart_va, Ordering::Relaxed);
 }
 
-pub fn stage4_arm_timer_interval(interval: u64) {
+pub fn stage4_arm_timer_ticks(interval: u64, max_ticks: u64) {
     STAGE4_TIMER_INTERVAL.store(interval, Ordering::Relaxed);
+    STAGE4_MAX_TICKS.store(max_ticks, Ordering::Relaxed);
     STAGE4_TICKS.store(0, Ordering::SeqCst);
+}
+
+pub fn stage4_arm_timer_interval(interval: u64) {
+    stage4_arm_timer_ticks(interval, 5);
 }
 
 pub fn stage4_get_ticks() -> u64 {
@@ -49,7 +55,7 @@ pub fn stage4_vectors_va() -> u64 {
 }
 
 #[no_mangle]
-pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) {
+pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) -> *mut TrapFrame {
     let uart = STAGE4_UART_VA.load(Ordering::Relaxed) as usize;
 
     if kind == 5 {
@@ -66,7 +72,8 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) {
             }
 
             let count = STAGE4_TICKS.fetch_add(1, Ordering::SeqCst) + 1;
-            if uart != 0 {
+            let max_ticks = STAGE4_MAX_TICKS.load(Ordering::Relaxed);
+            if uart != 0 && count <= max_ticks {
                 unsafe {
                     crate::arch::serial::serial_write(uart, b"GENESIS: timer tick ");
                     crate::arch::serial::serial_decimal(uart, count);
@@ -74,12 +81,14 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) {
                 }
             }
 
-            if count >= 5 {
+            if max_ticks > 0 && count >= max_ticks {
                 unsafe {
                     crate::arch::timer::ArmTimer::disable();
                     core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
                 }
             }
+
+            return crate::sched::scheduler_tick(frame as *mut TrapFrame);
         } else if intid < 1020 {
             // Unhandled valid IRQ: acknowledge end-of-interrupt to prevent CPU hang
             unsafe {
@@ -87,7 +96,7 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) {
             }
         }
         // INTIDs 1020..=1023 are spurious/special: do NOT write to ICC_EOIR1_EL1
-        return;
+        return frame as *mut TrapFrame;
     }
 
     // Synchronous, SError, FIQ or unexpected exception: Diagnostic dump and halt
@@ -262,6 +271,7 @@ stage4_save_and_dispatch:
     mov     x0, sp          // arg 0 = &mut TrapFrame
     // x1 is already kind   // arg 1 = kind: u64
     bl      stage4_exception_dispatch
+    mov     sp, x0          // switch to returned TrapFrame (for preemptive task switch)
 
     // Restore system registers
     ldp     x2, x3, [sp, #248]

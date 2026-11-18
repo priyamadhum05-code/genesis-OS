@@ -35,6 +35,10 @@ impl<'a, const N: usize> DynamicMapper<'a, N> {
         }
     }
 
+    pub fn pmm_mut(&mut self) -> &mut PhysicalPageAllocator<N> {
+        self.pmm
+    }
+
     /// Maps a single 4 KiB virtual page `va` to physical page `pa` with `perms`.
     /// Traverses L0->L1->L2->L3, allocating and zeroing intermediate tables via HHDM
     /// as needed, and synchronizes the CPU translation regime.

@@ -313,6 +313,48 @@ impl<const WORDS: usize> PhysicalPageAllocator<WORDS> {
         None
     }
 
+    /// Allocates `count` contiguous 4 KiB physical pages aligned to `align_pages` page boundary.
+    ///
+    /// For example, `count = 512, align_pages = 512` allocates a 2 MiB-aligned physical block.
+    pub fn allocate_aligned_pages(&mut self, count: usize, align_pages: usize) -> Option<u64> {
+        if count == 0 || align_pages == 0 || (count as u64) > self.free_pages {
+            return None;
+        }
+
+        let align_bytes = (align_pages as u64).checked_mul(EFI_PAGE_SIZE)?;
+        let first_aligned = (self.base_paddr + align_bytes - 1) & !(align_bytes - 1);
+        let mut cand_paddr = first_aligned;
+        let span_end = self.base_paddr + (self.span_pages as u64) * EFI_PAGE_SIZE;
+
+        while cand_paddr + (count as u64) * EFI_PAGE_SIZE <= span_end {
+            let start_page = ((cand_paddr - self.base_paddr) / EFI_PAGE_SIZE) as usize;
+            let mut all_free = true;
+            for i in 0..count {
+                let page_idx = start_page + i;
+                let w = page_idx / 64;
+                let b = page_idx % 64;
+                if (self.allocated_bitmap[w] & (1u64 << b)) != 0 {
+                    all_free = false;
+                    break;
+                }
+            }
+
+            if all_free {
+                for p in start_page..(start_page + count) {
+                    let pw = p / 64;
+                    let pb = p % 64;
+                    self.allocated_bitmap[pw] |= 1u64 << pb;
+                }
+                self.free_pages -= count as u64;
+                return Some(cand_paddr);
+            }
+
+            cand_paddr = cand_paddr.checked_add(align_bytes)?;
+        }
+
+        None
+    }
+
     /// Frees a previously allocated 4 KiB physical page.
     ///
     /// Validates address alignment, span bounds, usability invariant, and double-free.
@@ -597,5 +639,25 @@ mod tests {
         pmm.free_page(c).unwrap();
         pmm.free_page(d).unwrap();
         assert_eq!(pmm.free_pages(), 3);
+    }
+
+    #[test]
+    fn allocate_aligned_pages_test() {
+        let mut pmm = PhysicalPageAllocator::<16>::new(); // 1024 pages
+        let map = descriptor(CONVENTIONAL, 0x1000, 1024, PREFIX);
+        unsafe {
+            pmm.init_from_memory_map(map.as_ptr(), map.len(), PREFIX, &[])
+                .unwrap();
+        }
+
+        // Request 512 pages aligned to 512 pages (2 MiB)
+        let block = pmm.allocate_aligned_pages(512, 512).expect("should find 2 MiB aligned block");
+        assert_eq!(block % (512 * 4096), 0);
+        assert_eq!(pmm.free_pages(), 1024 - 512);
+
+        // Cannot allocate another 512 pages because only 512 pages remain and they are not aligned to 2 MiB
+        // or let's free and reallocate
+        pmm.free_contiguous_pages(block, 512).unwrap();
+        assert_eq!(pmm.free_pages(), 1024);
     }
 }

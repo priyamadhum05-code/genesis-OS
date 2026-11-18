@@ -4,14 +4,18 @@
 extern crate alloc;
 use alloc::{boxed::Box, vec::Vec};
 
-use core::{arch::asm, panic::PanicInfo, ptr};
+use core::{arch::asm, panic::PanicInfo, ptr, sync::atomic::{AtomicBool, AtomicU64, Ordering}};
 use genesis_stage1::{
     arch::{
-        parse_fdt_devices, stage4_arm_timer_interval, stage4_get_ticks, stage4_init_runtime,
-        stage4_vectors_va, ArmTimer, Gicv3,
+        parse_fdt_devices, psci_cpu_on, secondary_boot_stub, secondary_main,
+        stage4_arm_timer_interval, stage4_arm_timer_ticks, stage4_get_ticks, stage4_init_runtime,
+        stage4_vectors_va, ArmTimer, Gicv3, SecondaryBootArgs, ONLINE_CPUS,
     },
+    drivers::{VirtIOBlockDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC},
     memory_map,
+    mm::heap::SpinLock,
     pmm::{self, PhysicalPageAllocator, ReservedRange, KERNEL_PMM_WORDS},
+    sched,
     vmm::{
         get_stage3c3_layout, get_transition_layout, parse_pe_image, run_stage3c1_preflight,
         stage3c2_mmu_transition, stage3c3_jump_higher_half, stage3c3_vectors_start,
@@ -25,6 +29,68 @@ use genesis_stage1::{
 
 #[global_allocator]
 static KERNEL_HEAP: genesis_stage1::mm::LockedHeap = genesis_stage1::mm::LockedHeap::empty();
+
+static UART_LOCK: SpinLock<()> = SpinLock::new(());
+static DOT_PRODUCT_DONE: AtomicBool = AtomicBool::new(false);
+static DOT_PRODUCT_SUM: AtomicU64 = AtomicU64::new(0);
+static COUNTER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn dot_product_task(uart_va: u64) {
+    let uart = uart_va as usize;
+    let a = [1.5f64, 2.5, 3.5, 4.5];
+    let b = [2.0f64, 3.0, 4.0, 5.0];
+    let mut dot = 0.0f64;
+    for i in 0..4 {
+        dot += a[i] * b[i];
+    }
+    DOT_PRODUCT_SUM.store(dot.to_bits(), Ordering::SeqCst);
+    DOT_PRODUCT_DONE.store(true, Ordering::SeqCst);
+
+    {
+        let _guard = UART_LOCK.lock();
+        unsafe {
+            serial_write(uart, b"GENESIS: dot product worker finished\r\n");
+        }
+    }
+
+    loop {
+        #[cfg(target_os = "uefi")]
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+        #[cfg(not(target_os = "uefi"))]
+        core::hint::spin_loop();
+    }
+}
+
+extern "C" fn counter_task(uart_va: u64) {
+    let uart = uart_va as usize;
+    loop {
+        let c = COUNTER_TICKS.fetch_add(1, Ordering::SeqCst) + 1;
+        if c == 1 || c == 200_000 || c == 500_000 {
+            let _guard = UART_LOCK.lock();
+            unsafe {
+                serial_write(uart, b"GENESIS: counter task active count=");
+                serial_decimal(uart, c);
+                serial_write(uart, b"\r\n");
+            }
+        }
+        for _ in 0..50 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+extern "C" fn idle_task(_arg: u64) {
+    loop {
+        #[cfg(target_os = "uefi")]
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+        #[cfg(not(target_os = "uefi"))]
+        core::hint::spin_loop();
+    }
+}
 
 const EFI_SUCCESS: usize = 0;
 const EFI_INVALID_PARAMETER: usize = 2;
@@ -496,8 +562,53 @@ extern "C" fn kernel_entry(h: *const Handoff) -> ! {
 
         serial_write(uart, b"GENESIS: stage3c3 jumping to higher-half trampoline...\r\n");
 
+        // Relocate all PE DIR64 pointers to higher-half virtual addresses
+        apply_higher_half_relocations(KERNEL_IMAGE_PADDR, &pe);
+        asm!("dsb sy", "isb", options(nostack, preserves_flags));
+
         // Execute Stage 3C-3 Trampoline (noreturn)
         stage3c3_jump_higher_half(entry_va, stack_va, vbar_va, uart_va, handoff_va);
+    }
+}
+
+unsafe fn apply_higher_half_relocations(base_paddr: u64, pe: &genesis_stage1::vmm::ParsedPeImage) {
+    if let (Some(reloc_sec), Some(data_sec)) = (pe.find_section(b".reloc"), pe.find_section(b".data")) {
+        let reloc_ptr = (base_paddr + reloc_sec.virtual_address) as *const u8;
+        let reloc_size = reloc_sec.virtual_size as usize;
+        let delta = KERNEL_VA_BASE.wrapping_sub(base_paddr);
+
+        let data_start = data_sec.virtual_address as usize;
+        let data_end = data_start + data_sec.virtual_size as usize;
+
+        let mut p = 0usize;
+        while p + 8 <= reloc_size {
+            let page_rva = core::ptr::read_unaligned(reloc_ptr.add(p) as *const u32) as usize;
+            let block_size = core::ptr::read_unaligned(reloc_ptr.add(p + 4) as *const u32) as usize;
+            if block_size < 8 || p + block_size > reloc_size {
+                break;
+            }
+            let entry_count = (block_size - 8) / 2;
+            let entries = reloc_ptr.add(p + 8) as *const u16;
+            for i in 0..entry_count {
+                let entry = core::ptr::read_unaligned(entries.add(i));
+                let rel_type = entry >> 12;
+                let rel_off = (entry & 0xFFF) as usize;
+                let target_rva = page_rva + rel_off;
+
+                // Only mutate writable .data section entries (e.g. GOT table)
+                if rel_type == 10 && target_rva >= data_start && target_rva < data_end {
+                    let target_paddr = base_paddr + target_rva as u64;
+                    let ptr_loc = target_paddr as *mut u64;
+                    let val = core::ptr::read_volatile(ptr_loc);
+                    if val >= base_paddr && val < base_paddr + KERNEL_RESERVE_SIZE {
+                        core::ptr::write_volatile(ptr_loc, val.wrapping_add(delta));
+                        core::arch::asm!("dc cvac, {0}", in(reg) target_paddr, options(nomem, nostack));
+                    }
+                }
+            }
+            p += block_size;
+        }
+        core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
     }
 }
 
@@ -722,7 +833,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             serial_write(uart, b"\r\n");
             halt();
         }
-        if let Err(e) = mapper.map_mmio_range(GICR_VA, gicr_paddr, 32) {
+        if let Err(e) = mapper.map_mmio_range(GICR_VA, gicr_paddr, 128) {
             serial_write(uart, b"MAP_GICR_FAIL: ");
             serial_hex(uart, e.code());
             serial_write(uart, b"\r\n");
@@ -790,7 +901,13 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
 
         // 2. 2 MiB Hugepage Support in DynamicMapper
         const HUGEPAGE_VA: u64 = 0xFFFF_FFFF_A000_0000;
-        let hugepage_pa = 0x4200_0000u64; // Aligned 2 MiB physical DRAM block
+        let hugepage_pa = match mapper.pmm_mut().allocate_aligned_pages(512, 512) {
+            Some(pa) => pa,
+            None => {
+                serial_write(uart, b"STAGE5_HUGEPAGE_ALLOC_FAIL\r\n");
+                halt();
+            }
+        };
         if let Err(e) = mapper.map_l2_block(HUGEPAGE_VA, hugepage_pa, PagePermissions::kernel_data()) {
             serial_write(uart, b"STAGE5_MAP_L2_BLOCK_FAIL: ");
             serial_hex(uart, e.code());
@@ -810,7 +927,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         serial_write(uart, b"GENESIS: stage5 hugepage 2mib map ok\r\n");
 
         // 3. Dynamic Kernel Heap backed by KERNEL_PMM frames accessed via HHDM_BASE
-        let heap_paddr = match pmm.allocate_contiguous_pages(64) {
+        let heap_paddr = match mapper.pmm_mut().allocate_contiguous_pages(64) {
             Some(pa) => pa,
             None => {
                 serial_write(uart, b"STAGE5_HEAP_PMM_ALLOC_FAIL\r\n");
@@ -857,6 +974,224 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
 
         serial_write(uart, b"GENESIS: stage5 heap test ok\r\n");
         serial_write(uart, b"GENESIS: stage5 milestone complete\r\n");
+
+        // ====================================================================
+        // Stage 6: SMP (4-Core), Preemptive Scheduler, and VirtIO-Blk
+        // ====================================================================
+
+        // --------------------------------------------------------------------
+        // Stage 6A: Multi-Core SMP Bring-Up via PSCI (-smp 4)
+        // --------------------------------------------------------------------
+        serial_write(uart, b"GENESIS: stage6 smp starting bringup\r\n");
+
+        let ttbr0_val: u64;
+        let ttbr1_val: u64;
+        let tcr_val: u64;
+        let mair_val: u64;
+        let vbar_val: u64;
+        let sctlr_val: u64;
+        asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0_val, options(nomem, nostack));
+        asm!("mrs {0}, ttbr1_el1", out(reg) ttbr1_val, options(nomem, nostack));
+        asm!("mrs {0}, tcr_el1", out(reg) tcr_val, options(nomem, nostack));
+        asm!("mrs {0}, mair_el1", out(reg) mair_val, options(nomem, nostack));
+        asm!("mrs {0}, vbar_el1", out(reg) vbar_val, options(nomem, nostack));
+        asm!("mrs {0}, sctlr_el1", out(reg) sctlr_val, options(nomem, nostack));
+
+        let stub_va = secondary_boot_stub as *const () as u64;
+        let stub_pa = if stub_va >= KERNEL_VA_BASE {
+            stub_va - KERNEL_VA_BASE + 0x4800_0000
+        } else {
+            stub_va
+        };
+        asm!("dc cvac, {0}", "dsb sy", in(reg) stub_va, options(nomem, nostack));
+
+        for core_id in 1..4 {
+            let stack_pa = match mapper.pmm_mut().allocate_contiguous_pages(4) {
+                Some(pa) => pa,
+                None => {
+                    serial_write(uart, b"STAGE6_SMP_STACK_ALLOC_FAIL\r\n");
+                    halt();
+                }
+            };
+            let stack_va = HHDM_BASE + stack_pa + 16384;
+
+            let args_pa = match mapper.pmm_mut().allocate_page() {
+                Some(pa) => pa,
+                None => {
+                    serial_write(uart, b"STAGE6_SMP_ARGS_ALLOC_FAIL\r\n");
+                    halt();
+                }
+            };
+            let args_va = HHDM_BASE + args_pa;
+            let args_ptr = args_va as *mut SecondaryBootArgs;
+            *args_ptr = SecondaryBootArgs {
+                cpu_id: core_id as u64,
+                ttbr0: ttbr0_val,
+                ttbr1: ttbr1_val,
+                tcr: tcr_val & !(1 << 7), // clear EPD0 so identity mapping works during stub
+                mair: mair_val,
+                vbar: vbar_val,
+                sctlr: sctlr_val,
+                stack_va,
+                entry_va: secondary_main as *const () as u64,
+            };
+            asm!("dc cvac, {0}", "dsb sy", in(reg) args_va, options(nomem, nostack));
+
+            let psci_res = psci_cpu_on(core_id as u64, stub_pa, args_pa);
+            if psci_res < 0 {
+                serial_write(uart, b"STAGE6_PSCI_CPU_ON_FAIL: core=");
+                serial_decimal(uart, core_id as u64);
+                serial_write(uart, b" err=");
+                serial_hex(uart, psci_res as u64);
+                serial_write(uart, b"\r\n");
+                halt();
+            }
+        }
+
+        // Wait for all 4 cores to check in
+        let mut smp_spins = 0u64;
+        while ONLINE_CPUS.load(Ordering::SeqCst) < 4 && smp_spins < 50_000_000 {
+            core::hint::spin_loop();
+            smp_spins += 1;
+        }
+
+        if ONLINE_CPUS.load(Ordering::SeqCst) != 4 {
+            serial_write(uart, b"STAGE6_SMP_TIMEOUT: online=");
+            serial_decimal(uart, ONLINE_CPUS.load(Ordering::SeqCst));
+            serial_write(uart, b"\r\n");
+            halt();
+        }
+        serial_write(uart, b"GENESIS: stage6 smp online cpus=4\r\n");
+
+        // --------------------------------------------------------------------
+        // Stage 6B: Preemptive Kernel Task Scheduler
+        // --------------------------------------------------------------------
+        let current_sp: u64;
+        asm!("mov {0}, sp", out(reg) current_sp, options(nomem, nostack));
+        sched::init_scheduler(current_sp);
+
+        // Spawn 3 worker threads
+        let st1_pa = mapper.pmm_mut().allocate_contiguous_pages(4).unwrap();
+        let st1_top = HHDM_BASE + st1_pa + 16384;
+        sched::spawn_task(dot_product_task, uart as u64, st1_top).unwrap();
+
+        let st2_pa = mapper.pmm_mut().allocate_contiguous_pages(4).unwrap();
+        let st2_top = HHDM_BASE + st2_pa + 16384;
+        sched::spawn_task(counter_task, uart as u64, st2_top).unwrap();
+
+        let st3_pa = mapper.pmm_mut().allocate_contiguous_pages(4).unwrap();
+        let st3_top = HHDM_BASE + st3_pa + 16384;
+        sched::spawn_task(idle_task, 0, st3_top).unwrap();
+
+        // Arm timer for 15 ticks (10 ms interval, >= 10 ticks required)
+        let timer_freq = ArmTimer::frequency();
+        let sched_interval = timer_freq / 100; // 10 ms
+        stage4_arm_timer_ticks(sched_interval, 15);
+        ArmTimer::arm_periodic(sched_interval);
+
+        // Unmask IRQs to allow preemptive scheduling ticks
+        asm!("msr daifclr, #2", options(nomem, nostack));
+
+        // Wait for at least 12 timer ticks
+        while stage4_get_ticks() < 12 {
+            core::hint::spin_loop();
+        }
+
+        // Disable timer and mask IRQs
+        ArmTimer::disable();
+        asm!("msr daifset, #2", options(nomem, nostack));
+
+        // Verify dot-product calculation across preemptions
+        let dot_done = DOT_PRODUCT_DONE.load(Ordering::SeqCst);
+        let dot_res = f64::from_bits(DOT_PRODUCT_SUM.load(Ordering::SeqCst));
+        let counter_val = COUNTER_TICKS.load(Ordering::SeqCst);
+
+        if !dot_done || (dot_res - 47.0).abs() > 0.0001 || counter_val == 0 {
+            serial_write(uart, b"STAGE6_SCHEDULER_VERIFY_FAIL: done=");
+            serial_decimal(uart, dot_done as u64);
+            serial_write(uart, b" counter=");
+            serial_decimal(uart, counter_val);
+            serial_write(uart, b"\r\n");
+            halt();
+        }
+        serial_write(uart, b"GENESIS: stage6 scheduler ok\r\n");
+
+        // --------------------------------------------------------------------
+        // Stage 6C: VirtIO-Blk MMIO Driver (Sector Read)
+        // --------------------------------------------------------------------
+        // Map 4 pages of VirtIO MMIO slots (0x0A00_0000..0x0A00_4000)
+        const VIRTIO_MMIO_VA: u64 = 0xFFFF_FFFF_E020_0000;
+        if let Err(e) = mapper.map_mmio_range(VIRTIO_MMIO_VA, 0x0A00_0000, 4) {
+            serial_write(uart, b"STAGE6_MAP_VIRTIO_FAIL: ");
+            serial_hex(uart, e.code());
+            serial_write(uart, b"\r\n");
+            halt();
+        }
+
+        // Scan 32 MMIO slots for VirtIO Block device (DeviceID == 2)
+        let mut blk_slot_va: Option<u64> = None;
+        for i in 0..32 {
+            let slot_va = VIRTIO_MMIO_VA + (i as u64) * 0x200;
+            let magic = core::ptr::read_volatile(slot_va as *const u32);
+            let dev_id = core::ptr::read_volatile((slot_va + 8) as *const u32);
+            if magic == VIRTIO_MAGIC && dev_id == VIRTIO_DEV_BLOCK {
+                blk_slot_va = Some(slot_va);
+                break;
+            }
+        }
+
+        let blk_va = match blk_slot_va {
+            Some(va) => va,
+            None => {
+                serial_write(uart, b"STAGE6_VIRTIO_BLK_NOT_FOUND\r\n");
+                halt();
+            }
+        };
+
+        serial_write(uart, b"GENESIS: found virtio-blk at ");
+        serial_hex(uart, blk_va);
+        serial_write(uart, b"\r\n");
+
+        // Allocate 2 contiguous pages for Virtqueue 0 (legacy virtqueue used ring is at offset 4096)
+        let q_pa = mapper.pmm_mut().allocate_contiguous_pages(2).unwrap();
+        let q_va = HHDM_BASE + q_pa;
+        core::ptr::write_bytes(q_va as *mut u8, 0, 8192);
+
+        let blk_dev = match VirtIOBlockDevice::init(blk_va, q_pa, q_va) {
+            Ok(dev) => dev,
+            Err(_) => {
+                serial_write(uart, b"STAGE6_VIRTIO_BLK_INIT_FAIL\r\n");
+                halt();
+            }
+        };
+
+        serial_write(uart, b"GENESIS: virtio-blk initialized (version=");
+        serial_decimal(uart, blk_dev.version as u64);
+        serial_write(uart, b")\r\n");
+
+        // Allocate 1 page for Sector 0 request buffers
+        let req_pa = mapper.pmm_mut().allocate_page().unwrap();
+        let req_va = HHDM_BASE + req_pa;
+
+        let sig = match blk_dev.read_sector_0(req_pa, req_va) {
+            Ok(s) => s,
+            Err(e) => {
+                serial_write(uart, b"STAGE6_VIRTIO_READ_FAIL: ");
+                serial_write(uart, e.as_bytes());
+                serial_write(uart, b"\r\n");
+                halt();
+            }
+        };
+
+        if sig != 0x55AA {
+            serial_write(uart, b"STAGE6_VIRTIO_SIG_MISMATCH: ");
+            serial_hex(uart, sig as u64);
+            serial_write(uart, b"\r\n");
+            halt();
+        }
+
+        serial_write(uart, b"GENESIS: stage6 virtio-blk sector0 ok (sig=0x55aa)\r\n");
+        serial_write(uart, b"GENESIS: stage6 milestone complete\r\n");
 
         halt();
     }
