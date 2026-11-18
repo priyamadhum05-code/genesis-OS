@@ -1,0 +1,122 @@
+//! ARM Generic Interrupt Controller v3 (GICv3) Driver.
+
+#[cfg(target_os = "uefi")]
+use core::arch::asm;
+
+pub const GICD_CTLR: usize = 0x0000;
+pub const GICD_TYPER: usize = 0x0004;
+pub const GICD_IIDR: usize = 0x0008;
+
+pub const GICR_WAKER: usize = 0x0014;
+pub const GICR_SGI_OFFSET: usize = 0x10000;
+pub const GICR_IGROUPR0: usize = 0x0080;
+pub const GICR_ISENABLER0: usize = 0x0100;
+pub const GICR_ICENABLER0: usize = 0x0180;
+pub const GICR_IPRIORITYR: usize = 0x0400;
+pub const GICR_ICFGR1: usize = 0x0C04;
+
+pub struct Gicv3 {
+    gicd_base: usize,
+    gicr_base: usize,
+}
+
+impl Gicv3 {
+    pub const fn new(gicd_base: usize, gicr_base: usize) -> Self {
+        Self {
+            gicd_base,
+            gicr_base,
+        }
+    }
+
+    pub unsafe fn init(&self) {
+        // 1. Initialize Distributor (GICD)
+        let ctlr = self.mmio_read_d(GICD_CTLR);
+        // Bit 0: EnableGrp0, Bit 1: EnableGrp1NS, Bit 4: ARE_NS
+        self.mmio_write_d(GICD_CTLR, ctlr | (1 << 4) | (1 << 1) | (1 << 0));
+
+        // 2. Wake up Redistributor (GICR) for current CPU
+        let waker = self.mmio_read_r(GICR_WAKER);
+        self.mmio_write_r(GICR_WAKER, waker & !(1 << 1)); // Clear ProcessorSleep
+        while (self.mmio_read_r(GICR_WAKER) & (1 << 2)) != 0 {
+            // Wait for ChildrenAsleep == 0
+            core::hint::spin_loop();
+        }
+
+        // 3. Initialize CPU Interface system registers (ICC_*_EL1)
+        #[cfg(target_os = "uefi")]
+        {
+            // Enable System Register Access (ICC_SRE_EL1.SRE = 1)
+            let mut sre: u64;
+            asm!("mrs {0}, ICC_SRE_EL1", out(reg) sre, options(nomem, nostack, preserves_flags));
+            sre |= 1;
+            asm!("msr ICC_SRE_EL1, {0}", in(reg) sre, options(nomem, nostack, preserves_flags));
+            asm!("isb", options(nomem, nostack, preserves_flags));
+
+            // Unmask all interrupt priorities (ICC_PMR_EL1 = 0xFF)
+            asm!("msr ICC_PMR_EL1, {0}", in(reg) 0xFFu64, options(nomem, nostack, preserves_flags));
+
+            // Enable Group 1 interrupts (ICC_IGRPEN1_EL1 = 1)
+            asm!("msr ICC_IGRPEN1_EL1, {0}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
+            asm!("isb", options(nomem, nostack, preserves_flags));
+        }
+    }
+
+    pub unsafe fn enable_ppi(&self, intid: u32) {
+        let sgi_base = self.gicr_base + GICR_SGI_OFFSET;
+        // Group 1 Non-Secure
+        let grp = core::ptr::read_volatile((sgi_base + GICR_IGROUPR0) as *const u32);
+        core::ptr::write_volatile((sgi_base + GICR_IGROUPR0) as *mut u32, grp | (1 << intid));
+
+        // Priority 0x00 (highest)
+        let prio_addr = (sgi_base + GICR_IPRIORITYR + ((intid as usize & !3))) as *mut u32;
+        let prio = core::ptr::read_volatile(prio_addr);
+        let shift = (intid % 4) * 8;
+        core::ptr::write_volatile(prio_addr, prio & !(0xFF << shift));
+
+        // Enable interrupt in GICR_ISENABLER0
+        core::ptr::write_volatile((sgi_base + GICR_ISENABLER0) as *mut u32, 1 << intid);
+    }
+
+    #[inline]
+    unsafe fn mmio_read_d(&self, offset: usize) -> u32 {
+        core::ptr::read_volatile((self.gicd_base + offset) as *const u32)
+    }
+
+    #[inline]
+    unsafe fn mmio_write_d(&self, offset: usize, val: u32) {
+        core::ptr::write_volatile((self.gicd_base + offset) as *mut u32, val)
+    }
+
+    #[inline]
+    unsafe fn mmio_read_r(&self, offset: usize) -> u32 {
+        core::ptr::read_volatile((self.gicr_base + offset) as *const u32)
+    }
+
+    #[inline]
+    unsafe fn mmio_write_r(&self, offset: usize, val: u32) {
+        core::ptr::write_volatile((self.gicr_base + offset) as *mut u32, val)
+    }
+}
+
+#[inline]
+pub unsafe fn acknowledge_irq() -> u64 {
+    #[cfg(target_os = "uefi")]
+    {
+        let iar: u64;
+        asm!("mrs {0}, ICC_IAR1_EL1", out(reg) iar, options(nomem, nostack, preserves_flags));
+        iar
+    }
+    #[cfg(not(target_os = "uefi"))]
+    0
+}
+
+#[inline]
+pub unsafe fn end_of_irq(iar: u64) {
+    #[cfg(target_os = "uefi")]
+    {
+        asm!("msr ICC_EOIR1_EL1, {0}", in(reg) iar, options(nomem, nostack, preserves_flags));
+        asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(target_os = "uefi"))]
+    let _ = iar;
+}

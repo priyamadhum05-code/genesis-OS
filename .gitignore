@@ -1,0 +1,16 @@
+target/
+build/target/
+build/host-tests/
+build/esp/
+build/edk2-vars.fd
+build/*.sock
+build/*.dtb
+build/serial.log
+build/stage5.serial.log
+build/phase2-validation/
+build/stage2-validation/
+build/stage3c1-validation/
+build/stage4-validation/
+*.o
+*.d
+.DS_Store

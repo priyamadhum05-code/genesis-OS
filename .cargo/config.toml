@@ -1,0 +1,7 @@
+[build]
+target = "aarch64-unknown-uefi"
+target-dir = "build/target"
+jobs = 2
+
+[target.aarch64-unknown-uefi]
+rustflags = ["-C", "link-arg=/base:0x48000000", "-C", "link-arg=/entry:efi_main"]
