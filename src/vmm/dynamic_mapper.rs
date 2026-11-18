@@ -127,13 +127,24 @@ impl<'a, const N: usize> DynamicMapper<'a, N> {
         self.map_page(va, pa, PagePermissions::device_mmio())
     }
 
-    /// Maps a contiguous range of device MMIO pages.
-    pub fn map_mmio_range(&mut self, va_start: u64, pa_start: u64, page_count: usize) -> Result<(), VmmError> {
+    /// Maps a contiguous range of pages with given permissions.
+    pub fn map_range(
+        &mut self,
+        va_start: u64,
+        pa_start: u64,
+        page_count: usize,
+        perms: PagePermissions,
+    ) -> Result<(), VmmError> {
         for i in 0..page_count {
             let offset = (i as u64) * PAGE_SIZE;
-            self.map_mmio_page(va_start + offset, pa_start + offset)?;
+            self.map_page(va_start + offset, pa_start + offset, perms)?;
         }
         Ok(())
+    }
+
+    /// Maps a contiguous range of device MMIO pages.
+    pub fn map_mmio_range(&mut self, va_start: u64, pa_start: u64, page_count: usize) -> Result<(), VmmError> {
+        self.map_range(va_start, pa_start, page_count, PagePermissions::device_mmio())
     }
 
     /// Maps a 2 MiB virtual block `va` to physical block `pa` with `perms`.

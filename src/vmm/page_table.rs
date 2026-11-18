@@ -113,6 +113,15 @@ impl PagePermissions {
         }
     }
 
+    pub const fn framebuffer() -> Self {
+        Self {
+            mem_type: MemoryType::NormalNonCacheable,
+            access: AccessPermission::KernelRw,
+            privileged_execute: false,
+            unprivileged_execute: false,
+        }
+    }
+
     /// Converts permission attributes into architectural descriptor bits.
     pub const fn to_descriptor_bits(&self) -> u64 {
         let mut bits = 0u64;

@@ -237,27 +237,33 @@ impl FatVolume {
             let sectors_to_read = self.sec_per_clus as u16;
 
             // Read cluster sectors into scratch buffer, then copy to destination
-            // (or directly if cluster fits into remaining capacity)
-            if dest_offset + sectors_to_read as usize * 512 <= dest_cap {
-                dev.read_sectors(
-                    clus_lba,
-                    sectors_to_read,
-                    dest_pa + dest_offset as u64,
-                    dest_va + dest_offset as u64,
-                )?;
-                let read_len = bytes_left.min(clus_bytes);
-                bytes_left -= read_len;
-                dest_offset += read_len;
-            } else {
+            // If this is a partial final cluster, read into scratch buffer to avoid overwriting past file_size
+            if bytes_left < clus_bytes {
                 dev.read_sectors(clus_lba, sectors_to_read, scratch_pa, scratch_va)?;
-                let read_len = bytes_left.min(clus_bytes);
                 core::ptr::copy_nonoverlapping(
                     scratch_va as *const u8,
                     (dest_va + dest_offset as u64) as *mut u8,
-                    read_len,
+                    bytes_left,
                 );
-                bytes_left -= read_len;
-                dest_offset += read_len;
+                break;
+            } else {
+                if dest_offset + clus_bytes <= dest_cap {
+                    dev.read_sectors(
+                        clus_lba,
+                        sectors_to_read,
+                        dest_pa + dest_offset as u64,
+                        dest_va + dest_offset as u64,
+                    )?;
+                } else {
+                    dev.read_sectors(clus_lba, sectors_to_read, scratch_pa, scratch_va)?;
+                    core::ptr::copy_nonoverlapping(
+                        scratch_va as *const u8,
+                        (dest_va + dest_offset as u64) as *mut u8,
+                        clus_bytes,
+                    );
+                }
+                bytes_left -= clus_bytes;
+                dest_offset += clus_bytes;
             }
 
             if bytes_left == 0 {
@@ -266,7 +272,8 @@ impl FatVolume {
 
             // Lookup next cluster in FAT
             curr_clus = self.get_next_cluster(dev, curr_clus, scratch_pa, scratch_va)?;
-            if curr_clus >= 0x0FFF_FFF8 || (self.is_fat32 && curr_clus >= 0x0FFF_FFF7) {
+            let eof = if self.is_fat32 { 0x0FFF_FFF8 } else { 0xFFF8 };
+            if curr_clus >= eof {
                 break;
             }
         }
@@ -324,7 +331,8 @@ impl FatVolume {
 
         // Cluster-based directory (FAT32 root or any subdirectory)
         let mut curr_clus = dir_clus;
-        while curr_clus >= 2 && curr_clus < 0x0FFF_FFF8 {
+        let eof = if self.is_fat32 { 0x0FFF_FFF8 } else { 0xFFF8 };
+        while curr_clus >= 2 && curr_clus < eof {
             let start_lba = self.cluster_to_lba(curr_clus);
             for s in 0..self.sec_per_clus as u64 {
                 dev.read_sectors(start_lba + s, 1, scratch_pa, scratch_va)?;
@@ -386,6 +394,203 @@ impl FatVolume {
         }
         None
     }
+
+    /// Enumerates directory entries in directory cluster `dir_clus` (or root if 0 on FAT16).
+    pub unsafe fn list_dir_cluster<F: FnMut(&FatDirEntry)>(
+        &self,
+        dev: &mut VirtIOBlockDevice,
+        dir_clus: u32,
+        scratch_pa: u64,
+        scratch_va: u64,
+        mut callback: F,
+    ) -> Result<(), &'static str> {
+        if !self.is_fat32 && dir_clus == 0 {
+            // FAT16 Root Directory
+            for s in 0..self.root_dir_sectors {
+                let sec = self.root_dir_lba + s as u64;
+                dev.read_sectors(sec, 1, scratch_pa, scratch_va)?;
+                if self.scan_dir_sector_entries(scratch_va, &mut callback) {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+
+        let mut curr_clus = dir_clus;
+        let eof = if self.is_fat32 { 0x0FFF_FFF8 } else { 0xFFF8 };
+        while curr_clus >= 2 && curr_clus < eof {
+            let start_lba = self.cluster_to_lba(curr_clus);
+            for s in 0..self.sec_per_clus as u64 {
+                dev.read_sectors(start_lba + s, 1, scratch_pa, scratch_va)?;
+                if self.scan_dir_sector_entries(scratch_va, &mut callback) {
+                    return Ok(());
+                }
+            }
+
+            curr_clus = self.get_next_cluster(dev, curr_clus, scratch_pa, scratch_va)?;
+        }
+
+        Ok(())
+    }
+
+    /// Resolves `path` (or root if empty or "/") and enumerates all directory entries.
+    pub unsafe fn list_dir<F: FnMut(&FatDirEntry)>(
+        &self,
+        dev: &mut VirtIOBlockDevice,
+        path: &str,
+        scratch_pa: u64,
+        scratch_va: u64,
+        callback: F,
+    ) -> Result<(), &'static str> {
+        let mut path_str = path.trim();
+        while path_str.starts_with('/') {
+            path_str = &path_str[1..];
+        }
+        while path_str.ends_with('/') {
+            path_str = &path_str[..path_str.len() - 1];
+        }
+
+        let root_clus = if self.is_fat32 { self.root_clus } else { 0 };
+        if path_str.is_empty() || path_str == "." {
+            return self.list_dir_cluster(dev, root_clus, scratch_pa, scratch_va, callback);
+        }
+
+        let mut curr_dir_clus = root_clus;
+        let mut components = [""; 8];
+        let mut comp_count = 0;
+        for part in path_str.split('/') {
+            if !part.is_empty() {
+                if comp_count >= components.len() {
+                    return Err("Path depth exceeds maximum supported (8)");
+                }
+                components[comp_count] = part;
+                comp_count += 1;
+            }
+        }
+
+        for comp in &components[..comp_count] {
+            let target_8_3 = to_8_3(comp);
+            let (entry_clus, _size, is_dir) = self.find_entry_in_dir(
+                dev,
+                curr_dir_clus,
+                &target_8_3,
+                scratch_pa,
+                scratch_va,
+            )?;
+            if !is_dir {
+                return Err("Path component is not a directory");
+            }
+            curr_dir_clus = entry_clus;
+        }
+
+        self.list_dir_cluster(dev, curr_dir_clus, scratch_pa, scratch_va, callback)
+    }
+
+    /// Scans a 512-byte directory sector at `scratch_va` and passes valid entries to `callback`.
+    /// Returns `true` if end-of-directory marker (0x00) is encountered.
+    pub unsafe fn scan_dir_sector_entries<F: FnMut(&FatDirEntry)>(
+        &self,
+        scratch_va: u64,
+        callback: &mut F,
+    ) -> bool {
+        for e in 0..16 {
+            let entry_ptr = (scratch_va + e * 32) as *const u8;
+            let first_byte = *entry_ptr;
+            if first_byte == 0x00 {
+                // End of directory entries
+                return true;
+            }
+            if first_byte == 0xE5 {
+                // Deleted entry
+                continue;
+            }
+
+            let attr = *entry_ptr.add(11);
+            if attr == 0x0F || (attr & 0x08) != 0 {
+                // LFN or Volume ID
+                continue;
+            }
+
+            let mut raw = [0u8; 11];
+            core::ptr::copy_nonoverlapping(entry_ptr, raw.as_mut_ptr(), 11);
+            let (name, name_len) = format_8_3_name(&raw);
+
+            let is_dir = (attr & 0x10) != 0;
+            let clus_hi = if self.is_fat32 {
+                u16::from_le_bytes([*entry_ptr.add(20), *entry_ptr.add(21)]) as u32
+            } else {
+                0
+            };
+            let clus_lo = u16::from_le_bytes([*entry_ptr.add(26), *entry_ptr.add(27)]) as u32;
+            let first_clus = (clus_hi << 16) | clus_lo;
+
+            let size = u32::from_le_bytes([
+                *entry_ptr.add(28),
+                *entry_ptr.add(29),
+                *entry_ptr.add(30),
+                *entry_ptr.add(31),
+            ]) as usize;
+
+            let entry = FatDirEntry {
+                name,
+                name_len,
+                size,
+                is_dir,
+                first_clus,
+            };
+            callback(&entry);
+        }
+        false
+    }
+}
+
+/// A parsed 8.3 FAT directory entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FatDirEntry {
+    pub name: [u8; 13],
+    pub name_len: usize,
+    pub size: usize,
+    pub is_dir: bool,
+    pub first_clus: u32,
+}
+
+impl FatDirEntry {
+    pub fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("???")
+    }
+}
+
+/// Converts raw 11-byte space-padded 8.3 directory name into human-readable ASCII string.
+/// E.g. `b"WEIGHTS BIN"` -> `("WEIGHTS.BIN", 11)`, `b"EFI        "` -> `("EFI", 3)`.
+pub fn format_8_3_name(raw: &[u8; 11]) -> ([u8; 13], usize) {
+    let mut out = [0u8; 13];
+    let mut len = 0;
+
+    // Base name (up to 8 bytes, space-trimmed)
+    let mut base_len = 8;
+    while base_len > 0 && raw[base_len - 1] == b' ' {
+        base_len -= 1;
+    }
+    for i in 0..base_len {
+        out[len] = raw[i];
+        len += 1;
+    }
+
+    // Extension (up to 3 bytes, space-trimmed)
+    let mut ext_len = 3;
+    while ext_len > 0 && raw[8 + ext_len - 1] == b' ' {
+        ext_len -= 1;
+    }
+    if ext_len > 0 {
+        out[len] = b'.';
+        len += 1;
+        for i in 0..ext_len {
+            out[len] = raw[8 + i];
+            len += 1;
+        }
+    }
+
+    (out, len)
 }
 
 /// Formats a filename into standard 8.3 space-padded uppercase representation.
@@ -480,5 +685,135 @@ mod tests {
         assert_eq!(vol.root_clus, 2);
         assert_eq!(vol.cluster_to_lba(2), vol.data_start_lba);
         assert_eq!(vol.cluster_to_lba(3), vol.data_start_lba + 4);
+    }
+
+    #[test]
+    fn format_8_3_name_roundtrip_test() {
+        assert_eq!(format_8_3_name(b"WEIGHTS BIN"), (*b"WEIGHTS.BIN\0\0", 11));
+        assert_eq!(format_8_3_name(b"EFI        "), (*b"EFI\0\0\0\0\0\0\0\0\0\0", 3));
+        assert_eq!(format_8_3_name(b".          "), (*b".\0\0\0\0\0\0\0\0\0\0\0\0", 1));
+        assert_eq!(format_8_3_name(b"..         "), (*b"..\0\0\0\0\0\0\0\0\0\0\0", 2));
+        assert_eq!(format_8_3_name(b"A       B  "), (*b"A.B\0\0\0\0\0\0\0\0\0\0", 3));
+    }
+
+    #[test]
+    fn fat16_and_fat32_eof_test() {
+        let fat32_vol = FatVolume {
+            volume_lba: 0,
+            bytes_per_sec: 512,
+            sec_per_clus: 1,
+            rsvd_sec_cnt: 32,
+            num_fats: 2,
+            fat_size: 100,
+            root_clus: 2,
+            fat_start_lba: 32,
+            data_start_lba: 232,
+            is_fat32: true,
+            root_dir_lba: 0,
+            root_dir_sectors: 0,
+        };
+        let fat16_vol = FatVolume {
+            volume_lba: 0,
+            bytes_per_sec: 512,
+            sec_per_clus: 1,
+            rsvd_sec_cnt: 1,
+            num_fats: 2,
+            fat_size: 16,
+            root_clus: 0,
+            fat_start_lba: 1,
+            data_start_lba: 65,
+            is_fat32: false,
+            root_dir_lba: 33,
+            root_dir_sectors: 32,
+        };
+
+        let eof32 = if fat32_vol.is_fat32 { 0x0FFF_FFF8 } else { 0xFFF8 };
+        let eof16 = if fat16_vol.is_fat32 { 0x0FFF_FFF8 } else { 0xFFF8 };
+
+        assert_eq!(eof32, 0x0FFF_FFF8);
+        assert_eq!(eof16, 0xFFF8);
+
+        // In FAT16, 0xFFF8..=0xFFFF are EOF markers
+        assert!(0xFFF8 >= eof16);
+        assert!(0xFFFF >= eof16);
+        assert!(0x0010 < eof16);
+
+        // In FAT32, 0x0FFF_FFF8..=0x0FFF_FFFF are EOF markers
+        assert!(0x0FFF_FFF8 >= eof32);
+        assert!(0x0FFF_FFFF >= eof32);
+        assert!(0x0000_1234 < eof32);
+    }
+
+    #[test]
+    fn list_dir_scan_sector_test() {
+        let vol = FatVolume {
+            volume_lba: 0,
+            bytes_per_sec: 512,
+            sec_per_clus: 1,
+            rsvd_sec_cnt: 32,
+            num_fats: 2,
+            fat_size: 100,
+            root_clus: 2,
+            fat_start_lba: 32,
+            data_start_lba: 232,
+            is_fat32: true,
+            root_dir_lba: 0,
+            root_dir_sectors: 0,
+        };
+
+        // Construct a mock directory sector with 3 entries:
+        // 1. "EFI" directory (attr 0x10, clus 3)
+        // 2. Deleted entry (0xE5)
+        // 3. "WEIGHTS.BIN" file (attr 0x20, clus 5, size 32768)
+        // 4. End-of-dir marker (0x00)
+        let mut sec = [0u8; 512];
+
+        // Entry 0: EFI directory
+        sec[0..11].copy_from_slice(b"EFI        ");
+        sec[11] = 0x10; // Directory
+        sec[26] = 3;    // Cluster lo = 3
+
+        // Entry 1: Deleted entry
+        sec[32] = 0xE5;
+
+        // Entry 2: WEIGHTS.BIN
+        sec[64..75].copy_from_slice(b"WEIGHTS BIN");
+        sec[75] = 0x20; // Archive / regular file
+        sec[90] = 5;    // Cluster lo = 5
+        let size_bytes = (32768u32).to_le_bytes();
+        sec[92..96].copy_from_slice(&size_bytes);
+
+        // Entry 3: End of directory (0x00 already)
+
+        let mut count = 0usize;
+        let mut names = [""; 4];
+        let mut sizes = [0usize; 4];
+        let mut is_dirs = [false; 4];
+
+        unsafe {
+            let done = vol.scan_dir_sector_entries(sec.as_ptr() as u64, &mut |e| {
+                if count < 4 {
+                    // Safety for test: string slice is valid as long as e.name is
+                    // But e.name is copied into local array so convert to static str comparison
+                    if e.name_str() == "EFI" {
+                        names[count] = "EFI";
+                    } else if e.name_str() == "WEIGHTS.BIN" {
+                        names[count] = "WEIGHTS.BIN";
+                    }
+                    sizes[count] = e.size;
+                    is_dirs[count] = e.is_dir;
+                    count += 1;
+                }
+            });
+            assert!(done, "Should have reached end of directory marker");
+        }
+
+        assert_eq!(count, 2);
+        assert_eq!(names[0], "EFI");
+        assert_eq!(sizes[0], 0);
+        assert_eq!(is_dirs[0], true);
+        assert_eq!(names[1], "WEIGHTS.BIN");
+        assert_eq!(sizes[1], 32768);
+        assert_eq!(is_dirs[1], false);
     }
 }

@@ -6,6 +6,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const PSCI_CPU_ON_64: u64 = 0xC400_0003;
+pub const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 
 pub static ONLINE_CPUS: AtomicU64 = AtomicU64::new(1); // CPU 0 is online initially
 
@@ -69,6 +70,25 @@ pub unsafe fn psci_cpu_on(target_cpu: u64, entry_point_paddr: u64, context_id: u
     {
         let _ = (target_cpu, entry_point_paddr, context_id);
         0
+    }
+}
+
+/// Shuts down the machine via PSCI SYSTEM_OFF (Function ID 0x8400_0008).
+/// This call never returns.
+pub unsafe fn psci_system_off() -> ! {
+    #[cfg(target_os = "uefi")]
+    {
+        core::arch::asm!(
+            "hvc #0",
+            in("x0") PSCI_SYSTEM_OFF,
+            options(noreturn)
+        );
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        loop {
+            core::hint::spin_loop();
+        }
     }
 }
 

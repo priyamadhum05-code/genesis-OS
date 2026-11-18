@@ -304,6 +304,13 @@ impl LockedHeap {
     }
 }
 
+#[cfg(target_os = "uefi")]
+#[global_allocator]
+pub static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+#[cfg(not(target_os = "uefi"))]
+pub static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
+
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.inner.lock().alloc(layout)

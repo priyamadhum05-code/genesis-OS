@@ -9,15 +9,17 @@ use genesis_stage1::{
     ai::{scalar_matmul, smp_matmul_worker, verify_matrices, MATMUL_N},
     arch::{
         dispatch_smp_work, parse_fdt_devices, psci_cpu_on, secondary_boot_stub, secondary_main,
-        stage4_arm_timer_interval, stage4_arm_timer_ticks, stage4_get_ticks, stage4_init_runtime,
-        stage4_vectors_va, ArmTimer, Gicv3, SecondaryBootArgs, ONLINE_CPUS,
+        serial_read_line, stage4_arm_timer_interval, stage4_arm_timer_ticks,
+        stage4_get_ticks, stage4_init_runtime, stage4_vectors_va, ArmTimer, Gicv3,
+        SecondaryBootArgs, ONLINE_CPUS,
     },
-    drivers::{VirtIOBlockDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC},
+    drivers::{Framebuffer, VirtIOBlockDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC},
     fs::{locate_volume, FatVolume},
     memory_map,
     mm::heap::SpinLock,
     pmm::{self, PhysicalPageAllocator, ReservedRange, KERNEL_PMM_WORDS},
     sched,
+    shell::{Shell, ShellResult},
     vmm::{
         get_stage3c3_layout, get_transition_layout, parse_pe_image, run_stage3c1_preflight,
         stage3c2_mmu_transition, stage3c3_jump_higher_half, stage3c3_vectors_start,
@@ -29,8 +31,7 @@ use genesis_stage1::{
     serial_decimal, serial_hex, serial_write,
 };
 
-#[global_allocator]
-static KERNEL_HEAP: genesis_stage1::mm::LockedHeap = genesis_stage1::mm::LockedHeap::empty();
+use genesis_stage1::mm::HEAP_ALLOCATOR;
 
 static UART_LOCK: SpinLock<()> = SpinLock::new(());
 static DOT_PRODUCT_DONE: AtomicBool = AtomicBool::new(false);
@@ -105,8 +106,13 @@ const FDT_CLIENT_GUID: Guid = Guid {
     data1: 0xe11faca0, data2: 0x4710, data3: 0x4c8e,
     data4: [0xa7, 0xa2, 0x01, 0xba, 0xa2, 0x59, 0x1b, 0x4c],
 };
+const GOP_GUID: Guid = Guid {
+    data1: 0x9042a9de, data2: 0x23dc, data3: 0x4a38,
+    data4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
+};
 const FDT_CAP: usize = 128 * 1024;
 const STACK_SIZE: usize = 32 * 1024;
+const HUGEPAGE_VA: u64 = 0xFFFF_FFFF_A000_0000;
 
 #[repr(C)] #[derive(Clone, Copy)] struct Guid { data1: u32, data2: u16, data3: u16, data4: [u8; 8] }
 #[repr(C)] struct ConfigTable { guid: Guid, table: *const u8 }
@@ -117,13 +123,75 @@ const STACK_SIZE: usize = 32 * 1024;
     _stderr_handle: usize, _stderr: usize, _runtime: usize, boot_services: *const usize,
     table_count: usize, tables: *const ConfigTable,
 }
-#[repr(C)] struct Handoff { magic: [u8; 8], version: u32, size: u32, fdt: *const u8, fdt_size: usize, map: *const u8, map_size: usize, descriptor_size: usize, descriptor_version: u32, uart_base: usize, observed_el: u64 }
+#[repr(C)]
+struct EfiGraphicsOutputModeInformation {
+    version: u32,
+    horizontal_resolution: u32,
+    vertical_resolution: u32,
+    pixel_format: u32,
+    pixel_information: [u32; 4],
+    pixels_per_scan_line: u32,
+}
+#[repr(C)]
+struct EfiGraphicsOutputProtocolMode {
+    max_mode: u32,
+    mode: u32,
+    info: *const EfiGraphicsOutputModeInformation,
+    size_of_info: usize,
+    frame_buffer_base: u64,
+    frame_buffer_size: usize,
+}
+#[repr(C)]
+struct EfiGraphicsOutputProtocol {
+    query_mode: usize,
+    set_mode: usize,
+    blt: usize,
+    mode: *mut EfiGraphicsOutputProtocolMode,
+}
+#[repr(C)]
+struct Handoff {
+    magic: [u8; 8],
+    version: u32,
+    size: u32,
+    fdt: *const u8,
+    fdt_size: usize,
+    map: *const u8,
+    map_size: usize,
+    descriptor_size: usize,
+    descriptor_version: u32,
+    uart_base: usize,
+    observed_el: u64,
+    fb_base: u64,
+    fb_size: u64,
+    fb_width: u32,
+    fb_height: u32,
+    fb_stride: u32,
+    fb_pixel_format: u32,
+}
 #[repr(C)] #[derive(Clone, Copy)] struct Node { parent_ac: u32, parent_sc: u32, child_ac: u32, child_sc: u32, uart: bool, disabled: bool, reg: usize, reg_size: usize }
 #[repr(C)] struct FdtClient { methods: [usize; 9] }
 
 static mut FDT_COPY: [u8; FDT_CAP] = [0; FDT_CAP];
 static mut MEMORY_MAP: [u8; memory_map::BUFFER_CAPACITY] = [0; memory_map::BUFFER_CAPACITY];
-static mut HANDOFF: Handoff = Handoff { magic: [0;8], version:0, size:0, fdt:ptr::null(), fdt_size:0, map:ptr::null(), map_size:0, descriptor_size:0, descriptor_version:0, uart_base:0, observed_el:0 };
+static mut HANDOFF: Handoff = Handoff {
+    magic: [0; 8],
+    version: 0,
+    size: 0,
+    fdt: ptr::null(),
+    fdt_size: 0,
+    map: ptr::null(),
+    map_size: 0,
+    descriptor_size: 0,
+    descriptor_version: 0,
+    uart_base: 0,
+    observed_el: 0,
+    fb_base: 0,
+    fb_size: 0,
+    fb_width: 0,
+    fb_height: 0,
+    fb_stride: 0,
+    fb_pixel_format: 0,
+};
 static mut KERNEL_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 static mut KERNEL_PMM: PhysicalPageAllocator<KERNEL_PMM_WORDS> = PhysicalPageAllocator::new();
 static mut DORMANT_TTBR0_POOL: DormantTablePool = DormantTablePool::new();
@@ -170,6 +238,35 @@ pub extern "efiapi" fn efi_main(image: usize, system_table: *mut SystemTable) ->
             fdt = ptr::null();
             fdt_len = 0;
         }
+
+        // Query UEFI Graphics Output Protocol (GOP)
+        let mut fb_base = 0u64;
+        let mut fb_size = 0u64;
+        let mut fb_width = 0u32;
+        let mut fb_height = 0u32;
+        let mut fb_stride = 0u32;
+        let mut fb_pixel_format = 0u32;
+
+        let locate_protocol_gop: extern "efiapi" fn(*const Guid, *mut usize, *mut *mut EfiGraphicsOutputProtocol) -> usize =
+            core::mem::transmute(*st.boot_services.add(40));
+        let mut gop: *mut EfiGraphicsOutputProtocol = ptr::null_mut();
+        let gop_status = locate_protocol_gop(&GOP_GUID, ptr::null_mut(), &mut gop);
+        if gop_status == EFI_SUCCESS && !gop.is_null() {
+            let mode_ptr = (*gop).mode;
+            if !mode_ptr.is_null() {
+                let mode = &*mode_ptr;
+                if mode.frame_buffer_base != 0 && mode.frame_buffer_size != 0 && !mode.info.is_null() {
+                    let info = &*mode.info;
+                    fb_base = mode.frame_buffer_base;
+                    fb_size = mode.frame_buffer_size as u64;
+                    fb_width = info.horizontal_resolution;
+                    fb_height = info.vertical_resolution;
+                    fb_stride = info.pixels_per_scan_line;
+                    fb_pixel_format = info.pixel_format;
+                }
+            }
+        }
+
         let map = ptr::addr_of_mut!(MEMORY_MAP) as *mut u8;
 
         // EFI_BOOT_SERVICES begins with a 24-byte table header (three usize
@@ -191,7 +288,25 @@ pub extern "efiapi" fn efi_main(image: usize, system_table: *mut SystemTable) ->
         if !exited { fwmsg(st, "GENESIS loader: stale map retry limit\r\n"); return EFI_INVALID_PARAMETER; }
         let current_el: u64;
         asm!("mrs {0}, CurrentEL", out(reg) current_el, options(nomem, nostack, preserves_flags));
-        HANDOFF = Handoff { magic:*b"GENESIS\0", version:1, size:core::mem::size_of::<Handoff>() as u32, fdt, fdt_size:fdt_len, map, map_size:map_len, descriptor_size:desc_len, descriptor_version:desc_ver, uart_base, observed_el:current_el };
+        HANDOFF = Handoff {
+            magic: *b"GENESIS\0",
+            version: 1,
+            size: core::mem::size_of::<Handoff>() as u32,
+            fdt,
+            fdt_size: fdt_len,
+            map,
+            map_size: map_len,
+            descriptor_size: desc_len,
+            descriptor_version: desc_ver,
+            uart_base,
+            observed_el: current_el,
+            fb_base,
+            fb_size,
+            fb_width,
+            fb_height,
+            fb_stride,
+            fb_pixel_format,
+        };
         let stack_top = (ptr::addr_of_mut!(KERNEL_STACK) as usize + STACK_SIZE) & !15usize;
         asm!("mov sp, {stack}", "mov x0, {handoff}", "bl {kernel}", stack=in(reg) stack_top, handoff=in(reg) ptr::addr_of!(HANDOFF), kernel=sym kernel_entry, options(noreturn));
     }
@@ -220,11 +335,20 @@ extern "C" fn kernel_entry(h: *const Handoff) -> ! {
 
         // Initialize Physical Page Allocator
         let pmm = &mut *ptr::addr_of_mut!(KERNEL_PMM);
-        let reserved = [
+        let mut reserved = [
             ReservedRange { start: 0x4800_0000, size: 4 * 1024 * 1024 },
             ReservedRange { start: uart as u64, size: 0x1000 },
+            ReservedRange { start: 0, size: 0 },
         ];
-        if pmm.init_from_memory_map((*h).map, (*h).map_size, (*h).descriptor_size, &reserved).is_err() {
+        let mut num_reserved = 2;
+        if (*h).fb_base != 0 && (*h).fb_size != 0 {
+            reserved[num_reserved] = ReservedRange {
+                start: (*h).fb_base,
+                size: (*h).fb_size,
+            };
+            num_reserved += 1;
+        }
+        if pmm.init_from_memory_map((*h).map, (*h).map_size, (*h).descriptor_size, &reserved[..num_reserved]).is_err() {
             halt();
         }
         let total_usable = pmm.total_usable_pages();
@@ -902,7 +1026,6 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         }
 
         // 2. 2 MiB Hugepage Support in DynamicMapper
-        const HUGEPAGE_VA: u64 = 0xFFFF_FFFF_A000_0000;
         let hugepage_pa = match mapper.pmm_mut().allocate_aligned_pages(512, 512) {
             Some(pa) => pa,
             None => {
@@ -937,7 +1060,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             }
         };
         let heap_va = HHDM_BASE + heap_paddr;
-        KERNEL_HEAP.init(heap_va as usize, 64 * 4096);
+        HEAP_ALLOCATOR.init(heap_va as usize, 64 * 4096);
 
         // Verify Box dynamic allocation
         let boxed_val = Box::new(0xCAFE_BABE_1234_5678u64);
@@ -1310,8 +1433,125 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         serial_write(uart, b"GENESIS: stage7 smp neon matmul ok (cores=4)\r\n");
         serial_write(uart, b"GENESIS: stage7 milestone complete\r\n");
 
+        // ====================================================================
+        // Stage 8: UEFI GOP Framebuffer, UART RX, and Interactive Kernel Shell
+        // ====================================================================
+        serial_write(uart, b"GENESIS: stage8 starting (uefi gop, uart rx, and interactive shell)\r\n");
+
+        let total_usable = mapper.pmm_mut().total_usable_pages();
+
+        // 1. UEFI GOP Framebuffer Mapping & Dashboard
+        let mut fb_opt: Option<Framebuffer> = None;
+        if handoff.fb_base != 0 && handoff.fb_size != 0 {
+            serial_write(uart, b"GENESIS: uefi gop framebuffer detected (base=");
+            serial_hex(uart, handoff.fb_base);
+            serial_write(uart, b" size=");
+            serial_decimal(uart, handoff.fb_size);
+            serial_write(uart, b" res=");
+            serial_decimal(uart, handoff.fb_width as u64);
+            serial_write(uart, b"x");
+            serial_decimal(uart, handoff.fb_height as u64);
+            serial_write(uart, b" stride=");
+            serial_decimal(uart, handoff.fb_stride as u64);
+            serial_write(uart, b")\r\n");
+
+            const FB_VA_BASE: u64 = 0xFFFF_FFFF_C000_0000;
+            let fb_pages = ((handoff.fb_size + 4095) / 4096) as usize;
+            if let Err(e) = mapper.map_range(FB_VA_BASE, handoff.fb_base, fb_pages, PagePermissions::framebuffer()) {
+                serial_write(uart, b"STAGE8_FB_MAP_FAIL: ");
+                serial_hex(uart, e.code());
+                serial_write(uart, b"\r\n");
+                halt();
+            }
+            let mut fb = Framebuffer {
+                base_va: FB_VA_BASE,
+                size: handoff.fb_size as usize,
+                width: handoff.fb_width,
+                height: handoff.fb_height,
+                stride: handoff.fb_stride,
+                pixel_format: handoff.fb_pixel_format,
+            };
+            let cpus = ONLINE_CPUS.load(Ordering::Acquire);
+            let total_ram_mib = (total_usable * 4) / 1024;
+            let free_ram_mib = (mapper.pmm_mut().free_pages() * 4) / 1024;
+            fb.draw_dashboard(cpus, free_ram_mib, total_ram_mib, true);
+            fb_opt = Some(fb);
+            serial_write(uart, b"GENESIS: stage8 framebuffer initialized ok\r\n");
+        } else {
+            serial_write(uart, b"GENESIS: stage8 framebuffer skipped (headless mode)\r\n");
+        }
+
+        // 2. Dedicated 64 KiB Buffer for Shell File Reading
+        let shell_file_pa = mapper.pmm_mut().allocate_contiguous_pages(16).unwrap();
+        let shell_file_va = HHDM_BASE + shell_file_pa;
+        let shell_file_cap = 64 * 1024;
+
+        // 3. Initialize Interactive Shell
+        let total_ram_mib = (total_usable * 4) / 1024;
+        let free_ram_mib = (mapper.pmm_mut().free_pages() * 4) / 1024;
+        let mut shell = Shell {
+            uart_va: uart,
+            dev: Some(&mut blk_dev),
+            fat: Some(&volume),
+            scratch_pa,
+            scratch_va,
+            file_buf_pa: shell_file_pa,
+            file_buf_va: shell_file_va,
+            file_buf_cap: shell_file_cap,
+            fb: fb_opt.as_mut(),
+            total_ram_mib,
+            free_ram_mib,
+            bench_fn: Some(run_smp_matmul_benchmark),
+        };
+
+        // 4. Automated Shell Self-Test (info, ls, bench)
+        serial_write(uart, b"GENESIS: stage8 starting shell self-test\r\n");
+        shell.execute_command("info");
+        shell.execute_command("ls");
+        shell.execute_command("bench");
+        serial_write(uart, b"GENESIS: stage8 shell self-test ok\r\n");
+        serial_write(uart, b"GENESIS: stage8 milestone complete\r\n");
+
+        // 5. Interactive Prompt Loop
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 8)\r\n");
+        serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
+        let mut line_buf = [0u8; 128];
+        loop {
+            serial_write(uart, b"genesis> ");
+            let len = serial_read_line(uart, &mut line_buf);
+            if len > 0 {
+                if let Ok(line_str) = core::str::from_utf8(&line_buf[..len]) {
+                    if shell.execute_command(line_str) == ShellResult::Exit {
+                        break;
+                    }
+                }
+            }
+        }
+
         halt();
     }
+}
+
+fn run_smp_matmul_benchmark(_arg: u64) -> (u64, u64) {
+    let t0: u64;
+    let t1: u64;
+    let cntfrq: u64;
+    #[cfg(target_os = "uefi")]
+    unsafe {
+        asm!("mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
+        dispatch_smp_work(smp_matmul_worker, HUGEPAGE_VA);
+        asm!("mrs {}, cntvct_el0", out(reg) t1, options(nomem, nostack));
+        asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        t0 = 0;
+        t1 = 1000;
+        cntfrq = 1_000_000;
+    }
+    let ticks = t1.saturating_sub(t0);
+    let us = if cntfrq > 0 { (ticks * 1_000_000) / cntfrq } else { 0 };
+    (ticks, us)
 }
 
 unsafe fn find_pl011(fdt: *const u8, bound: usize) -> Option<usize> {

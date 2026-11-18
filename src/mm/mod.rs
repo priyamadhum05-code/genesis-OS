@@ -2,4 +2,4 @@
 
 pub mod heap;
 
-pub use heap::{FreeListHeap, LockedHeap};
+pub use heap::{FreeListHeap, LockedHeap, HEAP_ALLOCATOR};
