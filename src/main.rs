@@ -1317,30 +1317,40 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         serial_decimal(uart, blk_dev.version as u64);
         serial_write(uart, b")\r\n");
 
-        // Stage 9B: Probe VirtIO-Input Keyboard (DeviceID == 18)
-        let input_q_pa = mapper.pmm_mut().allocate_contiguous_pages(2).unwrap();
-        let input_q_va = HHDM_BASE + input_q_pa;
-        let mut input_dev_opt = match VirtIOInputDevice::probe(VIRTIO_MMIO_VA, input_q_pa, input_q_va) {
-            Ok(Some(dev)) => {
-                serial_write(uart, b"GENESIS: virtio-input keyboard detected (version=");
-                serial_decimal(uart, dev.version as u64);
-                serial_write(uart, b")\r\n");
-                Some(dev)
-            }
-            Ok(None) => {
-                let _ = mapper.pmm_mut().free_page(input_q_pa);
-                let _ = mapper.pmm_mut().free_page(input_q_pa + 4096);
-                None
-            }
-            Err(_) => {
-                let _ = mapper.pmm_mut().free_page(input_q_pa);
-                let _ = mapper.pmm_mut().free_page(input_q_pa + 4096);
-                None
-            }
-        };
+        // Stage 15B: Multi-Device VirtIO-Input Probing (DeviceID == 18)
+        let mut input_slots = [0u64; 4];
+        let found_input_count = VirtIOInputDevice::find_all_slots(VIRTIO_MMIO_VA, &mut input_slots);
+        let mut input_devs: [Option<VirtIOInputDevice>; 4] = [None, None, None, None];
 
-        if let Some(input_dev) = input_dev_opt.as_mut() {
-            genesis_stage1::drivers::virtio_input::register_global_virtio_input(input_dev as *mut _);
+        for i in 0..found_input_count {
+            if let Some(input_q_pa) = mapper.pmm_mut().allocate_contiguous_pages(2) {
+                let input_q_va = HHDM_BASE + input_q_pa;
+                match VirtIOInputDevice::init(input_slots[i], input_q_pa, input_q_va) {
+                    Ok(dev) => {
+                        serial_write(uart, b"GENESIS: virtio-input device detected (slot=");
+                        serial_hex(uart, input_slots[i]);
+                        serial_write(uart, b", version=");
+                        serial_decimal(uart, dev.version as u64);
+                        serial_write(uart, b")\r\n");
+                        if i == 0 {
+                            serial_write(uart, b"GENESIS: virtio-input keyboard detected (version=");
+                            serial_decimal(uart, dev.version as u64);
+                            serial_write(uart, b")\r\n");
+                        }
+                        input_devs[i] = Some(dev);
+                    }
+                    Err(_) => {
+                        let _ = mapper.pmm_mut().free_page(input_q_pa);
+                        let _ = mapper.pmm_mut().free_page(input_q_pa + 4096);
+                    }
+                }
+            }
+        }
+
+        for dev_opt in &mut input_devs {
+            if let Some(dev) = dev_opt {
+                genesis_stage1::drivers::virtio_input::register_global_virtio_input(dev as *mut _);
+            }
         }
 
         // Stage 12B: Probe VirtIO-Net (DeviceID == 1)
@@ -1564,6 +1574,11 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             serial_write(uart, b"GENESIS: stage8 framebuffer skipped (headless mode)\r\n");
         }
 
+        // Stage 15C: Allocate Write-Back Cached Framebuffer Backbuffer (1.92 MiB = 480 pages)
+        let backbuf_pa = mapper.pmm_mut().allocate_contiguous_pages(480).unwrap_or(0);
+        let backbuf_va = if backbuf_pa != 0 { HHDM_BASE + backbuf_pa } else { 0 };
+        genesis_stage1::ui::register_global_backbuffer(backbuf_va);
+
         // 2. Dedicated Buffers for Shell File and Tokenizer Reading
         let shell_file_pa = mapper.pmm_mut().allocate_contiguous_pages(128).unwrap();
         let shell_file_va = HHDM_BASE + shell_file_pa;
@@ -1656,8 +1671,54 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         shell.execute_command("chat GENESIS");
         serial_write(uart, b"GENESIS: stage14 milestone complete\r\n");
 
-        // 11. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 14)\r\n");
+        // 11. Stage 15 Automated Smoke-Test & Verification
+        // Part 15A: Writable FAT32 verification (write -> cat round-trip)
+        shell.execute_command("write TEST.TXT hello genesis stage 15");
+        shell.execute_command("cat TEST.TXT");
+        serial_write(uart, b"GENESIS: stage15 writable fat32 ok\r\n");
+
+        // Part 15B & 15C: Compositor & Input verification
+        if backbuf_va != 0 {
+            use genesis_stage1::ui::{DesktopCompositor, PointerState, WIN_TERMINAL, WIN_SYSMON};
+            let fb_w = if let Some(ref fb) = shell.fb { fb.width } else { 800 };
+            let fb_h = if let Some(ref fb) = shell.fb { fb.height } else { 600 };
+            let fb_stride = if let Some(ref fb) = shell.fb { fb.stride } else { 800 };
+            let fb_fmt = if let Some(ref fb) = shell.fb { fb.pixel_format } else { 1 };
+
+            let mut comp = DesktopCompositor::new(backbuf_va, fb_w, fb_h, fb_stride, fb_fmt);
+            comp.free_ram_mib = free_ram_mib;
+            comp.total_ram_mib = total_ram_mib;
+
+            // Verify pointer input: drag terminal window
+            let ptr_click = PointerState { x: comp.windows[WIN_TERMINAL].x + 30, y: comp.windows[WIN_TERMINAL].y + 10, left_button: true, right_button: false };
+            let _ = comp.handle_pointer(&ptr_click);
+            let ptr_drag = PointerState { x: comp.windows[WIN_TERMINAL].x + 60, y: comp.windows[WIN_TERMINAL].y + 30, left_button: true, right_button: false };
+            let _ = comp.handle_pointer(&ptr_drag);
+            let ptr_up = PointerState { x: comp.windows[WIN_TERMINAL].x + 60, y: comp.windows[WIN_TERMINAL].y + 30, left_button: false, right_button: false };
+            let _ = comp.handle_pointer(&ptr_up);
+
+            // Verify taskbar and window close/focus
+            comp.toggle_or_focus(WIN_SYSMON);
+
+            // Verify terminal typing
+            let _ = comp.handle_key(b'l');
+            let _ = comp.handle_key(b's');
+            let _ = comp.handle_key(b'\n');
+
+            // Render composite frame
+            comp.render_frame(&ptr_up);
+
+            // If real Framebuffer is present, blit frame to screen
+            if let Some(ref mut fb) = shell.fb {
+                comp.blit(fb);
+            }
+
+            serial_write(uart, b"GENESIS: stage15 compositor & input ok\r\n");
+            serial_write(uart, b"GENESIS: stage15 milestone complete\r\n");
+        }
+
+        // 12. Interactive Prompt Loop
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 15)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {

@@ -49,6 +49,12 @@ impl Framebuffer {
         self.draw_rect(0, 0, self.width, self.height, color);
     }
 
+    /// Copies `bytes` directly from an off-screen Write-Back backbuffer into this framebuffer.
+    pub unsafe fn blit_from(&mut self, src_va: u64, bytes: usize) {
+        let copy_len = bytes.min(self.size);
+        core::ptr::copy_nonoverlapping(src_va as *const u8, self.base_va as *mut u8, copy_len);
+    }
+
     /// Draws a filled rectangle from `(x, y)` with width `w` and height `h`.
     pub unsafe fn draw_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: u32) {
         let x_end = (x + w).min(self.width);

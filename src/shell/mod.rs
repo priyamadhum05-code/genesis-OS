@@ -77,7 +77,9 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  clear             - Clear graphical terminal console and serial screen\r\n");
                 serial_write(self.uart_va, b"  ls [path]         - List directory contents on FAT32 volume\r\n");
                 serial_write(self.uart_va, b"  cat <file>        - Print text contents of a file\r\n");
+                serial_write(self.uart_va, b"  write <file> <text> - Write text contents to a file\r\n");
                 serial_write(self.uart_va, b"  hexdump <file>    - Display hexadecimal dump of a file\r\n");
+                serial_write(self.uart_va, b"  desktop           - Launch double-buffered graphical desktop\r\n");
                 serial_write(self.uart_va, b"  bench             - Run 4-core SMP NEON 64x64 MatMul benchmark\r\n");
                 serial_write(self.uart_va, b"  draw              - Redraw UEFI GOP framebuffer dashboard\r\n");
                 serial_write(self.uart_va, b"  run <file>        - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
@@ -321,6 +323,39 @@ impl<'a> Shell<'a> {
                     serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
                 }
             }
+            "write" => {
+                if arg.is_empty() {
+                    serial_write(self.uart_va, b"Usage: write <file> <text>\r\n");
+                } else if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                    let rem = trimmed.strip_prefix(cmd).unwrap_or("").trim_start();
+                    let text = rem.strip_prefix(arg).unwrap_or("").trim_start();
+                    let res = fat.write_file(
+                        dev,
+                        arg,
+                        text.as_bytes(),
+                        self.scratch_pa,
+                        self.scratch_va,
+                    );
+                    match res {
+                        Ok(()) => {
+                            serial_write(self.uart_va, b"Wrote ");
+                            serial_decimal(self.uart_va, text.len() as u64);
+                            serial_write(self.uart_va, b" bytes to '");
+                            serial_write(self.uart_va, arg.as_bytes());
+                            serial_write(self.uart_va, b"'\r\n");
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error writing file '");
+                            serial_write(self.uart_va, arg.as_bytes());
+                            serial_write(self.uart_va, b"': ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                }
+            }
             "hexdump" => {
                 if arg.is_empty() {
                     serial_write(self.uart_va, b"Usage: hexdump <file>\r\n");
@@ -473,6 +508,22 @@ impl<'a> Shell<'a> {
                     let cpus = ONLINE_CPUS.load(Ordering::Acquire);
                     fb.draw_dashboard(cpus, self.free_ram_mib, self.total_ram_mib, true);
                     serial_write(self.uart_va, b"UEFI GOP framebuffer dashboard redrawn.\r\n");
+                } else {
+                    serial_write(self.uart_va, b"UEFI GOP framebuffer not available (headless mode)\r\n");
+                }
+            }
+            "desktop" => {
+                if let Some(fb) = self.fb.as_deref_mut() {
+                    crate::ui::run_desktop_gui(
+                        fb,
+                        self.uart_va,
+                        self.fat,
+                        self.dev.as_deref_mut(),
+                        self.scratch_pa,
+                        self.scratch_va,
+                        self.free_ram_mib,
+                        self.total_ram_mib,
+                    );
                 } else {
                     serial_write(self.uart_va, b"UEFI GOP framebuffer not available (headless mode)\r\n");
                 }

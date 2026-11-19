@@ -24,6 +24,17 @@ pub const EV_REL: u16 = 0x02;
 pub const EV_ABS: u16 = 0x03;
 pub const EV_MSC: u16 = 0x04;
 
+// Absolute and relative axes
+pub const ABS_X: u16 = 0x00;
+pub const ABS_Y: u16 = 0x01;
+pub const REL_X: u16 = 0x00;
+pub const REL_Y: u16 = 0x01;
+
+// Mouse/tablet buttons
+pub const BTN_LEFT: u16 = 0x110;
+pub const BTN_RIGHT: u16 = 0x111;
+pub const BTN_MIDDLE: u16 = 0x112;
+
 // Linux EV_KEY keycodes
 pub const KEY_ESC: u16 = 1;
 pub const KEY_1: u16 = 2;
@@ -91,6 +102,94 @@ pub struct VirtioInputEvent {
     pub value: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PointerState {
+    pub x: i32,
+    pub y: i32,
+    pub left_button: bool,
+    pub right_button: bool,
+}
+
+impl Default for PointerState {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            left_button: false,
+            right_button: false,
+        }
+    }
+}
+
+/// Scales an EV_ABS absolute coordinate (0..32767) to screen bounds (0..max_dim).
+#[inline]
+pub fn scale_abs_coordinate(raw: u32, max_dim: u32) -> i32 {
+    let scaled = (((raw as u64) * (max_dim as u64)) / 32767) as i32;
+    scaled.clamp(0, max_dim as i32)
+}
+
+/// Clamps a relative coordinate delta within screen bounds.
+#[inline]
+pub fn update_rel_coordinate(current: i32, delta: i32, max_dim: u32) -> i32 {
+    (current + delta).clamp(0, max_dim as i32)
+}
+
+impl PointerState {
+    /// Updates pointer position and button state from a Linux input event.
+    /// Returns true if coordinates or buttons changed.
+    pub fn update_event(&mut self, ev: &VirtioInputEvent, screen_w: u32, screen_h: u32) -> bool {
+        let max_w = if screen_w > 0 { screen_w - 1 } else { 0 };
+        let max_h = if screen_h > 0 { screen_h - 1 } else { 0 };
+
+        if ev.type_ == EV_ABS {
+            if ev.code == ABS_X {
+                let new_x = scale_abs_coordinate(ev.value, max_w);
+                if self.x != new_x {
+                    self.x = new_x;
+                    return true;
+                }
+            } else if ev.code == ABS_Y {
+                let new_y = scale_abs_coordinate(ev.value, max_h);
+                if self.y != new_y {
+                    self.y = new_y;
+                    return true;
+                }
+            }
+        } else if ev.type_ == EV_REL {
+            if ev.code == REL_X {
+                let new_x = update_rel_coordinate(self.x, ev.value as i32, max_w);
+                if self.x != new_x {
+                    self.x = new_x;
+                    return true;
+                }
+            } else if ev.code == REL_Y {
+                let new_y = update_rel_coordinate(self.y, ev.value as i32, max_h);
+                if self.y != new_y {
+                    self.y = new_y;
+                    return true;
+                }
+            }
+        } else if ev.type_ == EV_KEY {
+            if ev.code == BTN_LEFT {
+                let pressed = ev.value != 0;
+                if self.left_button != pressed {
+                    self.left_button = pressed;
+                    return true;
+                }
+            } else if ev.code == BTN_RIGHT {
+                let pressed = ev.value != 0;
+                if self.right_button != pressed {
+                    self.right_button = pressed;
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
 pub struct VirtIOInputDevice {
     pub base_va: u64,
     pub version: u32,
@@ -115,16 +214,10 @@ impl VirtIOInputDevice {
         core::ptr::write_volatile((self.base_va + offset as u64) as *mut u32, val)
     }
 
-    /// Probes VirtIO MMIO slots for DeviceID == 18.
-    /// Returns `Ok(Some(dev))` if an input device is found and initialized,
-    /// `Ok(None)` if no input device exists (e.g. headless mode), or `Err(...)` on error.
-    pub unsafe fn probe(
-        base_va: u64,
-        queue_pa: u64,
-        queue_va: u64,
-    ) -> Result<Option<Self>, &'static str> {
-        let mut found_slot: Option<u64> = None;
-
+    /// Scans VirtIO MMIO slots for DeviceID == 18.
+    /// Returns the number of input device slots found and stores their base VAs in `slots_va`.
+    pub unsafe fn find_all_slots(base_va: u64, slots_va: &mut [u64]) -> usize {
+        let mut count = 0;
         for slot in 0..VIRTIO_MMIO_SLOTS {
             let slot_va = base_va + (slot as u64) * VIRTIO_MMIO_STRIDE;
             let magic = core::ptr::read_volatile(slot_va as *const u32);
@@ -133,21 +226,22 @@ impl VirtIOInputDevice {
             }
             let dev_id = core::ptr::read_volatile((slot_va + VIRTIO_REG_DEVICE_ID as u64) as *const u32);
             if dev_id == VIRTIO_DEV_INPUT {
-                found_slot = Some(slot_va);
-                break;
+                if count < slots_va.len() {
+                    slots_va[count] = slot_va;
+                    count += 1;
+                }
             }
         }
+        count
+    }
 
-        let slot_va = match found_slot {
-            Some(va) => va,
-            None => return Ok(None),
-        };
-
-        // Layout within the 4 KiB queue page:
-        // 0..256: 16 Descriptors (256 bytes)
-        // 256..292: VirtqAvail (36 bytes)
-        // 512..640: 16 VirtioInputEvent buffers (128 bytes)
-        // 2048..2200: VirtqUsed (132 bytes)
+    /// Initializes a VirtIO Input device at the specified MMIO `slot_va`.
+    /// `queue_pa` / `queue_va` must point to 2 contiguous physical pages (8192 bytes).
+    pub unsafe fn init(
+        slot_va: u64,
+        queue_pa: u64,
+        queue_va: u64,
+    ) -> Result<Self, &'static str> {
         let events_pa = queue_pa + 512;
         let events_va = queue_va + 512;
 
@@ -255,12 +349,26 @@ impl VirtIOInputDevice {
         // Notify device that receive buffers are available
         dev.write32(VIRTIO_REG_QUEUE_NOTIFY, 0);
 
-        Ok(Some(dev))
+        Ok(dev)
     }
 
-    /// Polls for a key press event and translates it to an ASCII character.
-    /// Non-blocking: returns `None` if no new key is available.
-    pub unsafe fn poll_key(&mut self) -> Option<u8> {
+    /// Probes VirtIO MMIO slots for DeviceID == 18.
+    /// Returns `Ok(Some(dev))` if an input device is found and initialized,
+    /// `Ok(None)` if no input device exists (e.g. headless mode), or `Err(...)` on error.
+    pub unsafe fn probe(
+        base_va: u64,
+        queue_pa: u64,
+        queue_va: u64,
+    ) -> Result<Option<Self>, &'static str> {
+        let mut slots = [0u64; 1];
+        if Self::find_all_slots(base_va, &mut slots) == 0 {
+            return Ok(None);
+        }
+        Self::init(slots[0], queue_pa, queue_va).map(Some)
+    }
+
+    /// Polls the next raw event from the device queue, if available.
+    pub unsafe fn poll_event(&mut self) -> Option<VirtioInputEvent> {
         let used_offset = if self.version >= 2 { 2048 } else { 4096 };
         let used = (self.queue_va + used_offset) as *mut VirtqUsed<INPUT_QUEUE_SIZE>;
 
@@ -271,7 +379,7 @@ impl VirtIOInputDevice {
         }
 
         let cur_used_idx = (*used).idx;
-        while self.last_used_idx != cur_used_idx {
+        if self.last_used_idx != cur_used_idx {
             let elem = (*used).ring[(self.last_used_idx as usize) % INPUT_QUEUE_SIZE];
             let desc_id = elem.id as usize;
 
@@ -288,14 +396,31 @@ impl VirtIOInputDevice {
             (*avail).ring[(self.avail_idx as usize) % INPUT_QUEUE_SIZE] = desc_id as u16;
             self.avail_idx = self.avail_idx.wrapping_add(1);
             (*avail).idx = self.avail_idx;
+
+            #[cfg(target_os = "uefi")]
+            {
+                core::arch::asm!("dc cvac, {}", in(reg) (self.queue_va + 256), options(nostack));
+                core::arch::asm!("dsb sy", options(nostack));
+            }
+
             self.write32(VIRTIO_REG_QUEUE_NOTIFY, 0);
 
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
+            return Some(event);
+        }
+
+        None
+    }
+
+    /// Polls for a key press event and translates it to an ASCII character.
+    /// Non-blocking: returns `None` if no new key is available.
+    pub unsafe fn poll_key(&mut self) -> Option<u8> {
+        while let Some(event) = self.poll_event() {
             if event.type_ == EV_KEY {
                 if event.code == KEY_LEFTSHIFT || event.code == KEY_RIGHTSHIFT {
                     self.shift_pressed = event.value != 0;
-                } else if event.value == 1 || event.value == 2 {
+                } else if event.code < 0x100 && (event.value == 1 || event.value == 2) {
                     // Key press (1) or repeat (2)
                     if let Some(c) = ev_key_to_ascii(event.code, self.shift_pressed) {
                         return Some(c);
@@ -305,6 +430,23 @@ impl VirtIOInputDevice {
         }
 
         None
+    }
+
+    /// Polls all pending input events and updates `state` for tablet/mouse.
+    /// Returns true if coordinates or button states changed.
+    pub unsafe fn poll_pointer(
+        &mut self,
+        screen_w: u32,
+        screen_h: u32,
+        state: &mut PointerState,
+    ) -> bool {
+        let mut changed = false;
+        while let Some(event) = self.poll_event() {
+            if state.update_event(&event, screen_w, screen_h) {
+                changed = true;
+            }
+        }
+        changed
     }
 }
 
@@ -370,19 +512,66 @@ pub fn ev_key_to_ascii(code: u16, shift: bool) -> Option<u8> {
     }
 }
 
-// Global hook for polling VirtIO-Input keyboard from serial_read_line
-static mut GLOBAL_VIRTIO_INPUT: Option<*mut VirtIOInputDevice> = None;
+// Global hooks for polling VirtIO-Input devices
+pub static mut GLOBAL_VIRTIO_INPUT: Option<*mut VirtIOInputDevice> = None;
+pub const MAX_INPUT_DEVICES: usize = 4;
+pub static mut GLOBAL_INPUT_DEVICES: [*mut VirtIOInputDevice; MAX_INPUT_DEVICES] = [core::ptr::null_mut(); MAX_INPUT_DEVICES];
+pub static mut GLOBAL_INPUT_COUNT: usize = 0;
+pub static mut GLOBAL_POINTER_STATE: PointerState = PointerState { x: 400, y: 300, left_button: false, right_button: false };
 
 pub unsafe fn register_global_virtio_input(dev: *mut VirtIOInputDevice) {
-    GLOBAL_VIRTIO_INPUT = Some(dev);
+    let global_ptr = core::ptr::addr_of_mut!(GLOBAL_VIRTIO_INPUT);
+    if (*global_ptr).is_none() {
+        *global_ptr = Some(dev);
+    }
+    let count_ptr = core::ptr::addr_of_mut!(GLOBAL_INPUT_COUNT);
+    let dev_arr_ptr = core::ptr::addr_of_mut!(GLOBAL_INPUT_DEVICES) as *mut *mut VirtIOInputDevice;
+    for i in 0..*count_ptr {
+        if *dev_arr_ptr.add(i) == dev {
+            return;
+        }
+    }
+    if *count_ptr < MAX_INPUT_DEVICES {
+        *dev_arr_ptr.add(*count_ptr) = dev;
+        *count_ptr += 1;
+    }
 }
 
 pub unsafe fn poll_global_virtio_input() -> Option<u8> {
-    if let Some(ptr) = GLOBAL_VIRTIO_INPUT {
-        (*ptr).poll_key()
-    } else {
-        None
+    let count_ptr = core::ptr::addr_of!(GLOBAL_INPUT_COUNT);
+    let dev_arr_ptr = core::ptr::addr_of!(GLOBAL_INPUT_DEVICES) as *const *mut VirtIOInputDevice;
+    for i in 0..*count_ptr {
+        let dev = *dev_arr_ptr.add(i);
+        if !dev.is_null() {
+            if let Some(key) = (*dev).poll_key() {
+                return Some(key);
+            }
+        }
     }
+    let global_ptr = core::ptr::addr_of!(GLOBAL_VIRTIO_INPUT);
+    if let Some(ptr) = *global_ptr {
+        if *count_ptr == 0 {
+            return (*ptr).poll_key();
+        }
+    }
+    None
+}
+
+pub unsafe fn poll_global_pointer(screen_w: u32, screen_h: u32) -> (PointerState, bool) {
+    let mut any_changed = false;
+    let count_ptr = core::ptr::addr_of!(GLOBAL_INPUT_COUNT);
+    let dev_arr_ptr = core::ptr::addr_of!(GLOBAL_INPUT_DEVICES) as *const *mut VirtIOInputDevice;
+    let state_ptr = core::ptr::addr_of_mut!(GLOBAL_POINTER_STATE);
+
+    for i in 0..*count_ptr {
+        let dev = *dev_arr_ptr.add(i);
+        if !dev.is_null() {
+            if (*dev).poll_pointer(screen_w, screen_h, &mut *state_ptr) {
+                any_changed = true;
+            }
+        }
+    }
+    (*state_ptr, any_changed)
 }
 
 #[cfg(test)]
@@ -393,6 +582,58 @@ mod tests {
     fn virtio_input_event_size_and_alignment() {
         assert_eq!(core::mem::size_of::<VirtioInputEvent>(), 8);
         assert_eq!(core::mem::align_of::<VirtioInputEvent>(), 4);
+    }
+
+    #[test]
+    fn pointer_state_abs_scaling_and_clamping_test() {
+        let mut state = PointerState { x: 400, y: 300, left_button: false, right_button: false };
+
+        // Test scaling 0 -> 0
+        let ev_x0 = VirtioInputEvent { type_: EV_ABS, code: ABS_X, value: 0 };
+        assert!(state.update_event(&ev_x0, 800, 600));
+        assert_eq!(state.x, 0);
+
+        // Test scaling 32767 -> 799 (width - 1)
+        let ev_xmax = VirtioInputEvent { type_: EV_ABS, code: ABS_X, value: 32767 };
+        assert!(state.update_event(&ev_xmax, 800, 600));
+        assert_eq!(state.x, 799);
+
+        // Test scaling midpoint: 16383 -> ~399
+        let ev_xmid = VirtioInputEvent { type_: EV_ABS, code: ABS_X, value: 16383 };
+        assert!(state.update_event(&ev_xmid, 800, 600));
+        assert!((state.x - 399).abs() <= 1);
+
+        // Test Y scaling: 32767 -> 599 (height - 1)
+        let ev_ymax = VirtioInputEvent { type_: EV_ABS, code: ABS_Y, value: 32767 };
+        assert!(state.update_event(&ev_ymax, 800, 600));
+        assert_eq!(state.y, 599);
+
+        // Buttons
+        let ev_lpress = VirtioInputEvent { type_: EV_KEY, code: BTN_LEFT, value: 1 };
+        assert!(state.update_event(&ev_lpress, 800, 600));
+        assert_eq!(state.left_button, true);
+
+        let ev_lrelease = VirtioInputEvent { type_: EV_KEY, code: BTN_LEFT, value: 0 };
+        assert!(state.update_event(&ev_lrelease, 800, 600));
+        assert_eq!(state.left_button, false);
+
+        let ev_rpress = VirtioInputEvent { type_: EV_KEY, code: BTN_RIGHT, value: 1 };
+        assert!(state.update_event(&ev_rpress, 800, 600));
+        assert_eq!(state.right_button, true);
+    }
+
+    #[test]
+    fn pointer_state_rel_delta_and_clamping_test() {
+        let mut state = PointerState { x: 100, y: 100, left_button: false, right_button: false };
+
+        let ev_rel_x = VirtioInputEvent { type_: EV_REL, code: REL_X, value: 25 as u32 };
+        assert!(state.update_event(&ev_rel_x, 800, 600));
+        assert_eq!(state.x, 125);
+
+        // Clamping negative
+        let ev_rel_neg = VirtioInputEvent { type_: EV_REL, code: REL_X, value: (-500i32) as u32 };
+        assert!(state.update_event(&ev_rel_neg, 800, 600));
+        assert_eq!(state.x, 0);
     }
 
     #[test]

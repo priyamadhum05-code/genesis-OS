@@ -24,6 +24,7 @@ exec "$QEMU" -machine virt-11.1,gic-version=3 -cpu cortex-a76 -smp "${QEMU_SMP:-
   -device virtio-blk-device,drive=esp \
   -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
   -device virtio-keyboard-device \
+  -device virtio-tablet-device \
   -device ramfb \
   -device virtio-gpu-pci \
   -serial stdio \
