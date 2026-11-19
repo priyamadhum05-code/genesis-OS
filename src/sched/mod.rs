@@ -38,6 +38,7 @@ impl TaskFpContext {
 pub struct Task {
     pub id: usize,
     pub pid: u64,
+    pub asid: u16,
     pub state: TaskState,
     pub sp: u64,
     pub stack_top: u64,
@@ -51,6 +52,7 @@ impl Task {
         Self {
             id: 0,
             pid: 0,
+            asid: 0,
             state: TaskState::Unused,
             sp: 0,
             stack_top: 0,
@@ -163,6 +165,8 @@ pub fn spawn_user_process(
     let mut sched = SCHEDULER.lock();
     for idx in 1..MAX_TASKS {
         if sched.tasks[idx].state == TaskState::Unused || sched.tasks[idx].state == TaskState::Finished {
+            let asid = ((pid as u16) & 0xFF).max(1);
+            let ttbr0_with_asid = ((asid as u64) << 48) | (ttbr0_root & 0x0000_FFFF_FFFF_FFFF);
             let frame_ptr = (kernel_stack_top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
             unsafe {
                 (*frame_ptr).x = [0; 31];
@@ -171,16 +175,17 @@ pub fn spawn_user_process(
                 (*frame_ptr).esr_el1 = 0;
                 (*frame_ptr).far_el1 = 0;
                 (*frame_ptr).sp_el0 = user_sp;
-                (*frame_ptr).ttbr0_root = ttbr0_root;
+                (*frame_ptr).ttbr0_root = ttbr0_with_asid;
                 (*frame_ptr).pid = pid;
             }
 
             sched.tasks[idx].id = idx;
             sched.tasks[idx].pid = pid;
+            sched.tasks[idx].asid = asid;
             sched.tasks[idx].state = TaskState::Ready;
             sched.tasks[idx].sp = frame_ptr as u64;
             sched.tasks[idx].stack_top = kernel_stack_top;
-            sched.tasks[idx].ttbr0_root = ttbr0_root;
+            sched.tasks[idx].ttbr0_root = ttbr0_with_asid;
             sched.tasks[idx].sp_el0 = user_sp;
             sched.tasks[idx].fp_ctx = TaskFpContext::empty();
             return Ok(idx);
@@ -310,7 +315,7 @@ pub fn scheduler_tick_opt(current_frame: *mut TrapFrame, force_main: bool) -> *m
     #[cfg(target_os = "uefi")]
     unsafe {
         if next_ttbr0 != 0 {
-            // Switch to user TTBR0_EL1, clear TCR_EL1.EPD0, flush TLB
+            // Switch to user TTBR0_EL1 with ASID, clear TCR_EL1.EPD0 (no global TLBI needed due to ASID tagging)
             core::arch::asm!(
                 "msr ttbr0_el1, {0}",
                 "isb",
@@ -318,22 +323,16 @@ pub fn scheduler_tick_opt(current_frame: *mut TrapFrame, force_main: bool) -> *m
                 "bic {1}, {1}, #(1 << 7)", // EPD0 = 0
                 "msr tcr_el1, {1}",
                 "isb",
-                "tlbi vmalle1is",
-                "dsb ish",
-                "isb",
                 in(reg) next_ttbr0,
                 out(reg) _,
                 options(nostack)
             );
         } else {
-            // EL1-only task: set TCR_EL1.EPD0 = 1, flush TLB
+            // EL1-only task: set TCR_EL1.EPD0 = 1
             core::arch::asm!(
                 "mrs {0}, tcr_el1",
                 "orr {0}, {0}, #(1 << 7)", // EPD0 = 1
                 "msr tcr_el1, {0}",
-                "isb",
-                "tlbi vmalle1is",
-                "dsb ish",
                 "isb",
                 out(reg) _,
                 options(nostack)
@@ -451,9 +450,11 @@ mod tests {
 
         let sched = SCHEDULER.lock();
         assert_eq!(sched.tasks[1].pid, 101);
-        assert_eq!(sched.tasks[1].ttbr0_root, 0x4100_0000);
+        assert_eq!(sched.tasks[1].asid, 101);
+        assert_eq!(sched.tasks[1].ttbr0_root & 0x0000_FFFF_FFFF_FFFF, 0x4100_0000);
         assert_eq!(sched.tasks[2].pid, 102);
-        assert_eq!(sched.tasks[2].ttbr0_root, 0x4200_0000);
+        assert_eq!(sched.tasks[2].asid, 102);
+        assert_eq!(sched.tasks[2].ttbr0_root & 0x0000_FFFF_FFFF_FFFF, 0x4200_0000);
         drop(sched);
 
         // Simulate tick from task 0: should select task 1

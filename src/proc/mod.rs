@@ -1,11 +1,13 @@
 //! Process and EL0 User-Space Management for Project Genesis (Stage 9A).
 
 pub mod elf;
+pub mod ipc;
 
 pub use elf::{
-    destroy_user_page_table, destroy_user_process, load_elf64, Elf64Header, Elf64Phdr, ElfProcess,
-    USER_STACK_BASE, USER_STACK_PAGES, USER_STACK_TOP,
+    destroy_user_page_table, destroy_user_process, invalidate_asid, load_elf64, Elf64Header,
+    Elf64Phdr, ElfProcess, USER_STACK_BASE, USER_STACK_PAGES, USER_STACK_TOP,
 };
+pub use ipc::{IpcMailbox, IPC_MAILBOX, SYS_IPC_RECV, SYS_IPC_SEND};
 
 #[cfg(target_os = "uefi")]
 core::arch::global_asm!(

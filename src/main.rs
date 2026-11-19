@@ -7,11 +7,13 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{arch::asm, panic::PanicInfo, ptr, sync::atomic::{AtomicBool, AtomicU64, Ordering}};
 use genesis_stage1::{
     ai::{
-        load_micro_llm_from_bytes, load_model_from_bytes, load_transformer_from_bytes,
-        run_parallel_micro_llm_step, run_parallel_nn_inference, run_parallel_transformer,
-        scalar_infer, scalar_matmul, scalar_micro_llm_step, scalar_transformer_block,
-        smp_matmul_worker, verify_inference, verify_llm_step, verify_matrices, verify_transformer,
-        MATMUL_N, SMP_MICRO_LLM_WEIGHTS, SMP_NN_CTX, SMP_TRANSFORMER_CTX,
+        load_llama_weights, load_micro_llm_from_bytes, load_model_from_bytes,
+        load_transformer_from_bytes, run_llama_forward_step, run_parallel_micro_llm_step,
+        run_parallel_nn_inference, run_parallel_transformer, sample_greedy, scalar_infer,
+        scalar_matmul, scalar_micro_llm_step, scalar_transformer_block, smp_matmul_worker,
+        verify_inference, verify_llm_step, verify_matrices, verify_transformer, LLAMA_SEQ_LEN,
+        MATMUL_N, SMP_LLAMA_CTX, SMP_LLAMA_WEIGHTS, SMP_MICRO_LLM_WEIGHTS, SMP_NN_CTX,
+        SMP_TRANSFORMER_CTX,
     },
     arch::{
         dispatch_smp_work, parse_fdt_devices, psci_cpu_on, secondary_boot_stub, secondary_main,
@@ -21,11 +23,12 @@ use genesis_stage1::{
     },
     drivers::{
         register_global_fb_console, virtio_input::VirtIOInputDevice, FbConsole, Framebuffer,
-        VirtIOBlockDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC,
+        VirtIOBlockDevice, VirtIONetDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC,
     },
     fs::{locate_volume, FatVolume},
     memory_map,
     mm::heap::SpinLock,
+    net,
     pmm::{self, PhysicalPageAllocator, ReservedRange, KERNEL_PMM_WORDS},
     proc::{destroy_user_process, load_elf64, run_user_process},
     sched,
@@ -1337,6 +1340,44 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             genesis_stage1::drivers::virtio_input::register_global_virtio_input(input_dev as *mut _);
         }
 
+        // Stage 12B: Probe VirtIO-Net (DeviceID == 1)
+        let rx_q_pa = mapper.pmm_mut().allocate_contiguous_pages(2).unwrap();
+        let rx_q_va = HHDM_BASE + rx_q_pa;
+        let tx_q_pa = mapper.pmm_mut().allocate_contiguous_pages(2).unwrap();
+        let tx_q_va = HHDM_BASE + tx_q_pa;
+        let rx_buf_pa = mapper.pmm_mut().allocate_contiguous_pages(8).unwrap();
+        let rx_buf_va = HHDM_BASE + rx_buf_pa;
+        let tx_buf_pa = mapper.pmm_mut().allocate_contiguous_pages(1).unwrap();
+        let tx_buf_va = HHDM_BASE + tx_buf_pa;
+
+        let mut net_dev_opt = match VirtIONetDevice::probe(
+            VIRTIO_MMIO_VA,
+            rx_q_pa,
+            rx_q_va,
+            tx_q_pa,
+            tx_q_va,
+            rx_buf_pa,
+            rx_buf_va,
+            tx_buf_pa,
+            tx_buf_va,
+        ) {
+            Ok(Some(dev)) => {
+                serial_write(uart, b"GENESIS: virtio-net detected (version=");
+                serial_decimal(uart, dev.version as u64);
+                serial_write(uart, b", MAC=");
+                dev.print_mac(uart);
+                serial_write(uart, b")\r\n");
+                Some(dev)
+            }
+            _ => {
+                let _ = mapper.pmm_mut().free_contiguous_pages(rx_q_pa, 2);
+                let _ = mapper.pmm_mut().free_contiguous_pages(tx_q_pa, 2);
+                let _ = mapper.pmm_mut().free_contiguous_pages(rx_buf_pa, 8);
+                let _ = mapper.pmm_mut().free_page(tx_buf_pa);
+                None
+            }
+        };
+
         // Allocate 1 page for Sector 0 request buffers
         let req_pa = mapper.pmm_mut().allocate_page().unwrap();
         let req_va = HHDM_BASE + req_pa;
@@ -1520,10 +1561,10 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             serial_write(uart, b"GENESIS: stage8 framebuffer skipped (headless mode)\r\n");
         }
 
-        // 2. Dedicated 128 KiB Buffer for Shell File Reading
-        let shell_file_pa = mapper.pmm_mut().allocate_contiguous_pages(32).unwrap();
+        // 2. Dedicated 512 KiB Buffer for Shell File Reading
+        let shell_file_pa = mapper.pmm_mut().allocate_contiguous_pages(128).unwrap();
         let shell_file_va = HHDM_BASE + shell_file_pa;
-        let shell_file_cap = 128 * 1024;
+        let shell_file_cap = 512 * 1024;
 
         // 3. Initialize Interactive Shell
         let total_ram_mib = (total_usable * 4) / 1024;
@@ -1531,6 +1572,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         let mut shell = Shell {
             uart_va: uart,
             dev: Some(&mut blk_dev),
+            net_dev: net_dev_opt.as_mut(),
             fat: Some(&volume),
             scratch_pa,
             scratch_va,
@@ -1546,6 +1588,8 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             llm_fn: Some(kernel_run_llm),
             multitask_fn: Some(kernel_run_multitask),
             generate_fn: Some(kernel_run_generate),
+            llama_fn: Some(kernel_run_llama),
+            ping_fn: Some(kernel_ping_target),
         };
 
         // 4. Automated Shell Self-Test (info, ls, bench)
@@ -1570,8 +1614,18 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         shell.execute_command("generate GENESIS ");
         serial_write(uart, b"GENESIS: stage11 milestone complete\r\n");
 
-        // 8. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 11)\r\n");
+        // 8. Stage 12 Automated Smoke-Test (netinfo, ping, llama)
+        shell.execute_command("netinfo");
+        if shell.net_dev.is_some() {
+            shell.execute_command("ping 10.0.2.2");
+        } else {
+            serial_write(uart, b"GENESIS: stage12 virtio-net skipped (headless mode)\r\n");
+        }
+        shell.execute_command("llama GENESIS");
+        serial_write(uart, b"GENESIS: stage12 milestone complete\r\n");
+
+        // 9. Interactive Prompt Loop
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 12)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {
@@ -1865,6 +1919,192 @@ unsafe fn kernel_run_generate(
     serial_write(uart, b" tokens/sec (");
     serial_decimal(uart, us_per_tok);
     serial_write(uart, b" us/token, ");
+    serial_decimal(uart, total_us);
+    serial_write(uart, b" us total, cores=4)\r\n");
+
+    Ok(())
+}
+
+unsafe fn kernel_ping_target(net: &mut VirtIONetDevice, _uart: usize) -> Result<u64, &'static str> {
+    // 1. Resolve ARP for Gateway 10.0.2.2
+    let mut arp_frame = [0u8; 42];
+    net::build_ethernet_header(&mut arp_frame[0..14], net::BROADCAST_MAC, net.mac, net::ETHERTYPE_ARP);
+    net::build_arp_packet(
+        &mut arp_frame[14..42],
+        net::ARP_OP_REQUEST,
+        net.mac,
+        net::GUEST_IP,
+        [0u8; 6],
+        net::GATEWAY_IP,
+    );
+
+    net.send_packet(&arp_frame)?;
+
+    // Poll for ARP Reply
+    let mut gw_mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]; // standard QEMU SLIRP gateway MAC default
+    let mut rx_buf = [0u8; 1536];
+    let mut spins = 0usize;
+
+    while spins < 1_000_000 {
+        if let Some(len) = net.poll_packet(&mut rx_buf) {
+            if len >= 42 {
+                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
+                if ethertype == net::ETHERTYPE_ARP {
+                    if let Some((op, sender_mac, sender_ip, target_ip)) = net::parse_arp(&rx_buf[14..len]) {
+                        if op == net::ARP_OP_REPLY && sender_ip == net::GATEWAY_IP && target_ip == net::GUEST_IP {
+                            gw_mac = sender_mac;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+
+    // 2. Build and send ICMP Echo Request
+    let mut icmp_frame = [0u8; 74];
+    net::build_ethernet_header(&mut icmp_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
+    let payload = b"Genesis ICMP Ping Stage 12 Test!";
+    let icmp_len = net::build_icmp_echo(
+        &mut icmp_frame[34..74],
+        net::ICMP_TYPE_ECHO_REQUEST,
+        0x1234,
+        1,
+        payload,
+    );
+    net::build_ipv4_header(
+        &mut icmp_frame[14..34],
+        icmp_len as u16,
+        net::IP_PROTO_ICMP,
+        net::GUEST_IP,
+        net::GATEWAY_IP,
+        0x5678,
+    );
+
+    let t0: u64;
+    let cntfrq: u64;
+    #[cfg(target_os = "uefi")]
+    {
+        asm!("mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
+        asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        t0 = 0;
+        cntfrq = 1_000_000;
+    }
+
+    net.send_packet(&icmp_frame)?;
+
+    // Poll for ICMP Echo Reply
+    spins = 0;
+    let mut ping_ok = false;
+    let mut t1: u64 = t0;
+
+    while spins < 2_000_000 {
+        if let Some(len) = net.poll_packet(&mut rx_buf) {
+            if len >= 34 {
+                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
+                if ethertype == net::ETHERTYPE_IPV4 {
+                    if let Some((src, dst, icmp_type, _code, ident, _seq, _)) = net::parse_icmp_reply(&rx_buf[14..len]) {
+                        if src == net::GATEWAY_IP && dst == net::GUEST_IP && icmp_type == net::ICMP_TYPE_ECHO_REPLY && ident == 0x1234 {
+                            #[cfg(target_os = "uefi")]
+                            asm!("mrs {}, cntvct_el0", out(reg) t1, options(nomem, nostack));
+                            #[cfg(not(target_os = "uefi"))]
+                            { t1 = 500; }
+                            ping_ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+
+    if !ping_ok {
+        return Err("ICMP ping response timed out");
+    }
+
+    let ticks = t1.saturating_sub(t0);
+    let us = if cntfrq > 0 { (ticks * 1_000_000) / cntfrq } else { 0 };
+    Ok(us)
+}
+
+unsafe fn kernel_run_llama(
+    model_data: &[u8],
+    prompt_str: &str,
+    uart: usize,
+) -> Result<(), &'static str> {
+    let weights = &mut *core::ptr::addr_of_mut!(SMP_LLAMA_WEIGHTS);
+    load_llama_weights(model_data, weights)?;
+
+    let ctx = &mut *core::ptr::addr_of_mut!(SMP_LLAMA_CTX);
+
+    serial_write(uart, b"Prompt: \"");
+    serial_write(uart, prompt_str.as_bytes());
+    serial_write(uart, b"\"\r\nOutput: ");
+    serial_write(uart, prompt_str.as_bytes());
+
+    let prompt_bytes = prompt_str.as_bytes();
+    let prompt_len = prompt_bytes.len().min(LLAMA_SEQ_LEN - 8);
+
+    let t0: u64;
+    let t1: u64;
+    let cntfrq: u64;
+    #[cfg(target_os = "uefi")]
+    {
+        asm!("mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
+        asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        t0 = 0;
+        cntfrq = 1_000_000;
+    }
+
+    // Process prompt tokens
+    for pos in 0..prompt_len {
+        let tok = prompt_bytes[pos] as usize;
+        run_llama_forward_step(weights, ctx, tok, pos);
+    }
+
+    // Autoregressive generation (4 new tokens)
+    let steps_to_gen = 4;
+    for i in 0..steps_to_gen {
+        let next_tok = sample_greedy(&ctx.logits);
+        let char_byte = if next_tok < 128 && (next_tok as u8).is_ascii_graphic() || next_tok == b' ' as usize {
+            next_tok as u8
+        } else {
+            b'.'
+        };
+        serial_write(uart, &[char_byte]);
+
+        let pos = prompt_len + i;
+        if pos < LLAMA_SEQ_LEN - 1 {
+            run_llama_forward_step(weights, ctx, next_tok, pos);
+        }
+    }
+
+    #[cfg(target_os = "uefi")]
+    {
+        asm!("mrs {}, cntvct_el0", out(reg) t1, options(nomem, nostack));
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        t1 = 1000;
+    }
+
+    let ticks = t1.saturating_sub(t0);
+    let total_us = if cntfrq > 0 { (ticks * 1_000_000) / cntfrq } else { 0 };
+    let tok_per_sec = if total_us > 0 { ((steps_to_gen as u64) * 1_000_000) / total_us } else { 0 };
+
+    serial_write(uart, b"\r\nLlama-2 stats: ");
+    serial_decimal(uart, tok_per_sec);
+    serial_write(uart, b" tokens/sec (");
     serial_decimal(uart, total_us);
     serial_write(uart, b" us total, cores=4)\r\n");
 

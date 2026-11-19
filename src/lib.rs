@@ -6,6 +6,7 @@ pub mod drivers;
 pub mod fs;
 pub mod memory_map;
 pub mod mm;
+pub mod net;
 pub mod pmm;
 pub mod sched;
 pub mod shell;

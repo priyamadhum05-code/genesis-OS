@@ -108,10 +108,108 @@ if not os.path.exists(transformer_path):
         f.write(tf_data)
     print('Generated', transformer_path)
 
-# 4. APP1.ELF and APP2.ELF
-def build_app_elf(pid: int, path: str):
-    magic = b'\x7fELF'
-    ident = magic + bytes([2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+# 4. APP1.ELF and APP2.ELF (Stage 12 IPC)
+def assemble_arm64(asm_text):
+    import subprocess
+    with open('/tmp/asm.s', 'w') as f:
+        f.write('.text\n' + asm_text)
+    subprocess.run(['clang', '-c', '/tmp/asm.s', '-o', '/tmp/asm.o'], capture_output=True, check=True)
+    out = subprocess.run(['otool', '-t', '/tmp/asm.o'], capture_output=True, text=True, check=True).stdout
+    res = bytearray()
+    for line in out.splitlines()[2:]:
+        parts = line.split()
+        if len(parts) > 1:
+            for word in parts[1:]:
+                res.extend(bytes.fromhex(word)[::-1])
+    return bytes(res)
+
+app1_asm = '''
+    mov x8, #172
+    svc #0
+    mov x8, #1
+    adr x0, msg1
+    mov x1, #20
+    svc #0
+    mov x0, #2
+    adr x1, msg_ipc
+    mov x2, #15
+    mov x8, #200
+    svc #0
+    mov x19, #3
+1:
+    mov x20, #2000
+2:
+    subs x20, x20, #1
+    b.ne 2b
+    mov x8, #124
+    svc #0
+    subs x19, x19, #1
+    b.ne 1b
+    mov x8, #1
+    adr x0, msg2
+    mov x1, #21
+    svc #0
+    mov x8, #93
+    mov x0, #0
+    svc #0
+
+msg1:
+    .ascii "[PID 1] task active\\n"
+msg_ipc:
+    .ascii "PING_FROM_PID1\\n"
+msg2:
+    .ascii "[PID 1] task exiting\\n"
+'''
+
+app2_asm = '''
+    mov x8, #172
+    svc #0
+    mov x8, #1
+    adr x0, msg1
+    mov x1, #20
+    svc #0
+    sub sp, sp, #64
+    mov x19, #200
+recv_loop:
+    mov x0, #1
+    mov x1, sp
+    mov x2, #64
+    mov x8, #201
+    svc #0
+    cmp x0, #0
+    b.gt msg_received
+    mov x8, #124
+    svc #0
+    subs x19, x19, #1
+    b.ne recv_loop
+    b exit_app
+
+msg_received:
+    mov x2, x0
+    mov x1, sp
+    mov x0, #1
+    mov x8, #1
+    svc #0
+
+exit_app:
+    add sp, sp, #64
+    mov x2, #0
+    mov x8, #1
+    adr x0, msg2
+    mov x1, #21
+    svc #0
+    mov x8, #93
+    mov x0, #0
+    svc #0
+
+msg1:
+    .ascii "[PID 2] task active\\n"
+msg2:
+    .ascii "[PID 2] task exiting\\n"
+'''
+
+def write_app_elf(code, path):
+    ident = b'\x7fELF' + bytes([2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     ehdr = struct.pack(
         '<16sHHIQQQIHHHHHH',
         ident,
@@ -134,49 +232,21 @@ def build_app_elf(pid: int, path: str):
         0,              # p_offset
         0x0040_0000,    # p_vaddr
         0x0040_0000,    # p_paddr
-        256,            # p_filesz
-        256,            # p_memsz
+        512,            # p_filesz
+        512,            # p_memsz
         4096            # p_align
     )
-    code = bytes([
-        0x88, 0x15, 0x80, 0xd2, # mov x8, #172 (SYS_GETPID)
-        0x01, 0x00, 0x00, 0xd4, # svc #0
-        0x73, 0x00, 0x80, 0xd2, # mov x19, #3
-        0x28, 0x00, 0x80, 0xd2, # mov x8, #1
-        0x20, 0x02, 0x00, 0x10, # adr x0, msg1
-        0x81, 0x02, 0x80, 0xd2, # mov x1, #20
-        0x01, 0x00, 0x00, 0xd4, # svc #0
-        0x14, 0xfa, 0x80, 0xd2, # mov x20, #2000
-        0x94, 0x06, 0x00, 0xf1, # subs x20, x20, #1
-        0xe1, 0xff, 0xff, 0x54, # b.ne 0x20
-        0x88, 0x0f, 0x80, 0xd2, # mov x8, #124 (SYS_YIELD)
-        0x01, 0x00, 0x00, 0xd4, # svc #0
-        0x73, 0x06, 0x00, 0xf1, # subs x19, x19, #1
-        0xc1, 0xfe, 0xff, 0x54, # b.ne 0x0c
-        0x28, 0x00, 0x80, 0xd2, # mov x8, #1
-        0x60, 0x01, 0x00, 0x10, # adr x0, msg2
-        0xa1, 0x02, 0x80, 0xd2, # mov x1, #21
-        0x01, 0x00, 0x00, 0xd4, # svc #0
-        0xa8, 0x0b, 0x80, 0xd2, # mov x8, #93 (SYS_EXIT)
-        0x00, 0x00, 0x80, 0xd2, # mov x0, #0
-        0x01, 0x00, 0x00, 0xd4, # svc #0
-    ])
-    msg1 = f"[PID {pid}] task active\n".encode('ascii')
-    msg2 = f"[PID {pid}] task exiting\n".encode('ascii')
     pad = b'\x00' * (128 - len(ehdr) - len(phdr))
-    body = ehdr + phdr + pad + code + msg1 + msg2
-    body += b'\x00' * (256 - len(body))
+    body = ehdr + phdr + pad + code
+    body += b'\x00' * (512 - len(body))
     with open(path, 'wb') as f:
         f.write(body)
     print('Generated', path)
 
-app1_path = 'build/esp/APP1.ELF'
-if not os.path.exists(app1_path):
-    build_app_elf(1, app1_path)
-
-app2_path = 'build/esp/APP2.ELF'
-if not os.path.exists(app2_path):
-    build_app_elf(2, app2_path)
+c1 = assemble_arm64(app1_asm)
+c2 = assemble_arm64(app2_asm)
+write_app_elf(c1, 'build/esp/APP1.ELF')
+write_app_elf(c2, 'build/esp/APP2.ELF')
 
 # 5. MICRO_LLM.BIN
 llm_path = 'build/esp/MICRO_LLM.BIN'

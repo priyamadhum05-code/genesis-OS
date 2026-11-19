@@ -209,6 +209,23 @@ pub fn load_elf64<const N: usize>(
     })
 }
 
+/// Invalidate TLB entries for a specific ASID across all inner shareable cores.
+pub fn invalidate_asid(asid: u16) {
+    #[cfg(target_os = "uefi")]
+    unsafe {
+        let asid_reg = (asid as u64) << 48;
+        core::arch::asm!(
+            "tlbi aside1is, {0}",
+            "dsb ish",
+            "isb",
+            in(reg) asid_reg,
+            options(nostack)
+        );
+    }
+    #[cfg(not(target_os = "uefi"))]
+    let _ = asid;
+}
+
 /// Recursively tears down and frees all physical frames (leaf pages + page tables)
 /// belonging to an ELF user process address space.
 pub unsafe fn destroy_user_process<const N: usize>(
@@ -217,15 +234,20 @@ pub unsafe fn destroy_user_process<const N: usize>(
     hhdm_base: u64,
 ) {
     destroy_user_page_table(proc.ttbr0_root, hhdm_base, pmm);
+    let asid = (proc.ttbr0_root >> 48) as u16;
+    if asid > 0 {
+        invalidate_asid(asid);
+    }
 }
 
 /// Recursively traverses a 4-level translation table from `root_pa` and returns
 /// all mapped leaf pages and intermediate table pages to `pmm`.
 pub unsafe fn destroy_user_page_table<const N: usize>(
-    root_pa: u64,
+    raw_root_pa: u64,
     hhdm_base: u64,
     pmm: &mut PhysicalPageAllocator<N>,
 ) {
+    let root_pa = raw_root_pa & 0x0000_FFFF_FFFF_FFFF;
     let l0 = (hhdm_base + root_pa) as *const [u64; 512];
     for &l0_entry in (*l0).iter() {
         if !crate::vmm::page_table::is_valid(l0_entry) || !crate::vmm::page_table::is_table(l0_entry) {

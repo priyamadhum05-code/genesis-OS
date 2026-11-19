@@ -118,15 +118,16 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
                     // SYS_WRITE (fd = arg0, buf = arg1 / arg0, count = arg2 / arg1)
                     // Standard Linux AArch64: x0 = fd, x1 = buf, x2 = count
                     // Minimal genesis binary: x0 = buf, x1 = count or x0 = fd, x1 = buf, x2 = count
-                    let (buf, count) = if frame.x[1] > 0 && frame.x[2] > 0 {
-                        // Standard ABI: x1 = buf, x2 = count
+                    let (buf, count) = if frame.x[0] <= 10 && frame.x[1] >= 4096 && frame.x[2] > 0 {
+                        // Standard ABI: x0 = fd, x1 = buf, x2 = count
                         (frame.x[1], frame.x[2] as usize)
                     } else {
                         // Compact ABI: x0 = buf, x1 = count
                         (frame.x[0], frame.x[1] as usize)
                     };
 
-                    if buf < 0x0000_8000_0000_0000
+                    if buf >= 4096
+                        && buf < 0x0000_8000_0000_0000
                         && buf.checked_add(count as u64).map_or(false, |end| end <= 0x0000_8000_0000_0000)
                     {
                         if uart != 0 {
@@ -163,6 +164,44 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
                 172 => {
                     // SYS_GETPID
                     frame.x[0] = crate::sched::current_task_pid();
+                    return frame as *mut TrapFrame;
+                }
+                200 => {
+                    // SYS_IPC_SEND: x0 = target_pid, x1 = buf, x2 = count
+                    let target_pid = frame.x[0];
+                    let buf = frame.x[1];
+                    let count = frame.x[2] as usize;
+                    let sender_pid = crate::sched::current_task_pid();
+                    if buf < 0x0000_8000_0000_0000
+                        && buf.checked_add(count as u64).map_or(false, |end| end <= 0x0000_8000_0000_0000)
+                    {
+                        let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+                        match crate::proc::ipc::IPC_MAILBOX.lock().send(sender_pid, target_pid, slice) {
+                            Ok(()) => frame.x[0] = 0,
+                            Err(e) => frame.x[0] = e as u64,
+                        }
+                    } else {
+                        frame.x[0] = (-14i64) as u64; // -EFAULT
+                    }
+                    return frame as *mut TrapFrame;
+                }
+                201 => {
+                    // SYS_IPC_RECV: x0 = sender_filter (0 = any), x1 = buf, x2 = max_len
+                    let sender_filter = frame.x[0];
+                    let buf = frame.x[1];
+                    let max_len = frame.x[2] as usize;
+                    let receiver_pid = crate::sched::current_task_pid();
+                    if buf < 0x0000_8000_0000_0000
+                        && buf.checked_add(max_len as u64).map_or(false, |end| end <= 0x0000_8000_0000_0000)
+                    {
+                        let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, max_len) };
+                        match crate::proc::ipc::IPC_MAILBOX.lock().recv(receiver_pid, sender_filter, slice) {
+                            Ok((_sender, bytes_read)) => frame.x[0] = bytes_read as u64,
+                            Err(e) => frame.x[0] = e as u64,
+                        }
+                    } else {
+                        frame.x[0] = (-14i64) as u64; // -EFAULT
+                    }
                     return frame as *mut TrapFrame;
                 }
                 _ => {

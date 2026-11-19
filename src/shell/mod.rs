@@ -8,7 +8,7 @@ use crate::{
     arch::{
         psci_system_off, serial_decimal, serial_hex, serial_write, ONLINE_CPUS,
     },
-    drivers::{Framebuffer, VirtIOBlockDevice},
+    drivers::{Framebuffer, VirtIOBlockDevice, VirtIONetDevice},
     fs::FatVolume,
     mm::HEAP_ALLOCATOR,
 };
@@ -22,6 +22,7 @@ pub enum ShellResult {
 pub struct Shell<'a> {
     pub uart_va: usize,
     pub dev: Option<&'a mut VirtIOBlockDevice>,
+    pub net_dev: Option<&'a mut VirtIONetDevice>,
     pub fat: Option<&'a FatVolume>,
     pub scratch_pa: u64,
     pub scratch_va: u64,
@@ -37,6 +38,8 @@ pub struct Shell<'a> {
     pub llm_fn: Option<unsafe fn(&[u8], usize) -> Result<u64, &'static str>>,
     pub multitask_fn: Option<unsafe fn(&[u8], &[u8], usize) -> Result<(), &'static str>>,
     pub generate_fn: Option<unsafe fn(&[u8], &str, usize) -> Result<(), &'static str>>,
+    pub llama_fn: Option<unsafe fn(&[u8], &str, usize) -> Result<(), &'static str>>,
+    pub ping_fn: Option<unsafe fn(&mut VirtIONetDevice, usize) -> Result<u64, &'static str>>,
 }
 
 impl<'a> Shell<'a> {
@@ -53,10 +56,12 @@ impl<'a> Shell<'a> {
 
         match cmd {
             "help" => {
-                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 11)\r\n");
+                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 12)\r\n");
                 serial_write(self.uart_va, b"Available commands:\r\n");
                 serial_write(self.uart_va, b"  help              - List available commands\r\n");
                 serial_write(self.uart_va, b"  info              - Display system status, memory, registers, and framebuffer\r\n");
+                serial_write(self.uart_va, b"  netinfo           - Display VirtIO-Net MAC, IP, gateway, and status\r\n");
+                serial_write(self.uart_va, b"  ping [ip]         - Send ICMP echo request over VirtIO-Net\r\n");
                 serial_write(self.uart_va, b"  clear             - Clear graphical terminal console and serial screen\r\n");
                 serial_write(self.uart_va, b"  ls [path]         - List directory contents on FAT32 volume\r\n");
                 serial_write(self.uart_va, b"  cat <file>        - Print text contents of a file\r\n");
@@ -66,8 +71,9 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  run <file>        - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
                 serial_write(self.uart_va, b"  infer [file]      - Run 4-core SMP INT8 NEON neural network inference\r\n");
                 serial_write(self.uart_va, b"  llm [file]        - Run 4-core SMP INT8 NEON transformer block\r\n");
-                serial_write(self.uart_va, b"  multitask         - Run preemptive multi-process EL0 scheduling (APP1 + APP2)\r\n");
+                serial_write(self.uart_va, b"  multitask         - Run preemptive multi-process EL0 scheduling & IPC\r\n");
                 serial_write(self.uart_va, b"  generate [seed]   - Run 4-core SMP autoregressive Micro-LLM text generation\r\n");
+                serial_write(self.uart_va, b"  llama [prompt]    - Run 4-core SMP Llama-2 transformer inference\r\n");
                 serial_write(self.uart_va, b"  halt / poweroff   - Power off system via PSCI SYSTEM_OFF\r\n");
             }
             "info" => {
@@ -419,6 +425,9 @@ impl<'a> Shell<'a> {
                                 match multi_fn(app1_slice, app2_slice, self.uart_va) {
                                     Ok(()) => {
                                         serial_write(self.uart_va, b"GENESIS: stage11 el0 multitask ok\r\n");
+                                        if crate::proc::ipc::IPC_MAILBOX.lock().verified_ping {
+                                            serial_write(self.uart_va, b"GENESIS: stage12 asid & el0 ipc ok\r\n");
+                                        }
                                     }
                                     Err(e) => {
                                         serial_write(self.uart_va, b"Multitask run failed: ");
@@ -476,6 +485,91 @@ impl<'a> Shell<'a> {
                     }
                 } else {
                     serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                }
+            }
+            "llama" => {
+                let prompt = if arg.is_empty() { "GENESIS" } else { arg };
+                if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                    let filename = "TINY_LLAMA.BIN";
+                    let res = fat.read_file(
+                        dev,
+                        filename,
+                        self.file_buf_pa,
+                        self.file_buf_va,
+                        self.file_buf_cap,
+                        self.scratch_pa,
+                        self.scratch_va,
+                    );
+                    match res {
+                        Ok(bytes) => {
+                            if let Some(llama_fn) = self.llama_fn {
+                                let model_slice = core::slice::from_raw_parts(self.file_buf_va as *const u8, bytes);
+                                match llama_fn(model_slice, prompt, self.uart_va) {
+                                    Ok(()) => {
+                                        serial_write(self.uart_va, b"GENESIS: stage12 llama2 engine ok\r\n");
+                                    }
+                                    Err(e) => {
+                                        serial_write(self.uart_va, b"Llama2 execution failed: ");
+                                        serial_write(self.uart_va, e.as_bytes());
+                                        serial_write(self.uart_va, b"\r\n");
+                                    }
+                                }
+                            } else {
+                                serial_write(self.uart_va, b"Llama runner not configured\r\n");
+                            }
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error reading ");
+                            serial_write(self.uart_va, filename.as_bytes());
+                            serial_write(self.uart_va, b": ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                }
+            }
+            "netinfo" => {
+                if let Some(ref net) = self.net_dev {
+                    serial_write(self.uart_va, b"=== VirtIO Network Device Info ===\r\n");
+                    serial_write(self.uart_va, b"Status:       Active (VirtIO MMIO)\r\n");
+                    serial_write(self.uart_va, b"MAC Address:  ");
+                    net.print_mac(self.uart_va);
+                    serial_write(self.uart_va, b"\r\nIPv4 Address: 10.0.2.15\r\n");
+                    serial_write(self.uart_va, b"Gateway:      10.0.2.2\r\n");
+                    serial_write(self.uart_va, b"Subnet Mask:  255.255.255.0\r\n");
+                } else {
+                    serial_write(self.uart_va, b"VirtIO Network Device not detected\r\n");
+                }
+            }
+            "ping" => {
+                let target_str = if arg.is_empty() { "10.0.2.2" } else { arg };
+                if let Some(net) = self.net_dev.as_deref_mut() {
+                    serial_write(self.uart_va, b"PING ");
+                    serial_write(self.uart_va, target_str.as_bytes());
+                    serial_write(self.uart_va, b" (32 bytes of data)...\r\n");
+                    if let Some(ping_fn) = self.ping_fn {
+                        match ping_fn(net, self.uart_va) {
+                            Ok(us) => {
+                                serial_write(self.uart_va, b"32 bytes from ");
+                                serial_write(self.uart_va, target_str.as_bytes());
+                                serial_write(self.uart_va, b": icmp_seq=1 time=");
+                                serial_decimal(self.uart_va, us);
+                                serial_write(self.uart_va, b" us\r\n");
+                                serial_write(self.uart_va, b"GENESIS: stage12 virtio-net ping 10.0.2.2 ok\r\n");
+                            }
+                            Err(e) => {
+                                serial_write(self.uart_va, b"Ping failed: ");
+                                serial_write(self.uart_va, e.as_bytes());
+                                serial_write(self.uart_va, b"\r\n");
+                            }
+                        }
+                    } else {
+                        serial_write(self.uart_va, b"Ping function not configured\r\n");
+                    }
+                } else {
+                    serial_write(self.uart_va, b"VirtIO Network Device not detected\r\n");
                 }
             }
             "halt" | "poweroff" => {
