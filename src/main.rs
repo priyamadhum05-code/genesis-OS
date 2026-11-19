@@ -8,12 +8,12 @@ use core::{arch::asm, panic::PanicInfo, ptr, sync::atomic::{AtomicBool, AtomicU6
 use genesis_stage1::{
     ai::{
         load_llama_weights, load_micro_llm_from_bytes, load_model_from_bytes,
-        load_transformer_from_bytes, run_llama_forward_step, run_parallel_micro_llm_step,
+        load_transformer_from_bytes, parse_llama_header, run_llama_forward_step, run_parallel_micro_llm_step,
         run_parallel_nn_inference, run_parallel_transformer, sample_greedy, scalar_infer,
         scalar_matmul, scalar_micro_llm_step, scalar_transformer_block, smp_matmul_worker,
-        verify_inference, verify_llm_step, verify_matrices, verify_transformer, LLAMA_SEQ_LEN,
-        MATMUL_N, SMP_LLAMA_CTX, SMP_LLAMA_WEIGHTS, SMP_MICRO_LLM_WEIGHTS, SMP_NN_CTX,
-        SMP_TRANSFORMER_CTX,
+        verify_inference, verify_llm_step, verify_matrices, verify_transformer,
+        LlamaWeights, SmpLlamaContext, MATMUL_N, SMP_LLAMA_CTX, SMP_LLAMA_WEIGHTS,
+        SMP_MICRO_LLM_WEIGHTS, SMP_NN_CTX, SMP_TRANSFORMER_CTX,
     },
     arch::{
         dispatch_smp_work, parse_fdt_devices, psci_cpu_on, secondary_boot_stub, secondary_main,
@@ -37,9 +37,9 @@ use genesis_stage1::{
         get_stage3c3_layout, get_transition_layout, parse_pe_image, run_stage3c1_preflight,
         stage3c2_mmu_transition, stage3c3_jump_higher_half, stage3c3_vectors_start,
         verify_firmware_identity_mapping, verify_higher_half_pe_header, verify_stack_usability,
-        DormantTablePool, DynamicMapper, PagePermissions, GENESIS_MAIR_VALUE, GENESIS_TCR_VALUE,
-        HHDM_BASE, KERNEL_IMAGE_PADDR, KERNEL_RESERVE_SIZE, KERNEL_VA_BASE, MMIO_VA_BASE,
-        PAGE_SIZE, TRANSITION_CLEAN_START,
+        DormantTablePool, DynamicMapper, PagePermissions, ParsedPeImage, GENESIS_MAIR_VALUE,
+        GENESIS_TCR_VALUE, HHDM_BASE, KERNEL_IMAGE_PADDR, KERNEL_RESERVE_SIZE, KERNEL_VA_BASE,
+        MMIO_VA_BASE, PAGE_SIZE, TRANSITION_CLEAN_START,
     },
     serial_decimal, serial_hex, serial_write,
 };
@@ -209,6 +209,7 @@ static mut KERNEL_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 static mut KERNEL_PMM: PhysicalPageAllocator<KERNEL_PMM_WORDS> = PhysicalPageAllocator::new();
 static mut DORMANT_TTBR0_POOL: DormantTablePool = DormantTablePool::new();
 static mut DORMANT_TTBR1_POOL: DormantTablePool = DormantTablePool::new();
+static mut PARSED_PE: Option<ParsedPeImage> = None;
 
 #[no_mangle]
 pub extern "efiapi" fn efi_main(image: usize, system_table: *mut SystemTable) -> usize {
@@ -490,6 +491,7 @@ extern "C" fn kernel_entry(h: *const Handoff) -> ! {
                 halt();
             }
         };
+        *ptr::addr_of_mut!(PARSED_PE) = Some(pe);
 
         let preflight_res = run_stage3c1_preflight(mmfr0, pc, sp, uart as u64, pool0, pool1, &pe);
         let report = match preflight_res {
@@ -1569,6 +1571,11 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         // 3. Initialize Interactive Shell
         let total_ram_mib = (total_usable * 4) / 1024;
         let free_ram_mib = (mapper.pmm_mut().free_pages() * 4) / 1024;
+        let pmm_total = mapper.pmm_mut().total_usable_pages();
+        let pmm_free = mapper.pmm_mut().free_pages();
+        let mapper_tables = mapper.tables_allocated();
+        let pe_opt = *ptr::addr_of!(PARSED_PE);
+
         let mut shell = Shell {
             uart_va: uart,
             dev: Some(&mut blk_dev),
@@ -1582,6 +1589,10 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             fb: fb_opt.as_mut(),
             total_ram_mib,
             free_ram_mib,
+            pe: pe_opt,
+            pmm_total_pages: pmm_total,
+            pmm_free_pages: pmm_free,
+            mapper_tables,
             bench_fn: Some(run_smp_matmul_benchmark),
             run_elf_fn: Some(kernel_run_elf),
             infer_fn: Some(kernel_run_infer),
@@ -1590,6 +1601,8 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             generate_fn: Some(kernel_run_generate),
             llama_fn: Some(kernel_run_llama),
             ping_fn: Some(kernel_ping_target),
+            dns_fn: Some(kernel_resolve_dns),
+            httpget_fn: Some(kernel_http_get),
         };
 
         // 4. Automated Shell Self-Test (info, ls, bench)
@@ -1621,11 +1634,18 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         } else {
             serial_write(uart, b"GENESIS: stage12 virtio-net skipped (headless mode)\r\n");
         }
-        shell.execute_command("llama GENESIS");
+        shell.execute_command("llama TINY_LLAMA.BIN GENESIS");
         serial_write(uart, b"GENESIS: stage12 milestone complete\r\n");
 
-        // 9. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 12)\r\n");
+        // 9. Stage 13 Automated Smoke-Test (dns, ramstat)
+        if shell.net_dev.is_some() {
+            shell.execute_command("dns 10.0.2.2");
+        }
+        shell.execute_command("ramstat");
+        serial_write(uart, b"GENESIS: stage13 milestone complete\r\n");
+
+        // 10. Interactive Prompt Loop
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 13)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {
@@ -2034,15 +2054,306 @@ unsafe fn kernel_ping_target(net: &mut VirtIONetDevice, _uart: usize) -> Result<
     Ok(us)
 }
 
+unsafe fn kernel_resolve_dns(
+    net: &mut VirtIONetDevice,
+    hostname: &str,
+    _uart: usize,
+) -> Result<[u8; 4], &'static str> {
+    if let Some(ip) = net::parse_ipv4_addr(hostname) {
+        return Ok(ip);
+    }
+
+    // 1. Resolve Gateway MAC via ARP
+    let mut arp_frame = [0u8; 42];
+    net::build_ethernet_header(&mut arp_frame[0..14], net::BROADCAST_MAC, net.mac, net::ETHERTYPE_ARP);
+    net::build_arp_packet(
+        &mut arp_frame[14..42],
+        net::ARP_OP_REQUEST,
+        net.mac,
+        net::GUEST_IP,
+        [0u8; 6],
+        net::GATEWAY_IP,
+    );
+    net.send_packet(&arp_frame)?;
+
+    let mut gw_mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+    let mut rx_buf = [0u8; 1536];
+    let mut spins = 0usize;
+    while spins < 1_000_000 {
+        if let Some(len) = net.poll_packet(&mut rx_buf) {
+            if len >= 42 {
+                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
+                if ethertype == net::ETHERTYPE_ARP {
+                    if let Some((op, sender_mac, sender_ip, target_ip)) = net::parse_arp(&rx_buf[14..len]) {
+                        if op == net::ARP_OP_REPLY && sender_ip == net::GATEWAY_IP && target_ip == net::GUEST_IP {
+                            gw_mac = sender_mac;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+
+    // 2. Build DNS Query
+    let mut dns_buf = [0u8; 256];
+    let query_id = 0x1337;
+    let query_len = net::build_dns_query(&mut dns_buf, query_id, hostname);
+
+    let mut udp_frame = [0u8; 512];
+    let udp_len = net::build_udp_packet(
+        &mut udp_frame[34..],
+        net::GUEST_IP,
+        net::DNS_SERVER_IP,
+        49152,
+        net::DNS_PORT,
+        &dns_buf[..query_len],
+    );
+    net::build_ipv4_header(
+        &mut udp_frame[14..34],
+        udp_len as u16,
+        net::IP_PROTO_UDP,
+        net::GUEST_IP,
+        net::DNS_SERVER_IP,
+        0x1234,
+    );
+    net::build_ethernet_header(&mut udp_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
+
+    net.send_packet(&udp_frame[..14 + 20 + udp_len])?;
+
+    // 3. Poll for DNS response
+    spins = 0;
+    while spins < 2_000_000 {
+        if let Some(len) = net.poll_packet(&mut rx_buf) {
+            if len >= 42 {
+                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
+                if ethertype == net::ETHERTYPE_IPV4 {
+                    if let Some((src_ip, _dst_ip, _src_p, _dst_p, payload)) = net::parse_udp_packet(&rx_buf[14..len]) {
+                        if src_ip == net::DNS_SERVER_IP {
+                            if let Some(resolved) = net::parse_dns_response(payload, query_id) {
+                                return Ok(resolved);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+
+    Err("DNS query timed out")
+}
+
+unsafe fn kernel_http_get(
+    net: &mut VirtIONetDevice,
+    host_or_ip: &str,
+    port: u16,
+    path: &str,
+    uart: usize,
+) -> Result<usize, &'static str> {
+    let remote_ip = match net::parse_ipv4_addr(host_or_ip) {
+        Some(ip) => ip,
+        None => kernel_resolve_dns(net, host_or_ip, uart)?,
+    };
+
+    let gw_mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+    let local_port = 49153;
+    let initial_seq = 1000;
+    let mut client = net::tcp::TcpClient::new(net::GUEST_IP, local_port, remote_ip, port, initial_seq);
+
+    // 1. Send SYN
+    let mut syn_frame = [0u8; 74];
+    net::build_ethernet_header(&mut syn_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
+    let tcp_len = net::tcp::build_tcp_packet(
+        &mut syn_frame[34..74],
+        net::GUEST_IP,
+        remote_ip,
+        local_port,
+        port,
+        client.local_seq,
+        0,
+        net::tcp::TCP_FLAG_SYN,
+        64240,
+        &[],
+    );
+    net::build_ipv4_header(&mut syn_frame[14..34], tcp_len as u16, net::IP_PROTO_TCP, net::GUEST_IP, remote_ip, 0x3344);
+    net.send_packet(&syn_frame[..14 + 20 + tcp_len])?;
+    client.state = net::tcp::TcpState::SynSent;
+
+    // 2. Poll for SYN-ACK
+    let mut rx_buf = [0u8; 1536];
+    let mut spins = 0usize;
+    let mut connected = false;
+
+    while spins < 2_000_000 {
+        if let Some(len) = net.poll_packet(&mut rx_buf) {
+            if len >= 54 {
+                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
+                if ethertype == net::ETHERTYPE_IPV4 {
+                    if let Some((src, dst, sp, dp, seq, ack, flags, _win, _)) = net::tcp::parse_tcp_packet(&rx_buf[14..len]) {
+                        if src == remote_ip && dst == net::GUEST_IP && sp == port && dp == local_port {
+                            if (flags & (net::tcp::TCP_FLAG_SYN | net::tcp::TCP_FLAG_ACK)) == (net::tcp::TCP_FLAG_SYN | net::tcp::TCP_FLAG_ACK) {
+                                client.remote_seq = seq.wrapping_add(1);
+                                client.local_seq = ack;
+                                client.state = net::tcp::TcpState::Established;
+                                connected = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+
+    if !connected {
+        return Err("TCP handshake timed out");
+    }
+
+    // 3. Send ACK + HTTP Request (PSH | ACK)
+    let mut req_buf = [0u8; 256];
+    let mut req_len = 0;
+    let mut append = |s: &[u8]| {
+        for &b in s {
+            if req_len < 256 {
+                req_buf[req_len] = b;
+                req_len += 1;
+            }
+        }
+    };
+    append(b"GET ");
+    append(path.as_bytes());
+    append(b" HTTP/1.0\r\nHost: ");
+    append(host_or_ip.as_bytes());
+    append(b"\r\nConnection: close\r\n\r\n");
+
+    let mut http_frame = [0u8; 350];
+    net::build_ethernet_header(&mut http_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
+    let tcp_len = net::tcp::build_tcp_packet(
+        &mut http_frame[34..],
+        net::GUEST_IP,
+        remote_ip,
+        local_port,
+        port,
+        client.local_seq,
+        client.remote_seq,
+        net::tcp::TCP_FLAG_PSH | net::tcp::TCP_FLAG_ACK,
+        64240,
+        &req_buf[..req_len],
+    );
+    net::build_ipv4_header(&mut http_frame[14..34], tcp_len as u16, net::IP_PROTO_TCP, net::GUEST_IP, remote_ip, 0x3345);
+    net.send_packet(&http_frame[..14 + 20 + tcp_len])?;
+    client.local_seq = client.local_seq.wrapping_add(req_len as u32);
+
+    // 4. Poll for Response Data
+    spins = 0;
+    let mut total_received = 0usize;
+    while spins < 3_000_000 {
+        if let Some(len) = net.poll_packet(&mut rx_buf) {
+            if len >= 54 {
+                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
+                if ethertype == net::ETHERTYPE_IPV4 {
+                    if let Some((src, dst, sp, dp, seq, _ack, flags, _win, payload)) = net::tcp::parse_tcp_packet(&rx_buf[14..len]) {
+                        if src == remote_ip && dst == net::GUEST_IP && sp == port && dp == local_port {
+                            if !payload.is_empty() {
+                                total_received += payload.len();
+                                serial_write(uart, payload);
+                                client.remote_seq = seq.wrapping_add(payload.len() as u32);
+                                let mut ack_frame = [0u8; 74];
+                                net::build_ethernet_header(&mut ack_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
+                                let ack_tcp_len = net::tcp::build_tcp_packet(
+                                    &mut ack_frame[34..74],
+                                    net::GUEST_IP,
+                                    remote_ip,
+                                    local_port,
+                                    port,
+                                    client.local_seq,
+                                    client.remote_seq,
+                                    net::tcp::TCP_FLAG_ACK,
+                                    64240,
+                                    &[],
+                                );
+                                net::build_ipv4_header(&mut ack_frame[14..34], ack_tcp_len as u16, net::IP_PROTO_TCP, net::GUEST_IP, remote_ip, 0x3346);
+                                let _ = net.send_packet(&ack_frame[..14 + 20 + ack_tcp_len]);
+                            }
+
+                            if (flags & net::tcp::TCP_FLAG_FIN) != 0 {
+                                client.remote_seq = seq.wrapping_add(payload.len() as u32).wrapping_add(1);
+                                let mut finack_frame = [0u8; 74];
+                                net::build_ethernet_header(&mut finack_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
+                                let finack_len = net::tcp::build_tcp_packet(
+                                    &mut finack_frame[34..74],
+                                    net::GUEST_IP,
+                                    remote_ip,
+                                    local_port,
+                                    port,
+                                    client.local_seq,
+                                    client.remote_seq,
+                                    net::tcp::TCP_FLAG_FIN | net::tcp::TCP_FLAG_ACK,
+                                    64240,
+                                    &[],
+                                );
+                                net::build_ipv4_header(&mut finack_frame[14..34], finack_len as u16, net::IP_PROTO_TCP, net::GUEST_IP, remote_ip, 0x3347);
+                                let _ = net.send_packet(&finack_frame[..14 + 20 + finack_len]);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+
+    Ok(total_received)
+}
+
 unsafe fn kernel_run_llama(
     model_data: &[u8],
     prompt_str: &str,
     uart: usize,
 ) -> Result<(), &'static str> {
+    let cfg = parse_llama_header(model_data)?;
+    let required_weight_floats = LlamaWeights::total_floats_for(&cfg);
+    let required_ctx_floats = SmpLlamaContext::total_floats_for(&cfg);
+
     let weights = &mut *core::ptr::addr_of_mut!(SMP_LLAMA_WEIGHTS);
+    if weights.total_floats < required_weight_floats || weights.token_embedding.is_null() {
+        let pmm_va = ensure_higher_half(core::ptr::addr_of_mut!(KERNEL_PMM) as usize as u64);
+        let pmm = &mut *(pmm_va as *mut PhysicalPageAllocator<KERNEL_PMM_WORDS>);
+        let weight_pages = (required_weight_floats * 4 + 4095) / 4096;
+        let weight_pa = pmm.allocate_contiguous_pages(weight_pages)
+            .ok_or("Failed to allocate physical pages for dynamic Llama weights")?;
+        let weight_va = HHDM_BASE + weight_pa;
+        weights.init_from_buffer(cfg, weight_va as *mut f32);
+        weights.paddr = weight_pa;
+        weights.page_count = weight_pages;
+    }
+
     load_llama_weights(model_data, weights)?;
 
     let ctx = &mut *core::ptr::addr_of_mut!(SMP_LLAMA_CTX);
+    if ctx.total_floats < required_ctx_floats || ctx.logits.is_null() {
+        let pmm_va = ensure_higher_half(core::ptr::addr_of_mut!(KERNEL_PMM) as usize as u64);
+        let pmm = &mut *(pmm_va as *mut PhysicalPageAllocator<KERNEL_PMM_WORDS>);
+        let ctx_pages = (required_ctx_floats * 4 + 4095) / 4096;
+        let ctx_pa = pmm.allocate_contiguous_pages(ctx_pages)
+            .ok_or("Failed to allocate physical pages for dynamic Llama context")?;
+        let ctx_va = HHDM_BASE + ctx_pa;
+        ctx.init_from_buffer(cfg, ctx_va as *mut f32);
+        ctx.paddr = ctx_pa;
+        ctx.page_count = ctx_pages;
+    } else {
+        ctx.config = cfg;
+        core::ptr::write_bytes(ctx.x as *mut u8, 0, ctx.total_floats * 4);
+    }
+    ctx.weights_ptr = weights as *const LlamaWeights;
 
     serial_write(uart, b"Prompt: \"");
     serial_write(uart, prompt_str.as_bytes());
@@ -2050,7 +2361,7 @@ unsafe fn kernel_run_llama(
     serial_write(uart, prompt_str.as_bytes());
 
     let prompt_bytes = prompt_str.as_bytes();
-    let prompt_len = prompt_bytes.len().min(LLAMA_SEQ_LEN - 8);
+    let prompt_len = prompt_bytes.len().min(cfg.seq_len - 8);
 
     let t0: u64;
     let t1: u64;
@@ -2075,7 +2386,7 @@ unsafe fn kernel_run_llama(
     // Autoregressive generation (4 new tokens)
     let steps_to_gen = 4;
     for i in 0..steps_to_gen {
-        let next_tok = sample_greedy(&ctx.logits);
+        let next_tok = sample_greedy(ctx.logits_slice());
         let char_byte = if next_tok < 128 && (next_tok as u8).is_ascii_graphic() || next_tok == b' ' as usize {
             next_tok as u8
         } else {
@@ -2084,7 +2395,7 @@ unsafe fn kernel_run_llama(
         serial_write(uart, &[char_byte]);
 
         let pos = prompt_len + i;
-        if pos < LLAMA_SEQ_LEN - 1 {
+        if pos < cfg.seq_len - 1 {
             run_llama_forward_step(weights, ctx, next_tok, pos);
         }
     }

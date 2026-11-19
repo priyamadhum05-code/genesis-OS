@@ -32,6 +32,10 @@ pub struct Shell<'a> {
     pub fb: Option<&'a mut Framebuffer>,
     pub total_ram_mib: u64,
     pub free_ram_mib: u64,
+    pub pe: Option<crate::vmm::pe::ParsedPeImage>,
+    pub pmm_total_pages: u64,
+    pub pmm_free_pages: u64,
+    pub mapper_tables: usize,
     pub bench_fn: Option<fn(u64) -> (u64, u64)>,
     pub run_elf_fn: Option<unsafe fn(&[u8], usize) -> Result<i32, &'static str>>,
     pub infer_fn: Option<unsafe fn(&[u8], usize) -> Result<(usize, u64), &'static str>>,
@@ -40,6 +44,8 @@ pub struct Shell<'a> {
     pub generate_fn: Option<unsafe fn(&[u8], &str, usize) -> Result<(), &'static str>>,
     pub llama_fn: Option<unsafe fn(&[u8], &str, usize) -> Result<(), &'static str>>,
     pub ping_fn: Option<unsafe fn(&mut VirtIONetDevice, usize) -> Result<u64, &'static str>>,
+    pub dns_fn: Option<unsafe fn(&mut VirtIONetDevice, &str, usize) -> Result<[u8; 4], &'static str>>,
+    pub httpget_fn: Option<unsafe fn(&mut VirtIONetDevice, &str, u16, &str, usize) -> Result<usize, &'static str>>,
 }
 
 impl<'a> Shell<'a> {
@@ -56,12 +62,15 @@ impl<'a> Shell<'a> {
 
         match cmd {
             "help" => {
-                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 12)\r\n");
+                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 13)\r\n");
                 serial_write(self.uart_va, b"Available commands:\r\n");
                 serial_write(self.uart_va, b"  help              - List available commands\r\n");
                 serial_write(self.uart_va, b"  info              - Display system status, memory, registers, and framebuffer\r\n");
+                serial_write(self.uart_va, b"  ramstat           - Display kernel memory profile and physical RAM breakdown\r\n");
                 serial_write(self.uart_va, b"  netinfo           - Display VirtIO-Net MAC, IP, gateway, and status\r\n");
                 serial_write(self.uart_va, b"  ping [ip]         - Send ICMP echo request over VirtIO-Net\r\n");
+                serial_write(self.uart_va, b"  dns <hostname>    - Resolve hostname to IPv4 address via DNS\r\n");
+                serial_write(self.uart_va, b"  httpget <host> [port] [path] - Send HTTP/1.0 GET request via TCP\r\n");
                 serial_write(self.uart_va, b"  clear             - Clear graphical terminal console and serial screen\r\n");
                 serial_write(self.uart_va, b"  ls [path]         - List directory contents on FAT32 volume\r\n");
                 serial_write(self.uart_va, b"  cat <file>        - Print text contents of a file\r\n");
@@ -73,8 +82,94 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  llm [file]        - Run 4-core SMP INT8 NEON transformer block\r\n");
                 serial_write(self.uart_va, b"  multitask         - Run preemptive multi-process EL0 scheduling & IPC\r\n");
                 serial_write(self.uart_va, b"  generate [seed]   - Run 4-core SMP autoregressive Micro-LLM text generation\r\n");
-                serial_write(self.uart_va, b"  llama [prompt]    - Run 4-core SMP Llama-2 transformer inference\r\n");
+                serial_write(self.uart_va, b"  llama [model] [prompt] - Run 4-core SMP dynamic Llama-2 inference\r\n");
                 serial_write(self.uart_va, b"  halt / poweroff   - Power off system via PSCI SYSTEM_OFF\r\n");
+            }
+            "ramstat" => {
+                serial_write(self.uart_va, b"=== Project Genesis RAM Usage & Kernel Profiler ===\r\n");
+                serial_write(self.uart_va, b"Kernel Image (PE32+):\r\n");
+                if let Some(ref pe) = self.pe {
+                    for sec_opt in &pe.sections[..pe.section_count] {
+                        if let Some(sec) = sec_opt {
+                            serial_write(self.uart_va, b"  ");
+                            serial_write(self.uart_va, sec.name_bytes());
+                            serial_write(self.uart_va, b":  RVA ");
+                            serial_hex(self.uart_va, sec.virtual_address);
+                            serial_write(self.uart_va, b" (");
+                            serial_decimal(self.uart_va, sec.page_count as u64);
+                            serial_write(self.uart_va, b" pages, ");
+                            serial_decimal(self.uart_va, ((sec.page_count * 4096) / 1024) as u64);
+                            serial_write(self.uart_va, b" KiB) [");
+                            if sec.is_readable { serial_write(self.uart_va, b"RO"); }
+                            if sec.is_writable { serial_write(self.uart_va, b", RW"); }
+                            if sec.is_executable { serial_write(self.uart_va, b", X"); } else { serial_write(self.uart_va, b", NX"); }
+                            serial_write(self.uart_va, b"]\r\n");
+                        }
+                    }
+                    serial_write(self.uart_va, b"  Total PE Image: ");
+                    serial_decimal(self.uart_va, pe.total_pages as u64);
+                    serial_write(self.uart_va, b" pages (");
+                    serial_decimal(self.uart_va, ((pe.total_pages * 4096) / 1024) as u64);
+                    serial_write(self.uart_va, b" KiB)\r\n");
+                } else {
+                    serial_write(self.uart_va, b"  PE headers not available\r\n");
+                }
+
+                serial_write(self.uart_va, b"\r\nPage Tables:\r\n");
+                serial_write(self.uart_va, b"  Dormant TTBR0:   7 frames (28 KiB)\r\n");
+                serial_write(self.uart_va, b"  Dormant TTBR1:  11 frames (44 KiB)\r\n");
+                serial_write(self.uart_va, b"  Dynamic Mapper: ");
+                serial_decimal(self.uart_va, self.mapper_tables as u64);
+                serial_write(self.uart_va, b" frames (");
+                serial_decimal(self.uart_va, (self.mapper_tables * 4) as u64);
+                serial_write(self.uart_va, b" KiB)\r\n");
+
+                serial_write(self.uart_va, b"\r\nKernel Allocators:\r\n");
+                let heap_alloc = HEAP_ALLOCATOR.allocated_bytes();
+                let heap_total = HEAP_ALLOCATOR.total_bytes();
+                serial_write(self.uart_va, b"  Kernel Heap:    ");
+                serial_decimal(self.uart_va, heap_alloc as u64);
+                serial_write(self.uart_va, b" bytes used / ");
+                serial_decimal(self.uart_va, heap_total as u64);
+                serial_write(self.uart_va, b" bytes capacity\r\n");
+                serial_write(self.uart_va, b"  Hugepage Pools: 2 MiB allocated (L2 block at 0xFFFF_8000_4200_0000)\r\n");
+                let llama_pages = unsafe {
+                    crate::ai::llama::SMP_LLAMA_WEIGHTS.page_count + crate::ai::llama::SMP_LLAMA_CTX.page_count
+                };
+                serial_write(self.uart_va, b"  Dynamic Llama:  ");
+                serial_decimal(self.uart_va, (llama_pages * 4) as u64);
+                serial_write(self.uart_va, b" KiB allocated (");
+                serial_decimal(self.uart_va, llama_pages as u64);
+                serial_write(self.uart_va, b" pages)\r\n");
+
+                serial_write(self.uart_va, b"\r\nPhysical Memory Manager (PMM):\r\n");
+                let total_p = self.pmm_total_pages;
+                let free_p = self.pmm_free_pages;
+                let alloc_p = total_p.saturating_sub(free_p);
+                serial_write(self.uart_va, b"  Total Conventional RAM: ");
+                serial_decimal(self.uart_va, total_p);
+                serial_write(self.uart_va, b" pages (");
+                serial_decimal(self.uart_va, (total_p * 4) / 1024);
+                serial_write(self.uart_va, b" MiB)\r\n");
+
+                serial_write(self.uart_va, b"  Allocated by OS:        ");
+                serial_decimal(self.uart_va, alloc_p);
+                serial_write(self.uart_va, b" pages (");
+                serial_decimal(self.uart_va, (alloc_p * 4) / 1024);
+                serial_write(self.uart_va, b" MiB)\r\n");
+
+                serial_write(self.uart_va, b"  Free Usable RAM:        ");
+                serial_decimal(self.uart_va, free_p);
+                serial_write(self.uart_va, b" pages (");
+                serial_decimal(self.uart_va, (free_p * 4) / 1024);
+                serial_write(self.uart_va, b" MiB)\r\n");
+
+                let util_pct = if total_p > 0 { (alloc_p * 100) / total_p } else { 0 };
+                serial_write(self.uart_va, b"  RAM Utilization:        ");
+                serial_decimal(self.uart_va, util_pct);
+                serial_write(self.uart_va, b"%\r\n");
+                serial_write(self.uart_va, b"===================================================\r\n");
+                serial_write(self.uart_va, b"GENESIS: stage13 ramstat ok\r\n");
             }
             "info" => {
                 serial_write(self.uart_va, b"=== Project Genesis System Information ===\r\n");
@@ -488,9 +583,19 @@ impl<'a> Shell<'a> {
                 }
             }
             "llama" => {
-                let prompt = if arg.is_empty() { "GENESIS" } else { arg };
+                let mut filename = "TINY_LLAMA.BIN";
+                let mut prompt = "GENESIS";
+                if !arg.is_empty() {
+                    if arg.ends_with(".BIN") || arg.ends_with(".bin") {
+                        filename = arg;
+                        if let Some(next_token) = parts.next() {
+                            prompt = next_token;
+                        }
+                    } else {
+                        prompt = arg;
+                    }
+                }
                 if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
-                    let filename = "TINY_LLAMA.BIN";
                     let res = fat.read_file(
                         dev,
                         filename,
@@ -507,6 +612,7 @@ impl<'a> Shell<'a> {
                                 match llama_fn(model_slice, prompt, self.uart_va) {
                                     Ok(()) => {
                                         serial_write(self.uart_va, b"GENESIS: stage12 llama2 engine ok\r\n");
+                                        serial_write(self.uart_va, b"GENESIS: stage13 dynamic llama2 ok\r\n");
                                     }
                                     Err(e) => {
                                         serial_write(self.uart_va, b"Llama2 execution failed: ");
@@ -538,7 +644,83 @@ impl<'a> Shell<'a> {
                     net.print_mac(self.uart_va);
                     serial_write(self.uart_va, b"\r\nIPv4 Address: 10.0.2.15\r\n");
                     serial_write(self.uart_va, b"Gateway:      10.0.2.2\r\n");
+                    serial_write(self.uart_va, b"DNS Server:   10.0.2.3:53\r\n");
                     serial_write(self.uart_va, b"Subnet Mask:  255.255.255.0\r\n");
+                } else {
+                    serial_write(self.uart_va, b"VirtIO Network Device not detected\r\n");
+                }
+            }
+            "dns" => {
+                let target = if arg.is_empty() { "gateway.local" } else { arg };
+                if let Some(net) = self.net_dev.as_deref_mut() {
+                    serial_write(self.uart_va, b"Resolving '");
+                    serial_write(self.uart_va, target.as_bytes());
+                    serial_write(self.uart_va, b"' via DNS (10.0.2.3:53)...\r\n");
+                    if let Some(dns_fn) = self.dns_fn {
+                        match dns_fn(net, target, self.uart_va) {
+                            Ok(ip) => {
+                                serial_write(self.uart_va, target.as_bytes());
+                                serial_write(self.uart_va, b" resolved to ");
+                                serial_decimal(self.uart_va, ip[0] as u64);
+                                serial_write(self.uart_va, b".");
+                                serial_decimal(self.uart_va, ip[1] as u64);
+                                serial_write(self.uart_va, b".");
+                                serial_decimal(self.uart_va, ip[2] as u64);
+                                serial_write(self.uart_va, b".");
+                                serial_decimal(self.uart_va, ip[3] as u64);
+                                serial_write(self.uart_va, b"\r\n");
+                                serial_write(self.uart_va, b"GENESIS: stage13 dns ok\r\n");
+                            }
+                            Err(e) => {
+                                serial_write(self.uart_va, b"DNS resolution failed: ");
+                                serial_write(self.uart_va, e.as_bytes());
+                                serial_write(self.uart_va, b"\r\n");
+                            }
+                        }
+                    } else {
+                        serial_write(self.uart_va, b"DNS resolver function not configured\r\n");
+                    }
+                } else {
+                    serial_write(self.uart_va, b"VirtIO Network Device not detected\r\n");
+                }
+            }
+            "httpget" => {
+                let target = if arg.is_empty() { "10.0.2.2" } else { arg };
+                let port_str = parts.next().unwrap_or("80");
+                let path = parts.next().unwrap_or("/");
+                if let Some(net) = self.net_dev.as_deref_mut() {
+                    let mut port: u16 = 0;
+                    for &b in port_str.as_bytes() {
+                        if b >= b'0' && b <= b'9' {
+                            port = port * 10 + (b - b'0') as u16;
+                        }
+                    }
+                    if port == 0 { port = 80; }
+
+                    serial_write(self.uart_va, b"HTTP GET http://");
+                    serial_write(self.uart_va, target.as_bytes());
+                    serial_write(self.uart_va, b":");
+                    serial_decimal(self.uart_va, port as u64);
+                    serial_write(self.uart_va, path.as_bytes());
+                    serial_write(self.uart_va, b"...\r\n");
+
+                    if let Some(http_fn) = self.httpget_fn {
+                        match http_fn(net, target, port, path, self.uart_va) {
+                            Ok(bytes) => {
+                                serial_write(self.uart_va, b"HTTP GET response complete (");
+                                serial_decimal(self.uart_va, bytes as u64);
+                                serial_write(self.uart_va, b" bytes received)\r\n");
+                                serial_write(self.uart_va, b"GENESIS: stage13 httpget ok\r\n");
+                            }
+                            Err(e) => {
+                                serial_write(self.uart_va, b"HTTP GET failed: ");
+                                serial_write(self.uart_va, e.as_bytes());
+                                serial_write(self.uart_va, b"\r\n");
+                            }
+                        }
+                    } else {
+                        serial_write(self.uart_va, b"HTTP client function not configured\r\n");
+                    }
                 } else {
                     serial_write(self.uart_va, b"VirtIO Network Device not detected\r\n");
                 }
@@ -659,6 +841,12 @@ mod tests {
         let input_empty = "   ";
         let mut parts_empty = input_empty.trim().split_whitespace();
         assert_eq!(parts_empty.next(), None);
+
+        let input_llama = "llama TINY_LLAMA.BIN PROMPT";
+        let mut parts_llama = input_llama.trim().split_whitespace();
+        assert_eq!(parts_llama.next(), Some("llama"));
+        assert_eq!(parts_llama.next(), Some("TINY_LLAMA.BIN"));
+        assert_eq!(parts_llama.next(), Some("PROMPT"));
     }
 
     #[test]

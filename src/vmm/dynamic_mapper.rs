@@ -18,6 +18,7 @@ pub struct DynamicMapper<'a, const N: usize> {
     max_pa: u64,
     pmm: &'a mut PhysicalPageAllocator<N>,
     hhdm_base: u64,
+    tables_allocated: usize,
 }
 
 impl<'a, const N: usize> DynamicMapper<'a, N> {
@@ -32,7 +33,12 @@ impl<'a, const N: usize> DynamicMapper<'a, N> {
             max_pa,
             pmm,
             hhdm_base,
+            tables_allocated: 0,
         }
+    }
+
+    pub fn tables_allocated(&self) -> usize {
+        self.tables_allocated
     }
 
     pub fn pmm_mut(&mut self) -> &mut PhysicalPageAllocator<N> {
@@ -213,6 +219,7 @@ impl<'a, const N: usize> DynamicMapper<'a, N> {
 
     fn allocate_and_zero_frame(&mut self) -> Result<u64, VmmError> {
         let frame_paddr = self.pmm.allocate_page().ok_or(VmmError::FrameAllocationFailed)?;
+        self.tables_allocated += 1;
         let table = self.get_table_mut(frame_paddr);
         table.fill(0);
         Ok(frame_paddr)

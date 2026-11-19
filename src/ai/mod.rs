@@ -7,7 +7,7 @@ pub mod llm;
 pub mod llama;
 
 pub use llama::{
-    fast_expf, fast_sin_cos, fast_sqrtf, load_llama_weights, matmul as llama_matmul, rmsnorm,
+    fast_expf, fast_sin_cos, fast_sqrtf, load_llama_weights, parse_llama_header, matmul as llama_matmul, rmsnorm,
     run_llama_forward_step, sample_greedy, smp_llama_attn_worker, smp_llama_ffn_worker,
     LlamaConfig, LlamaWeights, SmpLlamaContext, LLAMA_DIM, LLAMA_HEADS, LLAMA_HEAD_SIZE,
     LLAMA_HIDDEN_DIM, LLAMA_KV_HEADS, LLAMA_LAYERS, LLAMA_SEQ_LEN, LLAMA_VOCAB,

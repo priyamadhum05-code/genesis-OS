@@ -1,12 +1,13 @@
-//! Project Genesis — Llama-2 4-Core SMP Inference Engine (Stage 12A).
+//! Project Genesis — Dynamic Hugepage-Backed Llama-2 4-Core SMP Inference Engine (Stage 13A).
 //!
-//! Implements a compact Llama-2 transformer architecture in `no_std` Rust:
+//! Implements a compact, dynamically-allocated Llama-2 transformer architecture in `no_std` Rust:
 //! - Standard `llama2.c` binary format loader
+//! - Dynamically allocated weights and KV-cache backed by KERNEL_PMM + HHDM_BASE
 //! - RMSNorm (NEON vectorized)
 //! - RoPE (Rotary Position Embeddings)
-//! - Multi-Head Attention with KV-cache partitioned across 4 SMP cores
-//! - SwiGLU Feed-Forward Network partitioned across 4 SMP cores
-//! - Softmax and greedy / temperature token sampling
+//! - Dynamic Multi-Head Attention partitioned across 4 SMP cores (`cpu_id * heads_per_core`)
+//! - Dynamic SwiGLU Feed-Forward Network partitioned across 4 SMP cores (`cpu_id * slice_len`)
+//! - Softmax and greedy token sampling
 
 pub const LLAMA_DIM: usize = 64;
 pub const LLAMA_HIDDEN_DIM: usize = 128;
@@ -15,10 +16,10 @@ pub const LLAMA_HEADS: usize = 4;
 pub const LLAMA_KV_HEADS: usize = 4;
 pub const LLAMA_VOCAB: usize = 128;
 pub const LLAMA_SEQ_LEN: usize = 32;
-pub const LLAMA_HEAD_SIZE: usize = LLAMA_DIM / LLAMA_HEADS; // 16
+pub const LLAMA_HEAD_SIZE: usize = 16;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct LlamaConfig {
     pub dim: usize,
     pub hidden_dim: usize,
@@ -176,7 +177,6 @@ pub fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, n_heads: usize, head
         while i < head_size {
             // theta = 10000^(-2i / head_size)
             let exponent = -((i as f32) / (head_size as f32));
-            // Approximate 10000^x = 2^(x * 13.2877)
             let theta = fast_expf(exponent * 9.21034037);
             let angle = (pos as f32) * theta;
             let (s, c) = fast_sin_cos(angle);
@@ -242,173 +242,327 @@ pub fn swiglu_forward(out: &mut [f32], h1: &[f32], h3: &[f32]) {
     }
 }
 
+/// Dynamically allocated model weights backed by PMM/HHDM memory.
+pub struct LlamaWeights {
+    pub config: LlamaConfig,
+    pub token_embedding: *const f32,
+    pub rms_att: *const f32,
+    pub wq: *const f32,
+    pub wk: *const f32,
+    pub wv: *const f32,
+    pub wo: *const f32,
+    pub rms_ffn: *const f32,
+    pub w1: *const f32,
+    pub w2: *const f32,
+    pub w3: *const f32,
+    pub rms_final: *const f32,
+    pub total_floats: usize,
+    pub paddr: u64,
+    pub page_count: usize,
+}
+
+unsafe impl Send for LlamaWeights {}
+unsafe impl Sync for LlamaWeights {}
+
+impl LlamaWeights {
+    pub const fn empty() -> Self {
+        Self {
+            config: LlamaConfig {
+                dim: 0,
+                hidden_dim: 0,
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                vocab_size: 0,
+                seq_len: 0,
+            },
+            token_embedding: core::ptr::null(),
+            rms_att: core::ptr::null(),
+            wq: core::ptr::null(),
+            wk: core::ptr::null(),
+            wv: core::ptr::null(),
+            wo: core::ptr::null(),
+            rms_ffn: core::ptr::null(),
+            w1: core::ptr::null(),
+            w2: core::ptr::null(),
+            w3: core::ptr::null(),
+            rms_final: core::ptr::null(),
+            total_floats: 0,
+            paddr: 0,
+            page_count: 0,
+        }
+    }
+
+    pub fn total_floats_for(cfg: &LlamaConfig) -> usize {
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let layers = cfg.n_layers;
+        let vocab = cfg.vocab_size;
+
+        vocab * dim              // token_embedding
+        + layers * dim           // rms_att
+        + layers * dim * dim     // wq
+        + layers * dim * dim     // wk
+        + layers * dim * dim     // wv
+        + layers * dim * dim     // wo
+        + layers * dim           // rms_ffn
+        + layers * dim * hidden  // w1
+        + layers * hidden * dim  // w2
+        + layers * dim * hidden  // w3
+        + dim                    // rms_final
+    }
+
+    pub unsafe fn init_from_buffer(&mut self, cfg: LlamaConfig, base_ptr: *mut f32) {
+        self.config = cfg;
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let layers = cfg.n_layers;
+        let vocab = cfg.vocab_size;
+
+        let mut p = base_ptr;
+        self.token_embedding = p; p = p.add(vocab * dim);
+        self.rms_att = p; p = p.add(layers * dim);
+        self.wq = p; p = p.add(layers * dim * dim);
+        self.wk = p; p = p.add(layers * dim * dim);
+        self.wv = p; p = p.add(layers * dim * dim);
+        self.wo = p; p = p.add(layers * dim * dim);
+        self.rms_ffn = p; p = p.add(layers * dim);
+        self.w1 = p; p = p.add(layers * dim * hidden);
+        self.w2 = p; p = p.add(layers * hidden * dim);
+        self.w3 = p; p = p.add(layers * dim * hidden);
+        self.rms_final = p; p = p.add(dim);
+
+        self.total_floats = p.offset_from(base_ptr) as usize;
+    }
+}
+
+/// Dynamically allocated SMP Llama inference context backed by PMM/HHDM memory.
 #[repr(C, align(64))]
 pub struct SmpLlamaContext {
-    // Current activations
-    pub x: [f32; LLAMA_DIM],
-    pub xb: [f32; LLAMA_DIM],
-    pub xb2: [f32; LLAMA_DIM],
-    pub q: [f32; LLAMA_DIM],
-    pub k: [f32; LLAMA_DIM],
-    pub v: [f32; LLAMA_DIM],
-    pub att_out: [f32; LLAMA_DIM],
+    pub config: LlamaConfig,
+    pub x: *mut f32,
+    pub xb: *mut f32,
+    pub xb2: *mut f32,
+    pub q: *mut f32,
+    pub k: *mut f32,
+    pub v: *mut f32,
+    pub att_out: *mut f32,
 
-    // FFN activations
-    pub hb1: [f32; LLAMA_HIDDEN_DIM],
-    pub hb3: [f32; LLAMA_HIDDEN_DIM],
-    pub h_glu: [f32; LLAMA_HIDDEN_DIM],
+    pub hb1: *mut f32,
+    pub hb3: *mut f32,
+    pub h_glu: *mut f32,
 
-    // Attention scores & KV-cache
-    pub att_scores: [f32; LLAMA_HEADS * LLAMA_SEQ_LEN],
-    pub key_cache: [f32; LLAMA_LAYERS * LLAMA_SEQ_LEN * LLAMA_DIM],
-    pub value_cache: [f32; LLAMA_LAYERS * LLAMA_SEQ_LEN * LLAMA_DIM],
+    pub att_scores: *mut f32,
+    pub key_cache: *mut f32,
+    pub value_cache: *mut f32,
+    pub logits: *mut f32,
 
-    // Output logits
-    pub logits: [f32; LLAMA_VOCAB],
-
-    // Work dispatch parameters
     pub cur_layer: usize,
     pub cur_pos: usize,
     pub weights_ptr: *const LlamaWeights,
+
+    pub total_floats: usize,
+    pub paddr: u64,
+    pub page_count: usize,
 }
 
-pub struct LlamaWeights {
-    pub config: LlamaConfig,
-    pub token_embedding: [f32; LLAMA_VOCAB * LLAMA_DIM],
-    pub rms_att: [f32; LLAMA_LAYERS * LLAMA_DIM],
-    pub wq: [f32; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-    pub wk: [f32; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-    pub wv: [f32; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-    pub wo: [f32; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-    pub rms_ffn: [f32; LLAMA_LAYERS * LLAMA_DIM],
-    pub w1: [f32; LLAMA_LAYERS * LLAMA_DIM * LLAMA_HIDDEN_DIM],
-    pub w2: [f32; LLAMA_LAYERS * LLAMA_HIDDEN_DIM * LLAMA_DIM],
-    pub w3: [f32; LLAMA_LAYERS * LLAMA_DIM * LLAMA_HIDDEN_DIM],
-    pub rms_final: [f32; LLAMA_DIM],
+unsafe impl Send for SmpLlamaContext {}
+unsafe impl Sync for SmpLlamaContext {}
+
+impl SmpLlamaContext {
+    pub const fn empty() -> Self {
+        Self {
+            config: LlamaConfig {
+                dim: 0,
+                hidden_dim: 0,
+                n_layers: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                vocab_size: 0,
+                seq_len: 0,
+            },
+            x: core::ptr::null_mut(),
+            xb: core::ptr::null_mut(),
+            xb2: core::ptr::null_mut(),
+            q: core::ptr::null_mut(),
+            k: core::ptr::null_mut(),
+            v: core::ptr::null_mut(),
+            att_out: core::ptr::null_mut(),
+            hb1: core::ptr::null_mut(),
+            hb3: core::ptr::null_mut(),
+            h_glu: core::ptr::null_mut(),
+            att_scores: core::ptr::null_mut(),
+            key_cache: core::ptr::null_mut(),
+            value_cache: core::ptr::null_mut(),
+            logits: core::ptr::null_mut(),
+            cur_layer: 0,
+            cur_pos: 0,
+            weights_ptr: core::ptr::null(),
+            total_floats: 0,
+            paddr: 0,
+            page_count: 0,
+        }
+    }
+
+    pub fn total_floats_for(cfg: &LlamaConfig) -> usize {
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let layers = cfg.n_layers;
+        let heads = cfg.n_heads;
+        let seq = cfg.seq_len;
+        let vocab = cfg.vocab_size;
+
+        7 * dim                     // x, xb, xb2, q, k, v, att_out
+        + 3 * hidden                // hb1, hb3, h_glu
+        + heads * seq               // att_scores
+        + 2 * (layers * seq * dim)  // key_cache, value_cache
+        + vocab                     // logits
+    }
+
+    pub unsafe fn init_from_buffer(&mut self, cfg: LlamaConfig, base_ptr: *mut f32) {
+        self.config = cfg;
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let layers = cfg.n_layers;
+        let heads = cfg.n_heads;
+        let seq = cfg.seq_len;
+        let vocab = cfg.vocab_size;
+
+        let mut p = base_ptr;
+        self.x = p; p = p.add(dim);
+        self.xb = p; p = p.add(dim);
+        self.xb2 = p; p = p.add(dim);
+        self.q = p; p = p.add(dim);
+        self.k = p; p = p.add(dim);
+        self.v = p; p = p.add(dim);
+        self.att_out = p; p = p.add(dim);
+
+        self.hb1 = p; p = p.add(hidden);
+        self.hb3 = p; p = p.add(hidden);
+        self.h_glu = p; p = p.add(hidden);
+
+        self.att_scores = p; p = p.add(heads * seq);
+        self.key_cache = p; p = p.add(layers * seq * dim);
+        self.value_cache = p; p = p.add(layers * seq * dim);
+        self.logits = p; p = p.add(vocab);
+
+        self.total_floats = p.offset_from(base_ptr) as usize;
+        core::ptr::write_bytes(base_ptr as *mut u8, 0, self.total_floats * 4);
+    }
+
+    pub unsafe fn logits_slice(&self) -> &[f32] {
+        if self.logits.is_null() {
+            &[]
+        } else {
+            core::slice::from_raw_parts(self.logits, self.config.vocab_size)
+        }
+    }
 }
 
-pub static mut SMP_LLAMA_CTX: SmpLlamaContext = SmpLlamaContext {
-    x: [0.0; LLAMA_DIM],
-    xb: [0.0; LLAMA_DIM],
-    xb2: [0.0; LLAMA_DIM],
-    q: [0.0; LLAMA_DIM],
-    k: [0.0; LLAMA_DIM],
-    v: [0.0; LLAMA_DIM],
-    att_out: [0.0; LLAMA_DIM],
-    hb1: [0.0; LLAMA_HIDDEN_DIM],
-    hb3: [0.0; LLAMA_HIDDEN_DIM],
-    h_glu: [0.0; LLAMA_HIDDEN_DIM],
-    att_scores: [0.0; LLAMA_HEADS * LLAMA_SEQ_LEN],
-    key_cache: [0.0; LLAMA_LAYERS * LLAMA_SEQ_LEN * LLAMA_DIM],
-    value_cache: [0.0; LLAMA_LAYERS * LLAMA_SEQ_LEN * LLAMA_DIM],
-    logits: [0.0; LLAMA_VOCAB],
-    cur_layer: 0,
-    cur_pos: 0,
-    weights_ptr: core::ptr::null(),
-};
+pub static mut SMP_LLAMA_CTX: SmpLlamaContext = SmpLlamaContext::empty();
+pub static mut SMP_LLAMA_WEIGHTS: LlamaWeights = LlamaWeights::empty();
 
-pub static mut SMP_LLAMA_WEIGHTS: LlamaWeights = LlamaWeights {
-    config: LlamaConfig {
-        dim: LLAMA_DIM,
-        hidden_dim: LLAMA_HIDDEN_DIM,
-        n_layers: LLAMA_LAYERS,
-        n_heads: LLAMA_HEADS,
-        n_kv_heads: LLAMA_KV_HEADS,
-        vocab_size: LLAMA_VOCAB,
-        seq_len: LLAMA_SEQ_LEN,
-    },
-    token_embedding: [0.0; LLAMA_VOCAB * LLAMA_DIM],
-    rms_att: [0.0; LLAMA_LAYERS * LLAMA_DIM],
-    wq: [0.0; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-    wk: [0.0; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-    wv: [0.0; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-    wo: [0.0; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-    rms_ffn: [0.0; LLAMA_LAYERS * LLAMA_DIM],
-    w1: [0.0; LLAMA_LAYERS * LLAMA_DIM * LLAMA_HIDDEN_DIM],
-    w2: [0.0; LLAMA_LAYERS * LLAMA_HIDDEN_DIM * LLAMA_DIM],
-    w3: [0.0; LLAMA_LAYERS * LLAMA_DIM * LLAMA_HIDDEN_DIM],
-    rms_final: [0.0; LLAMA_DIM],
-};
-
-/// 4-core worker: Computes 1 attention head per core (Head = cpu_id).
+/// 4-core worker: Computes attention heads partitioned dynamically across cores (`cpu_id * heads_per_core`).
 pub extern "C" fn smp_llama_attn_worker(cpu_id: u64, ctx_ptr: u64) {
-    let h = (cpu_id as usize).min(LLAMA_HEADS - 1);
     let ctx = unsafe { &mut *(ctx_ptr as *mut SmpLlamaContext) };
+    let cfg = ctx.config;
     let l = ctx.cur_layer;
     let pos = ctx.cur_pos;
-    let head_size = LLAMA_HEAD_SIZE;
+    let dim = cfg.dim;
+    let n_heads = cfg.n_heads;
+    let seq_len = cfg.seq_len;
+    if n_heads == 0 || dim == 0 {
+        return;
+    }
+    let head_size = dim / n_heads;
 
-    let q_head = &ctx.q[h * head_size..(h + 1) * head_size];
-    let scores_base = h * LLAMA_SEQ_LEN;
+    let heads_per_core = (n_heads / 4).max(1);
+    let h_start = (cpu_id as usize) * heads_per_core;
+    let h_end = (h_start + heads_per_core).min(n_heads);
+    let inv_sqrt_head = 1.0f32 / fast_sqrtf(head_size as f32);
 
-    // 1. Calculate attention scores for t = 0..=pos
-    let mut max_score = -1e9f32;
-    for t in 0..=pos {
-        let k_offset = l * (LLAMA_SEQ_LEN * LLAMA_DIM) + t * LLAMA_DIM + h * head_size;
-        let k_slice = &ctx.key_cache[k_offset..k_offset + head_size];
+    for h in h_start..h_end {
+        let q_head = unsafe { core::slice::from_raw_parts(ctx.q.add(h * head_size), head_size) };
+        let scores_base = h * seq_len;
 
-        let mut dot = 0.0f32;
-        for i in 0..head_size {
-            dot += q_head[i] * k_slice[i];
+        // 1. Calculate attention scores for t = 0..=pos
+        let mut max_score = -1e9f32;
+        for t in 0..=pos {
+            let k_offset = l * (seq_len * dim) + t * dim + h * head_size;
+            let k_slice = unsafe { core::slice::from_raw_parts(ctx.key_cache.add(k_offset), head_size) };
+
+            let mut dot = 0.0f32;
+            for i in 0..head_size {
+                dot += q_head[i] * k_slice[i];
+            }
+            let score = dot * inv_sqrt_head;
+            unsafe { *ctx.att_scores.add(scores_base + t) = score; }
+            if score > max_score {
+                max_score = score;
+            }
         }
-        let score = dot / 4.0; // sqrt(16) = 4.0
-        ctx.att_scores[scores_base + t] = score;
-        if score > max_score {
-            max_score = score;
+
+        // 2. Softmax normalization
+        let mut exp_sum = 0.0f32;
+        for t in 0..=pos {
+            let exp_val = fast_expf(unsafe { *ctx.att_scores.add(scores_base + t) } - max_score);
+            unsafe { *ctx.att_scores.add(scores_base + t) = exp_val; }
+            exp_sum += exp_val;
         }
-    }
+        let inv_sum = 1.0f32 / (exp_sum.max(1e-5));
+        for t in 0..=pos {
+            unsafe { *ctx.att_scores.add(scores_base + t) *= inv_sum; }
+        }
 
-    // 2. Softmax normalization
-    let mut exp_sum = 0.0f32;
-    for t in 0..=pos {
-        let exp_val = fast_expf(ctx.att_scores[scores_base + t] - max_score);
-        ctx.att_scores[scores_base + t] = exp_val;
-        exp_sum += exp_val;
-    }
-    let inv_sum = 1.0f32 / (exp_sum.max(1e-5));
-    for t in 0..=pos {
-        ctx.att_scores[scores_base + t] *= inv_sum;
-    }
-
-    // 3. Weighted sum of values into att_out slice
-    let out_head = &mut ctx.att_out[h * head_size..(h + 1) * head_size];
-    for i in 0..head_size {
-        out_head[i] = 0.0;
-    }
-
-    for t in 0..=pos {
-        let weight = ctx.att_scores[scores_base + t];
-        let v_offset = l * (LLAMA_SEQ_LEN * LLAMA_DIM) + t * LLAMA_DIM + h * head_size;
-        let v_slice = &ctx.value_cache[v_offset..v_offset + head_size];
+        // 3. Weighted sum of values into att_out slice
+        let out_head = unsafe { core::slice::from_raw_parts_mut(ctx.att_out.add(h * head_size), head_size) };
         for i in 0..head_size {
-            out_head[i] += weight * v_slice[i];
+            out_head[i] = 0.0;
+        }
+
+        for t in 0..=pos {
+            let weight = unsafe { *ctx.att_scores.add(scores_base + t) };
+            let v_offset = l * (seq_len * dim) + t * dim + h * head_size;
+            let v_slice = unsafe { core::slice::from_raw_parts(ctx.value_cache.add(v_offset), head_size) };
+            for i in 0..head_size {
+                out_head[i] += weight * v_slice[i];
+            }
         }
     }
 }
 
-/// 4-core worker: Computes 32 hidden units of SwiGLU FFN per core.
+/// 4-core worker: Computes SwiGLU FFN units partitioned dynamically across cores (`cpu_id * slice_len`).
 pub extern "C" fn smp_llama_ffn_worker(cpu_id: u64, ctx_ptr: u64) {
-    let core = (cpu_id as usize).min(3);
     let ctx = unsafe { &mut *(ctx_ptr as *mut SmpLlamaContext) };
     let weights = unsafe { &*ctx.weights_ptr };
+    let cfg = ctx.config;
     let l = ctx.cur_layer;
+    let dim = cfg.dim;
+    let hidden = cfg.hidden_dim;
+    if hidden == 0 || dim == 0 {
+        return;
+    }
 
-    let slice_len = LLAMA_HIDDEN_DIM / 4; // 32 units per core
-    let start = core * slice_len;
-    let end = start + slice_len;
+    let slice_len = (hidden / 4).max(1);
+    let start = (cpu_id as usize) * slice_len;
+    let end = (start + slice_len).min(hidden);
 
-    let w1_layer = &weights.w1[l * LLAMA_DIM * LLAMA_HIDDEN_DIM..];
-    let w3_layer = &weights.w3[l * LLAMA_DIM * LLAMA_HIDDEN_DIM..];
+    let w1_layer = unsafe { weights.w1.add(l * dim * hidden) };
+    let w3_layer = unsafe { weights.w3.add(l * dim * hidden) };
 
     for j in start..end {
         let mut sum1 = 0.0f32;
         let mut sum3 = 0.0f32;
-        for c in 0..LLAMA_DIM {
-            sum1 += ctx.xb[c] * w1_layer[j * LLAMA_DIM + c];
-            sum3 += ctx.xb[c] * w3_layer[j * LLAMA_DIM + c];
+        for c in 0..dim {
+            unsafe {
+                sum1 += *ctx.xb.add(c) * *w1_layer.add(j * dim + c);
+                sum3 += *ctx.xb.add(c) * *w3_layer.add(j * dim + c);
+            }
         }
         let silu = sum1 / (1.0 + fast_expf(-sum1));
-        ctx.h_glu[j] = silu * sum3;
+        unsafe {
+            *ctx.h_glu.add(j) = silu * sum3;
+        }
     }
 }
 
@@ -419,40 +573,69 @@ pub fn run_llama_forward_step(
     token: usize,
     pos: usize,
 ) {
-    let dim = LLAMA_DIM;
+    let cfg = ctx.config;
+    let dim = cfg.dim;
+    let hidden = cfg.hidden_dim;
+    let layers = cfg.n_layers;
+    let heads = cfg.n_heads;
+    let seq_len = cfg.seq_len;
+    let head_size = dim / heads;
+    let vocab = cfg.vocab_size;
+
     ctx.cur_pos = pos;
     ctx.weights_ptr = weights as *const LlamaWeights;
 
     // 1. Embedding lookup
-    let emb_offset = (token % LLAMA_VOCAB) * dim;
-    ctx.x.copy_from_slice(&weights.token_embedding[emb_offset..emb_offset + dim]);
+    let emb_offset = (token % vocab) * dim;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            weights.token_embedding.add(emb_offset),
+            ctx.x,
+            dim,
+        );
+    }
 
     // 2. Transformer layers
-    for l in 0..LLAMA_LAYERS {
+    for l in 0..layers {
         ctx.cur_layer = l;
 
         // Attention RMSNorm
         let att_weight_offset = l * dim;
-        rmsnorm(
-            &mut ctx.xb,
-            &ctx.x,
-            &weights.rms_att[att_weight_offset..att_weight_offset + dim],
-            1e-5,
-        );
+        unsafe {
+            rmsnorm(
+                core::slice::from_raw_parts_mut(ctx.xb, dim),
+                core::slice::from_raw_parts(ctx.x, dim),
+                core::slice::from_raw_parts(weights.rms_att.add(att_weight_offset), dim),
+                1e-5,
+            );
+        }
 
         // Q, K, V projections
         let w_offset = l * dim * dim;
-        matmul(&mut ctx.q, &ctx.xb, &weights.wq[w_offset..], dim, dim);
-        matmul(&mut ctx.k, &ctx.xb, &weights.wk[w_offset..], dim, dim);
-        matmul(&mut ctx.v, &ctx.xb, &weights.wv[w_offset..], dim, dim);
+        unsafe {
+            let xb_slice = core::slice::from_raw_parts(ctx.xb, dim);
+            matmul(core::slice::from_raw_parts_mut(ctx.q, dim), xb_slice, core::slice::from_raw_parts(weights.wq.add(w_offset), dim * dim), dim, dim);
+            matmul(core::slice::from_raw_parts_mut(ctx.k, dim), xb_slice, core::slice::from_raw_parts(weights.wk.add(w_offset), dim * dim), dim, dim);
+            matmul(core::slice::from_raw_parts_mut(ctx.v, dim), xb_slice, core::slice::from_raw_parts(weights.wv.add(w_offset), dim * dim), dim, dim);
+        }
 
         // RoPE rotations on Q and K
-        apply_rope(&mut ctx.q, &mut ctx.k, pos, LLAMA_HEADS, LLAMA_HEAD_SIZE);
+        unsafe {
+            apply_rope(
+                core::slice::from_raw_parts_mut(ctx.q, dim),
+                core::slice::from_raw_parts_mut(ctx.k, dim),
+                pos,
+                heads,
+                head_size,
+            );
+        }
 
         // Save key and value to cache at position `pos`
-        let kv_offset = l * (LLAMA_SEQ_LEN * dim) + pos * dim;
-        ctx.key_cache[kv_offset..kv_offset + dim].copy_from_slice(&ctx.k);
-        ctx.value_cache[kv_offset..kv_offset + dim].copy_from_slice(&ctx.v);
+        let kv_offset = l * (seq_len * dim) + pos * dim;
+        unsafe {
+            core::ptr::copy_nonoverlapping(ctx.k, ctx.key_cache.add(kv_offset), dim);
+            core::ptr::copy_nonoverlapping(ctx.v, ctx.value_cache.add(kv_offset), dim);
+        }
 
         // Multi-head attention across 4 cores
         let ctx_ptr = ctx as *mut SmpLlamaContext as u64;
@@ -466,20 +649,32 @@ pub fn run_llama_forward_step(
         }
 
         // Wo projection: xb2 = wo * att_out
-        matmul(&mut ctx.xb2, &ctx.att_out, &weights.wo[w_offset..], dim, dim);
+        unsafe {
+            matmul(
+                core::slice::from_raw_parts_mut(ctx.xb2, dim),
+                core::slice::from_raw_parts(ctx.att_out, dim),
+                core::slice::from_raw_parts(weights.wo.add(w_offset), dim * dim),
+                dim,
+                dim,
+            );
+        }
 
         // Residual connection: x = x + xb2
-        for i in 0..dim {
-            ctx.x[i] += ctx.xb2[i];
+        unsafe {
+            for i in 0..dim {
+                *ctx.x.add(i) += *ctx.xb2.add(i);
+            }
         }
 
         // FFN RMSNorm
-        rmsnorm(
-            &mut ctx.xb,
-            &ctx.x,
-            &weights.rms_ffn[att_weight_offset..att_weight_offset + dim],
-            1e-5,
-        );
+        unsafe {
+            rmsnorm(
+                core::slice::from_raw_parts_mut(ctx.xb, dim),
+                core::slice::from_raw_parts(ctx.x, dim),
+                core::slice::from_raw_parts(weights.rms_ffn.add(att_weight_offset), dim),
+                1e-5,
+            );
+        }
 
         // SwiGLU FFN across 4 cores
         #[cfg(target_os = "uefi")]
@@ -492,26 +687,45 @@ pub fn run_llama_forward_step(
         }
 
         // W2 projection: xb2 = w2 * h_glu
-        let w2_offset = l * LLAMA_HIDDEN_DIM * dim;
-        matmul(&mut ctx.xb2, &ctx.h_glu, &weights.w2[w2_offset..], dim, LLAMA_HIDDEN_DIM);
+        let w2_offset = l * hidden * dim;
+        unsafe {
+            matmul(
+                core::slice::from_raw_parts_mut(ctx.xb2, dim),
+                core::slice::from_raw_parts(ctx.h_glu, hidden),
+                core::slice::from_raw_parts(weights.w2.add(w2_offset), dim * hidden),
+                dim,
+                hidden,
+            );
+        }
 
         // Residual connection: x = x + xb2
-        for i in 0..dim {
-            ctx.x[i] += ctx.xb2[i];
+        unsafe {
+            for i in 0..dim {
+                *ctx.x.add(i) += *ctx.xb2.add(i);
+            }
         }
     }
 
     // 3. Final RMSNorm
-    rmsnorm(&mut ctx.xb, &ctx.x, &weights.rms_final, 1e-5);
+    unsafe {
+        rmsnorm(
+            core::slice::from_raw_parts_mut(ctx.xb, dim),
+            core::slice::from_raw_parts(ctx.x, dim),
+            core::slice::from_raw_parts(weights.rms_final, dim),
+            1e-5,
+        );
+    }
 
     // 4. Classifier / LM Head projection onto vocabulary
-    for v in 0..LLAMA_VOCAB {
-        let emb_offset = v * dim;
-        let mut logit = 0.0f32;
-        for i in 0..dim {
-            logit += ctx.xb[i] * weights.token_embedding[emb_offset + i];
+    unsafe {
+        for v in 0..vocab {
+            let emb_offset = v * dim;
+            let mut logit = 0.0f32;
+            for i in 0..dim {
+                logit += *ctx.xb.add(i) * *weights.token_embedding.add(emb_offset + i);
+            }
+            *ctx.logits.add(v) = logit;
         }
-        ctx.logits[v] = logit;
     }
 }
 
@@ -528,8 +742,8 @@ pub fn sample_greedy(logits: &[f32]) -> usize {
     best_idx
 }
 
-/// Parses a `llama2.c` binary format header and loads model weights.
-pub fn load_llama_weights(data: &[u8], weights: &mut LlamaWeights) -> Result<(), &'static str> {
+/// Parses a `llama2.c` binary format header.
+pub fn parse_llama_header(data: &[u8]) -> Result<LlamaConfig, &'static str> {
     if data.len() < 28 {
         return Err("Llama model file too short for header");
     }
@@ -546,11 +760,11 @@ pub fn load_llama_weights(data: &[u8], weights: &mut LlamaWeights) -> Result<(),
     let vocab_size = read_i32(20).unsigned_abs() as usize;
     let seq_len = read_i32(24) as usize;
 
-    if dim != LLAMA_DIM || hidden_dim != LLAMA_HIDDEN_DIM || n_layers != LLAMA_LAYERS {
-        return Err("Model dimensions do not match Genesis compact Llama configuration");
+    if dim == 0 || n_heads == 0 || dim % n_heads != 0 || n_heads % 4 != 0 {
+        return Err("Invalid Llama dimensions: dim and n_heads must be divisible by 4");
     }
 
-    weights.config = LlamaConfig {
+    Ok(LlamaConfig {
         dim,
         hidden_dim,
         n_layers,
@@ -558,40 +772,37 @@ pub fn load_llama_weights(data: &[u8], weights: &mut LlamaWeights) -> Result<(),
         n_kv_heads,
         vocab_size,
         seq_len,
-    };
+    })
+}
 
-    // Load float slices sequentially
-    let mut offset = 28;
-    let mut read_f32_slice = |slice: &mut [f32]| -> Result<(), &'static str> {
-        let byte_len = slice.len() * 4;
-        if offset + byte_len > data.len() {
-            return Err("Unexpected EOF reading model weights");
-        }
-        for (i, val) in slice.iter_mut().enumerate() {
-            let b_idx = offset + i * 4;
-            *val = f32::from_le_bytes([data[b_idx], data[b_idx + 1], data[b_idx + 2], data[b_idx + 3]]);
-        }
-        offset += byte_len;
-        Ok(())
-    };
+/// Copies model weights from `data` into an already initialized `LlamaWeights` buffer.
+pub fn load_llama_weights(data: &[u8], weights: &mut LlamaWeights) -> Result<(), &'static str> {
+    let cfg = parse_llama_header(data)?;
+    let required_floats = LlamaWeights::total_floats_for(&cfg);
+    if weights.total_floats < required_floats || weights.token_embedding.is_null() {
+        return Err("Weights buffer not initialized or too small for model");
+    }
 
-    read_f32_slice(&mut weights.token_embedding)?;
-    read_f32_slice(&mut weights.rms_att)?;
-    read_f32_slice(&mut weights.wq)?;
-    read_f32_slice(&mut weights.wk)?;
-    read_f32_slice(&mut weights.wv)?;
-    read_f32_slice(&mut weights.wo)?;
-    read_f32_slice(&mut weights.rms_ffn)?;
-    read_f32_slice(&mut weights.w1)?;
-    read_f32_slice(&mut weights.w2)?;
-    read_f32_slice(&mut weights.w3)?;
-    read_f32_slice(&mut weights.rms_final)?;
+    let byte_len = required_floats * 4;
+    if data.len() < 28 + byte_len {
+        return Err("Unexpected EOF reading model weights");
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr().add(28),
+            weights.token_embedding as *mut u8,
+            byte_len,
+        );
+    }
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+    use alloc::vec;
     use super::*;
 
     #[test]
@@ -639,57 +850,69 @@ mod tests {
         let h3 = [2.0, 3.0, 4.0, 1.0];
         let mut out = [0.0; 4];
         swiglu_forward(&mut out, &h1, &h3);
-        // silu(0) = 0, so out[2] should be 0
         assert_eq!(out[2], 0.0);
         assert!(out[0] > 0.0);
     }
 
     #[test]
-    fn llama_forward_step_test() {
-        let weights = LlamaWeights {
-            config: LlamaConfig {
-                dim: LLAMA_DIM,
-                hidden_dim: LLAMA_HIDDEN_DIM,
-                n_layers: LLAMA_LAYERS,
-                n_heads: LLAMA_HEADS,
-                n_kv_heads: LLAMA_KV_HEADS,
-                vocab_size: LLAMA_VOCAB,
-                seq_len: LLAMA_SEQ_LEN,
-            },
-            token_embedding: [0.01; LLAMA_VOCAB * LLAMA_DIM],
-            rms_att: [1.0; LLAMA_LAYERS * LLAMA_DIM],
-            wq: [0.01; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-            wk: [0.01; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-            wv: [0.01; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-            wo: [0.01; LLAMA_LAYERS * LLAMA_DIM * LLAMA_DIM],
-            rms_ffn: [1.0; LLAMA_LAYERS * LLAMA_DIM],
-            w1: [0.01; LLAMA_LAYERS * LLAMA_DIM * LLAMA_HIDDEN_DIM],
-            w2: [0.01; LLAMA_LAYERS * LLAMA_HIDDEN_DIM * LLAMA_DIM],
-            w3: [0.01; LLAMA_LAYERS * LLAMA_DIM * LLAMA_HIDDEN_DIM],
-            rms_final: [1.0; LLAMA_DIM],
-        };
-        let mut ctx = SmpLlamaContext {
-            x: [0.0; LLAMA_DIM],
-            xb: [0.0; LLAMA_DIM],
-            xb2: [0.0; LLAMA_DIM],
-            q: [0.0; LLAMA_DIM],
-            k: [0.0; LLAMA_DIM],
-            v: [0.0; LLAMA_DIM],
-            att_out: [0.0; LLAMA_DIM],
-            hb1: [0.0; LLAMA_HIDDEN_DIM],
-            hb3: [0.0; LLAMA_HIDDEN_DIM],
-            h_glu: [0.0; LLAMA_HIDDEN_DIM],
-            att_scores: [0.0; LLAMA_HEADS * LLAMA_SEQ_LEN],
-            key_cache: [0.0; LLAMA_LAYERS * LLAMA_SEQ_LEN * LLAMA_DIM],
-            value_cache: [0.0; LLAMA_LAYERS * LLAMA_SEQ_LEN * LLAMA_DIM],
-            logits: [0.0; LLAMA_VOCAB],
-            cur_layer: 0,
-            cur_pos: 0,
-            weights_ptr: core::ptr::null(),
+    fn dynamic_llama_forward_step_test() {
+        let cfg = LlamaConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_layers: 2,
+            n_heads: 4,
+            n_kv_heads: 4,
+            vocab_size: 128,
+            seq_len: 32,
         };
 
+        let weight_floats = LlamaWeights::total_floats_for(&cfg);
+        let mut weight_buf = vec![0.01f32; weight_floats];
+        let mut weights = LlamaWeights::empty();
+        unsafe {
+            weights.init_from_buffer(cfg, weight_buf.as_mut_ptr());
+        }
+
+        let ctx_floats = SmpLlamaContext::total_floats_for(&cfg);
+        let mut ctx_buf = vec![0.0f32; ctx_floats];
+        let mut ctx = SmpLlamaContext::empty();
+        unsafe {
+            ctx.init_from_buffer(cfg, ctx_buf.as_mut_ptr());
+        }
+
         run_llama_forward_step(&weights, &mut ctx, 65, 0);
-        let tok = sample_greedy(&ctx.logits);
-        assert!(tok < LLAMA_VOCAB);
+        let tok = sample_greedy(unsafe { ctx.logits_slice() });
+        assert!(tok < cfg.vocab_size);
+    }
+
+    #[test]
+    fn dynamic_llama_larger_dim_and_heads() {
+        let cfg = LlamaConfig {
+            dim: 128,
+            hidden_dim: 256,
+            n_layers: 1,
+            n_heads: 8,
+            n_kv_heads: 8,
+            vocab_size: 64,
+            seq_len: 16,
+        };
+
+        let weight_floats = LlamaWeights::total_floats_for(&cfg);
+        let mut weight_buf = vec![0.02f32; weight_floats];
+        let mut weights = LlamaWeights::empty();
+        unsafe {
+            weights.init_from_buffer(cfg, weight_buf.as_mut_ptr());
+        }
+
+        let ctx_floats = SmpLlamaContext::total_floats_for(&cfg);
+        let mut ctx_buf = vec![0.0f32; ctx_floats];
+        let mut ctx = SmpLlamaContext::empty();
+        unsafe {
+            ctx.init_from_buffer(cfg, ctx_buf.as_mut_ptr());
+        }
+
+        run_llama_forward_step(&weights, &mut ctx, 10, 0);
+        let tok = sample_greedy(unsafe { ctx.logits_slice() });
+        assert!(tok < cfg.vocab_size);
     }
 }
