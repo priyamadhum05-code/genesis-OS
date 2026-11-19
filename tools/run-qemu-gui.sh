@@ -17,7 +17,7 @@ with open('build/esp/WEIGHTS.BIN', 'wb') as f:
 python3 tools/gen-stage9-assets.py
 python3 tools/gen-stage12-assets.py
 [ -f build/target/aarch64-unknown-uefi/release/genesis-stage1.efi ] && cp build/target/aarch64-unknown-uefi/release/genesis-stage1.efi build/esp/EFI/BOOT/BOOTAA64.EFI
-exec "$QEMU" -machine virt-11.1,gic-version=3 -cpu cortex-a76 -smp "${QEMU_SMP:-4}" -m 256M \
+exec "$QEMU" -machine virt-11.1,gic-version=3 -cpu cortex-a76 -smp "${QEMU_SMP:-4}" -m 512M \
   -drive if=pflash,format=raw,unit=0,readonly=on,file="$FW/edk2-aarch64-code.fd" \
   -drive if=pflash,format=raw,unit=1,file=build/edk2-vars.fd \
   -drive if=none,format=raw,file=fat:rw:build/esp,id=esp \

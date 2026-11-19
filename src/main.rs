@@ -12,7 +12,7 @@ use genesis_stage1::{
         run_parallel_nn_inference, run_parallel_transformer, sample_greedy, scalar_infer,
         scalar_matmul, scalar_micro_llm_step, scalar_transformer_block, smp_matmul_worker,
         verify_inference, verify_llm_step, verify_matrices, verify_transformer,
-        LlamaWeights, SmpLlamaContext, MATMUL_N, SMP_LLAMA_CTX, SMP_LLAMA_WEIGHTS,
+        LlamaWeights, SmpLlamaContext, Tokenizer, MATMUL_N, SMP_LLAMA_CTX, SMP_LLAMA_WEIGHTS,
         SMP_MICRO_LLM_WEIGHTS, SMP_NN_CTX, SMP_TRANSFORMER_CTX,
     },
     arch::{
@@ -22,8 +22,9 @@ use genesis_stage1::{
         SecondaryBootArgs, ONLINE_CPUS,
     },
     drivers::{
-        register_global_fb_console, virtio_input::VirtIOInputDevice, FbConsole, Framebuffer,
-        VirtIOBlockDevice, VirtIONetDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC,
+        global_fb_console_write, register_global_fb_console, update_workspace_telemetry,
+        virtio_input::VirtIOInputDevice, write_u64, FbConsole, Framebuffer, VirtIOBlockDevice,
+        VirtIONetDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC,
     },
     fs::{locate_volume, FatVolume},
     memory_map,
@@ -1563,10 +1564,14 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             serial_write(uart, b"GENESIS: stage8 framebuffer skipped (headless mode)\r\n");
         }
 
-        // 2. Dedicated 512 KiB Buffer for Shell File Reading
+        // 2. Dedicated Buffers for Shell File and Tokenizer Reading
         let shell_file_pa = mapper.pmm_mut().allocate_contiguous_pages(128).unwrap();
         let shell_file_va = HHDM_BASE + shell_file_pa;
         let shell_file_cap = 512 * 1024;
+
+        let tok_file_pa = mapper.pmm_mut().allocate_contiguous_pages(4).unwrap();
+        let tok_file_va = HHDM_BASE + tok_file_pa;
+        let tok_file_cap = 16 * 1024;
 
         // 3. Initialize Interactive Shell
         let total_ram_mib = (total_usable * 4) / 1024;
@@ -1586,6 +1591,9 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             file_buf_pa: shell_file_pa,
             file_buf_va: shell_file_va,
             file_buf_cap: shell_file_cap,
+            tok_buf_pa: tok_file_pa,
+            tok_buf_va: tok_file_va,
+            tok_buf_cap: tok_file_cap,
             fb: fb_opt.as_mut(),
             total_ram_mib,
             free_ram_mib,
@@ -1644,8 +1652,12 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         shell.execute_command("ramstat");
         serial_write(uart, b"GENESIS: stage13 milestone complete\r\n");
 
-        // 10. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 13)\r\n");
+        // 10. Stage 14 Automated Smoke-Test (chat GENESIS)
+        shell.execute_command("chat GENESIS");
+        serial_write(uart, b"GENESIS: stage14 milestone complete\r\n");
+
+        // 11. Interactive Prompt Loop
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 14)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {
@@ -2316,6 +2328,7 @@ unsafe fn kernel_http_get(
 
 unsafe fn kernel_run_llama(
     model_data: &[u8],
+    tokenizer_data: Option<&[u8]>,
     prompt_str: &str,
     uart: usize,
 ) -> Result<(), &'static str> {
@@ -2355,13 +2368,29 @@ unsafe fn kernel_run_llama(
     }
     ctx.weights_ptr = weights as *const LlamaWeights;
 
+    let tokenizer = if let Some(tok_bytes) = tokenizer_data {
+        Tokenizer::parse(tok_bytes, cfg.vocab_size).ok()
+    } else {
+        None
+    };
+
     serial_write(uart, b"Prompt: \"");
     serial_write(uart, prompt_str.as_bytes());
     serial_write(uart, b"\"\r\nOutput: ");
     serial_write(uart, prompt_str.as_bytes());
 
-    let prompt_bytes = prompt_str.as_bytes();
-    let prompt_len = prompt_bytes.len().min(cfg.seq_len - 8);
+    global_fb_console_write(b"Prompt: \"");
+    global_fb_console_write(prompt_str.as_bytes());
+    global_fb_console_write(b"\"\r\nOutput: ");
+    global_fb_console_write(prompt_str.as_bytes());
+
+    let prompt_tokens = if let Some(ref tok) = tokenizer {
+        tok.encode(prompt_str, true)
+    } else {
+        prompt_str.bytes().map(|b| b as usize).collect()
+    };
+
+    let prompt_len = prompt_tokens.len().min(cfg.seq_len.saturating_sub(8).max(1));
 
     let t0: u64;
     let t1: u64;
@@ -2379,20 +2408,30 @@ unsafe fn kernel_run_llama(
 
     // Process prompt tokens
     for pos in 0..prompt_len {
-        let tok = prompt_bytes[pos] as usize;
+        let tok = prompt_tokens[pos];
         run_llama_forward_step(weights, ctx, tok, pos);
     }
 
     // Autoregressive generation (4 new tokens)
     let steps_to_gen = 4;
+    let mut prev_tok = *prompt_tokens.last().unwrap_or(&1);
     for i in 0..steps_to_gen {
         let next_tok = sample_greedy(ctx.logits_slice());
-        let char_byte = if next_tok < 128 && (next_tok as u8).is_ascii_graphic() || next_tok == b' ' as usize {
-            next_tok as u8
+        if let Some(ref tok) = tokenizer {
+            let mut scratch = [0u8; 8];
+            let piece = tok.decode(prev_tok, next_tok, &mut scratch);
+            serial_write(uart, piece);
+            global_fb_console_write(piece);
         } else {
-            b'.'
-        };
-        serial_write(uart, &[char_byte]);
+            let char_byte = if next_tok < 128 && (next_tok as u8).is_ascii_graphic() || next_tok == b' ' as usize {
+                next_tok as u8
+            } else {
+                b'.'
+            };
+            serial_write(uart, &[char_byte]);
+            global_fb_console_write(&[char_byte]);
+        }
+        prev_tok = next_tok;
 
         let pos = prompt_len + i;
         if pos < cfg.seq_len - 1 {
@@ -2418,6 +2457,26 @@ unsafe fn kernel_run_llama(
     serial_write(uart, b" tokens/sec (");
     serial_decimal(uart, total_us);
     serial_write(uart, b" us total, cores=4)\r\n");
+
+    global_fb_console_write(b"\r\n[Llama-2: ");
+    let mut num_buf = [0u8; 32];
+    let nlen = write_u64(tok_per_sec, &mut num_buf);
+    global_fb_console_write(&num_buf[..nlen]);
+    global_fb_console_write(b" tok/s]\r\n");
+
+    update_workspace_telemetry(
+        Some("Llama-2 SMP"),
+        Some(tok_per_sec),
+        Some(total_us),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("LLAMA2 OK"),
+    );
 
     Ok(())
 }

@@ -29,6 +29,9 @@ pub struct Shell<'a> {
     pub file_buf_pa: u64,
     pub file_buf_va: u64,
     pub file_buf_cap: usize,
+    pub tok_buf_pa: u64,
+    pub tok_buf_va: u64,
+    pub tok_buf_cap: usize,
     pub fb: Option<&'a mut Framebuffer>,
     pub total_ram_mib: u64,
     pub free_ram_mib: u64,
@@ -42,7 +45,7 @@ pub struct Shell<'a> {
     pub llm_fn: Option<unsafe fn(&[u8], usize) -> Result<u64, &'static str>>,
     pub multitask_fn: Option<unsafe fn(&[u8], &[u8], usize) -> Result<(), &'static str>>,
     pub generate_fn: Option<unsafe fn(&[u8], &str, usize) -> Result<(), &'static str>>,
-    pub llama_fn: Option<unsafe fn(&[u8], &str, usize) -> Result<(), &'static str>>,
+    pub llama_fn: Option<unsafe fn(&[u8], Option<&[u8]>, &str, usize) -> Result<(), &'static str>>,
     pub ping_fn: Option<unsafe fn(&mut VirtIONetDevice, usize) -> Result<u64, &'static str>>,
     pub dns_fn: Option<unsafe fn(&mut VirtIONetDevice, &str, usize) -> Result<[u8; 4], &'static str>>,
     pub httpget_fn: Option<unsafe fn(&mut VirtIONetDevice, &str, u16, &str, usize) -> Result<usize, &'static str>>,
@@ -62,7 +65,7 @@ impl<'a> Shell<'a> {
 
         match cmd {
             "help" => {
-                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 13)\r\n");
+                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 14)\r\n");
                 serial_write(self.uart_va, b"Available commands:\r\n");
                 serial_write(self.uart_va, b"  help              - List available commands\r\n");
                 serial_write(self.uart_va, b"  info              - Display system status, memory, registers, and framebuffer\r\n");
@@ -83,6 +86,7 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  multitask         - Run preemptive multi-process EL0 scheduling & IPC\r\n");
                 serial_write(self.uart_va, b"  generate [seed]   - Run 4-core SMP autoregressive Micro-LLM text generation\r\n");
                 serial_write(self.uart_va, b"  llama [model] [prompt] - Run 4-core SMP dynamic Llama-2 inference\r\n");
+                serial_write(self.uart_va, b"  chat <prompt>     - Interactive Llama-2 chat with BPE tokenization\r\n");
                 serial_write(self.uart_va, b"  halt / poweroff   - Power off system via PSCI SYSTEM_OFF\r\n");
             }
             "ramstat" => {
@@ -170,6 +174,23 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"%\r\n");
                 serial_write(self.uart_va, b"===================================================\r\n");
                 serial_write(self.uart_va, b"GENESIS: stage13 ramstat ok\r\n");
+
+                let pe_kib = if let Some(ref pe) = self.pe { ((pe.total_pages * 4096) / 1024) as u64 } else { 312 };
+                let heap_kib = (heap_alloc as u64) / 1024;
+                let huge_kib = (llama_pages as u64) * 4;
+                crate::drivers::fb::update_workspace_telemetry(
+                    None,
+                    None,
+                    None,
+                    Some(pe_kib),
+                    Some(heap_kib),
+                    Some(huge_kib),
+                    Some(self.free_ram_mib),
+                    Some(self.total_ram_mib),
+                    None,
+                    None,
+                    Some("RAMSTAT OK"),
+                );
             }
             "info" => {
                 serial_write(self.uart_va, b"=== Project Genesis System Information ===\r\n");
@@ -339,6 +360,19 @@ impl<'a> Shell<'a> {
                     serial_write(self.uart_va, b" ticks (~");
                     serial_decimal(self.uart_va, us);
                     serial_write(self.uart_va, b" us)\r\n");
+                    crate::drivers::fb::update_workspace_telemetry(
+                        None,
+                        None,
+                        Some(us),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("BENCH OK"),
+                    );
                 } else {
                     serial_write(self.uart_va, b"Benchmark function not configured\r\n");
                 }
@@ -542,7 +576,7 @@ impl<'a> Shell<'a> {
                     serial_write(self.uart_va, b"Multitask runner not configured\r\n");
                 }
             }
-            "generate" | "chat" => {
+            "generate" => {
                 let prompt = if arg.is_empty() { "GENESIS " } else { arg };
                 if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
                     let res = fat.read_file(
@@ -596,6 +630,23 @@ impl<'a> Shell<'a> {
                     }
                 }
                 if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                    let tok_slice = if self.tok_buf_cap > 0 {
+                        match fat.read_file(
+                            dev,
+                            "TOKENIZER.BIN",
+                            self.tok_buf_pa,
+                            self.tok_buf_va,
+                            self.tok_buf_cap,
+                            self.scratch_pa,
+                            self.scratch_va,
+                        ) {
+                            Ok(bytes) => Some(core::slice::from_raw_parts(self.tok_buf_va as *const u8, bytes)),
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+
                     let res = fat.read_file(
                         dev,
                         filename,
@@ -609,13 +660,103 @@ impl<'a> Shell<'a> {
                         Ok(bytes) => {
                             if let Some(llama_fn) = self.llama_fn {
                                 let model_slice = core::slice::from_raw_parts(self.file_buf_va as *const u8, bytes);
-                                match llama_fn(model_slice, prompt, self.uart_va) {
+                                match llama_fn(model_slice, tok_slice, prompt, self.uart_va) {
                                     Ok(()) => {
                                         serial_write(self.uart_va, b"GENESIS: stage12 llama2 engine ok\r\n");
                                         serial_write(self.uart_va, b"GENESIS: stage13 dynamic llama2 ok\r\n");
+                                        crate::drivers::fb::update_workspace_telemetry(
+                                            Some("Llama-2 SMP"),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            Some("LLAMA2 OK"),
+                                        );
                                     }
                                     Err(e) => {
                                         serial_write(self.uart_va, b"Llama2 execution failed: ");
+                                        serial_write(self.uart_va, e.as_bytes());
+                                        serial_write(self.uart_va, b"\r\n");
+                                    }
+                                }
+                            } else {
+                                serial_write(self.uart_va, b"Llama runner not configured\r\n");
+                            }
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error reading ");
+                            serial_write(self.uart_va, filename.as_bytes());
+                            serial_write(self.uart_va, b": ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                }
+            }
+            "chat" => {
+                let filename = "TINY_LLAMA.BIN";
+                let prompt = if !arg.is_empty() {
+                    let full_arg_start = line.find("chat").unwrap_or(0) + 4;
+                    line[full_arg_start..].trim()
+                } else {
+                    "GENESIS"
+                };
+                if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                    let tok_slice = if self.tok_buf_cap > 0 {
+                        match fat.read_file(
+                            dev,
+                            "TOKENIZER.BIN",
+                            self.tok_buf_pa,
+                            self.tok_buf_va,
+                            self.tok_buf_cap,
+                            self.scratch_pa,
+                            self.scratch_va,
+                        ) {
+                            Ok(bytes) => Some(core::slice::from_raw_parts(self.tok_buf_va as *const u8, bytes)),
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    let res = fat.read_file(
+                        dev,
+                        filename,
+                        self.file_buf_pa,
+                        self.file_buf_va,
+                        self.file_buf_cap,
+                        self.scratch_pa,
+                        self.scratch_va,
+                    );
+                    match res {
+                        Ok(bytes) => {
+                            if let Some(llama_fn) = self.llama_fn {
+                                let model_slice = core::slice::from_raw_parts(self.file_buf_va as *const u8, bytes);
+                                match llama_fn(model_slice, tok_slice, prompt, self.uart_va) {
+                                    Ok(()) => {
+                                        crate::drivers::fb::update_workspace_telemetry(
+                                            Some("Llama-2 SMP"),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            Some("CHAT OK"),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        serial_write(self.uart_va, b"Chat execution failed: ");
                                         serial_write(self.uart_va, e.as_bytes());
                                         serial_write(self.uart_va, b"\r\n");
                                     }
@@ -740,6 +881,19 @@ impl<'a> Shell<'a> {
                                 serial_decimal(self.uart_va, us);
                                 serial_write(self.uart_va, b" us\r\n");
                                 serial_write(self.uart_va, b"GENESIS: stage12 virtio-net ping 10.0.2.2 ok\r\n");
+                                crate::drivers::fb::update_workspace_telemetry(
+                                    None,
+                                    None,
+                                    Some(us),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(true),
+                                    Some("PING OK"),
+                                );
                             }
                             Err(e) => {
                                 serial_write(self.uart_va, b"Ping failed: ");
@@ -847,6 +1001,11 @@ mod tests {
         assert_eq!(parts_llama.next(), Some("llama"));
         assert_eq!(parts_llama.next(), Some("TINY_LLAMA.BIN"));
         assert_eq!(parts_llama.next(), Some("PROMPT"));
+
+        let input_chat = "chat Hello Genesis Assistant";
+        let mut parts_chat = input_chat.trim().split_whitespace();
+        assert_eq!(parts_chat.next(), Some("chat"));
+        assert_eq!(parts_chat.next(), Some("Hello"));
     }
 
     #[test]

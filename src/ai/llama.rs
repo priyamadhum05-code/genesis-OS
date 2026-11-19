@@ -28,6 +28,7 @@ pub struct LlamaConfig {
     pub n_kv_heads: usize,
     pub vocab_size: usize,
     pub seq_len: usize,
+    pub shared_weights: bool,
 }
 
 #[inline]
@@ -169,10 +170,16 @@ pub fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
 }
 
 /// Applies Rotary Position Embeddings (RoPE) to Q and K slices at `pos`.
-pub fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, n_heads: usize, head_size: usize) {
+pub fn apply_rope(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_size: usize,
+) {
     for h in 0..n_heads {
         let q_head = &mut q[h * head_size..(h + 1) * head_size];
-        let k_head = &mut k[h * head_size..(h + 1) * head_size];
         let mut i = 0;
         while i < head_size {
             // theta = 10000^(-2i / head_size)
@@ -185,6 +192,18 @@ pub fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, n_heads: usize, head
             let q1 = q_head[i + 1];
             q_head[i] = q0 * c - q1 * s;
             q_head[i + 1] = q0 * s + q1 * c;
+
+            i += 2;
+        }
+    }
+    for h in 0..n_kv_heads {
+        let k_head = &mut k[h * head_size..(h + 1) * head_size];
+        let mut i = 0;
+        while i < head_size {
+            let exponent = -((i as f32) / (head_size as f32));
+            let theta = fast_expf(exponent * 9.21034037);
+            let angle = (pos as f32) * theta;
+            let (s, c) = fast_sin_cos(angle);
 
             let k0 = k_head[i];
             let k1 = k_head[i + 1];
@@ -256,6 +275,7 @@ pub struct LlamaWeights {
     pub w2: *const f32,
     pub w3: *const f32,
     pub rms_final: *const f32,
+    pub wcls: *const f32,
     pub total_floats: usize,
     pub paddr: u64,
     pub page_count: usize,
@@ -275,6 +295,7 @@ impl LlamaWeights {
                 n_kv_heads: 0,
                 vocab_size: 0,
                 seq_len: 0,
+                shared_weights: true,
             },
             token_embedding: core::ptr::null(),
             rms_att: core::ptr::null(),
@@ -287,6 +308,7 @@ impl LlamaWeights {
             w2: core::ptr::null(),
             w3: core::ptr::null(),
             rms_final: core::ptr::null(),
+            wcls: core::ptr::null(),
             total_floats: 0,
             paddr: 0,
             page_count: 0,
@@ -298,18 +320,20 @@ impl LlamaWeights {
         let hidden = cfg.hidden_dim;
         let layers = cfg.n_layers;
         let vocab = cfg.vocab_size;
+        let kv_dim = if cfg.n_heads > 0 { (dim * cfg.n_kv_heads) / cfg.n_heads } else { dim };
 
         vocab * dim              // token_embedding
         + layers * dim           // rms_att
         + layers * dim * dim     // wq
-        + layers * dim * dim     // wk
-        + layers * dim * dim     // wv
+        + layers * dim * kv_dim  // wk
+        + layers * dim * kv_dim  // wv
         + layers * dim * dim     // wo
         + layers * dim           // rms_ffn
         + layers * dim * hidden  // w1
         + layers * hidden * dim  // w2
         + layers * dim * hidden  // w3
         + dim                    // rms_final
+        + if cfg.shared_weights { 0 } else { vocab * dim } // wcls
     }
 
     pub unsafe fn init_from_buffer(&mut self, cfg: LlamaConfig, base_ptr: *mut f32) {
@@ -318,19 +342,25 @@ impl LlamaWeights {
         let hidden = cfg.hidden_dim;
         let layers = cfg.n_layers;
         let vocab = cfg.vocab_size;
+        let kv_dim = if cfg.n_heads > 0 { (dim * cfg.n_kv_heads) / cfg.n_heads } else { dim };
 
         let mut p = base_ptr;
         self.token_embedding = p; p = p.add(vocab * dim);
         self.rms_att = p; p = p.add(layers * dim);
         self.wq = p; p = p.add(layers * dim * dim);
-        self.wk = p; p = p.add(layers * dim * dim);
-        self.wv = p; p = p.add(layers * dim * dim);
+        self.wk = p; p = p.add(layers * dim * kv_dim);
+        self.wv = p; p = p.add(layers * dim * kv_dim);
         self.wo = p; p = p.add(layers * dim * dim);
         self.rms_ffn = p; p = p.add(layers * dim);
         self.w1 = p; p = p.add(layers * dim * hidden);
         self.w2 = p; p = p.add(layers * hidden * dim);
         self.w3 = p; p = p.add(layers * dim * hidden);
         self.rms_final = p; p = p.add(dim);
+        if cfg.shared_weights {
+            self.wcls = self.token_embedding;
+        } else {
+            self.wcls = p; p = p.add(vocab * dim);
+        }
 
         self.total_floats = p.offset_from(base_ptr) as usize;
     }
@@ -380,6 +410,7 @@ impl SmpLlamaContext {
                 n_kv_heads: 0,
                 vocab_size: 0,
                 seq_len: 0,
+                shared_weights: true,
             },
             x: core::ptr::null_mut(),
             xb: core::ptr::null_mut(),
@@ -411,11 +442,12 @@ impl SmpLlamaContext {
         let heads = cfg.n_heads;
         let seq = cfg.seq_len;
         let vocab = cfg.vocab_size;
+        let kv_dim = if cfg.n_heads > 0 { (dim * cfg.n_kv_heads) / cfg.n_heads } else { dim };
 
-        7 * dim                     // x, xb, xb2, q, k, v, att_out
+        5 * dim + 2 * kv_dim        // x, xb, xb2, att_out (dim) + q (dim) + k (kv_dim) + v (kv_dim)
         + 3 * hidden                // hb1, hb3, h_glu
         + heads * seq               // att_scores
-        + 2 * (layers * seq * dim)  // key_cache, value_cache
+        + 2 * (layers * seq * kv_dim) // key_cache, value_cache
         + vocab                     // logits
     }
 
@@ -427,14 +459,15 @@ impl SmpLlamaContext {
         let heads = cfg.n_heads;
         let seq = cfg.seq_len;
         let vocab = cfg.vocab_size;
+        let kv_dim = if cfg.n_heads > 0 { (dim * cfg.n_kv_heads) / cfg.n_heads } else { dim };
 
         let mut p = base_ptr;
         self.x = p; p = p.add(dim);
         self.xb = p; p = p.add(dim);
         self.xb2 = p; p = p.add(dim);
         self.q = p; p = p.add(dim);
-        self.k = p; p = p.add(dim);
-        self.v = p; p = p.add(dim);
+        self.k = p; p = p.add(kv_dim);
+        self.v = p; p = p.add(kv_dim);
         self.att_out = p; p = p.add(dim);
 
         self.hb1 = p; p = p.add(hidden);
@@ -442,8 +475,8 @@ impl SmpLlamaContext {
         self.h_glu = p; p = p.add(hidden);
 
         self.att_scores = p; p = p.add(heads * seq);
-        self.key_cache = p; p = p.add(layers * seq * dim);
-        self.value_cache = p; p = p.add(layers * seq * dim);
+        self.key_cache = p; p = p.add(layers * seq * kv_dim);
+        self.value_cache = p; p = p.add(layers * seq * kv_dim);
         self.logits = p; p = p.add(vocab);
 
         self.total_floats = p.offset_from(base_ptr) as usize;
@@ -470,25 +503,29 @@ pub extern "C" fn smp_llama_attn_worker(cpu_id: u64, ctx_ptr: u64) {
     let pos = ctx.cur_pos;
     let dim = cfg.dim;
     let n_heads = cfg.n_heads;
+    let n_kv_heads = cfg.n_kv_heads;
     let seq_len = cfg.seq_len;
-    if n_heads == 0 || dim == 0 {
+    if n_heads == 0 || dim == 0 || n_kv_heads == 0 {
         return;
     }
     let head_size = dim / n_heads;
+    let kv_dim = (dim * n_kv_heads) / n_heads;
+    let kv_mul = (n_heads / n_kv_heads).max(1);
 
-    let heads_per_core = (n_heads / 4).max(1);
-    let h_start = (cpu_id as usize) * heads_per_core;
+    let heads_per_core = ((n_heads + 3) / 4).max(1);
+    let h_start = ((cpu_id as usize) * heads_per_core).min(n_heads);
     let h_end = (h_start + heads_per_core).min(n_heads);
     let inv_sqrt_head = 1.0f32 / fast_sqrtf(head_size as f32);
 
     for h in h_start..h_end {
+        let h_kv = h / kv_mul;
         let q_head = unsafe { core::slice::from_raw_parts(ctx.q.add(h * head_size), head_size) };
         let scores_base = h * seq_len;
 
         // 1. Calculate attention scores for t = 0..=pos
         let mut max_score = -1e9f32;
         for t in 0..=pos {
-            let k_offset = l * (seq_len * dim) + t * dim + h * head_size;
+            let k_offset = l * (seq_len * kv_dim) + t * kv_dim + h_kv * head_size;
             let k_slice = unsafe { core::slice::from_raw_parts(ctx.key_cache.add(k_offset), head_size) };
 
             let mut dot = 0.0f32;
@@ -522,7 +559,7 @@ pub extern "C" fn smp_llama_attn_worker(cpu_id: u64, ctx_ptr: u64) {
 
         for t in 0..=pos {
             let weight = unsafe { *ctx.att_scores.add(scores_base + t) };
-            let v_offset = l * (seq_len * dim) + t * dim + h * head_size;
+            let v_offset = l * (seq_len * kv_dim) + t * kv_dim + h_kv * head_size;
             let v_slice = unsafe { core::slice::from_raw_parts(ctx.value_cache.add(v_offset), head_size) };
             for i in 0..head_size {
                 out_head[i] += weight * v_slice[i];
@@ -543,8 +580,8 @@ pub extern "C" fn smp_llama_ffn_worker(cpu_id: u64, ctx_ptr: u64) {
         return;
     }
 
-    let slice_len = (hidden / 4).max(1);
-    let start = (cpu_id as usize) * slice_len;
+    let slice_len = ((hidden + 3) / 4).max(1);
+    let start = ((cpu_id as usize) * slice_len).min(hidden);
     let end = (start + slice_len).min(hidden);
 
     let w1_layer = unsafe { weights.w1.add(l * dim * hidden) };
@@ -578,8 +615,10 @@ pub fn run_llama_forward_step(
     let hidden = cfg.hidden_dim;
     let layers = cfg.n_layers;
     let heads = cfg.n_heads;
+    let n_kv_heads = cfg.n_kv_heads;
     let seq_len = cfg.seq_len;
     let head_size = dim / heads;
+    let kv_dim = if heads > 0 { (dim * n_kv_heads) / heads } else { dim };
     let vocab = cfg.vocab_size;
 
     ctx.cur_pos = pos;
@@ -611,30 +650,33 @@ pub fn run_llama_forward_step(
         }
 
         // Q, K, V projections
-        let w_offset = l * dim * dim;
+        let wq_offset = l * dim * dim;
+        let wk_offset = l * dim * kv_dim;
+        let wv_offset = l * dim * kv_dim;
         unsafe {
             let xb_slice = core::slice::from_raw_parts(ctx.xb, dim);
-            matmul(core::slice::from_raw_parts_mut(ctx.q, dim), xb_slice, core::slice::from_raw_parts(weights.wq.add(w_offset), dim * dim), dim, dim);
-            matmul(core::slice::from_raw_parts_mut(ctx.k, dim), xb_slice, core::slice::from_raw_parts(weights.wk.add(w_offset), dim * dim), dim, dim);
-            matmul(core::slice::from_raw_parts_mut(ctx.v, dim), xb_slice, core::slice::from_raw_parts(weights.wv.add(w_offset), dim * dim), dim, dim);
+            matmul(core::slice::from_raw_parts_mut(ctx.q, dim), xb_slice, core::slice::from_raw_parts(weights.wq.add(wq_offset), dim * dim), dim, dim);
+            matmul(core::slice::from_raw_parts_mut(ctx.k, kv_dim), xb_slice, core::slice::from_raw_parts(weights.wk.add(wk_offset), kv_dim * dim), kv_dim, dim);
+            matmul(core::slice::from_raw_parts_mut(ctx.v, kv_dim), xb_slice, core::slice::from_raw_parts(weights.wv.add(wv_offset), kv_dim * dim), kv_dim, dim);
         }
 
         // RoPE rotations on Q and K
         unsafe {
             apply_rope(
                 core::slice::from_raw_parts_mut(ctx.q, dim),
-                core::slice::from_raw_parts_mut(ctx.k, dim),
+                core::slice::from_raw_parts_mut(ctx.k, kv_dim),
                 pos,
                 heads,
+                n_kv_heads,
                 head_size,
             );
         }
 
         // Save key and value to cache at position `pos`
-        let kv_offset = l * (seq_len * dim) + pos * dim;
+        let kv_offset = l * (seq_len * kv_dim) + pos * kv_dim;
         unsafe {
-            core::ptr::copy_nonoverlapping(ctx.k, ctx.key_cache.add(kv_offset), dim);
-            core::ptr::copy_nonoverlapping(ctx.v, ctx.value_cache.add(kv_offset), dim);
+            core::ptr::copy_nonoverlapping(ctx.k, ctx.key_cache.add(kv_offset), kv_dim);
+            core::ptr::copy_nonoverlapping(ctx.v, ctx.value_cache.add(kv_offset), kv_dim);
         }
 
         // Multi-head attention across 4 cores
@@ -649,11 +691,12 @@ pub fn run_llama_forward_step(
         }
 
         // Wo projection: xb2 = wo * att_out
+        let wo_offset = l * dim * dim;
         unsafe {
             matmul(
                 core::slice::from_raw_parts_mut(ctx.xb2, dim),
                 core::slice::from_raw_parts(ctx.att_out, dim),
-                core::slice::from_raw_parts(weights.wo.add(w_offset), dim * dim),
+                core::slice::from_raw_parts(weights.wo.add(wo_offset), dim * dim),
                 dim,
                 dim,
             );
@@ -722,7 +765,7 @@ pub fn run_llama_forward_step(
             let emb_offset = v * dim;
             let mut logit = 0.0f32;
             for i in 0..dim {
-                logit += *ctx.xb.add(i) * *weights.token_embedding.add(emb_offset + i);
+                logit += *ctx.xb.add(i) * *weights.wcls.add(emb_offset + i);
             }
             *ctx.logits.add(v) = logit;
         }
@@ -742,6 +785,109 @@ pub fn sample_greedy(logits: &[f32]) -> usize {
     best_idx
 }
 
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    if x == 0 {
+        x = 0x853c_49e6_748f_ea9b;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+fn rand_uniform(state: &mut u64) -> f32 {
+    let u = (xorshift64(state) >> 40) as u32;
+    (u as f32) / 16777216.0f32
+}
+
+/// Temperature and top-p (nucleus) sampler.
+/// When `temperature <= 0.0`, falls back to greedy argmax.
+pub fn sample(
+    logits: &mut [f32],
+    temperature: f32,
+    top_p: f32,
+    rng_state: &mut u64,
+) -> usize {
+    if temperature <= 0.0 || logits.is_empty() {
+        return sample_greedy(logits);
+    }
+
+    let inv_temp = 1.0f32 / temperature;
+    for val in logits.iter_mut() {
+        *val *= inv_temp;
+    }
+
+    // Softmax
+    let mut max_val = -1e9f32;
+    for &val in logits.iter() {
+        if val > max_val {
+            max_val = val;
+        }
+    }
+    let mut sum = 0.0f32;
+    for val in logits.iter_mut() {
+        *val = fast_expf(*val - max_val);
+        sum += *val;
+    }
+    let inv_sum = 1.0f32 / sum.max(1e-5);
+    for val in logits.iter_mut() {
+        *val *= inv_sum;
+    }
+
+    let coin = rand_uniform(rng_state);
+
+    if top_p > 0.0 && top_p < 1.0 {
+        let mut sorted_indices = [0usize; 128];
+        let n = logits.len().min(128);
+        for i in 0..n {
+            sorted_indices[i] = i;
+        }
+        for i in 1..n {
+            let key = sorted_indices[i];
+            let key_p = logits[key];
+            let mut j = i;
+            while j > 0 && logits[sorted_indices[j - 1]] < key_p {
+                sorted_indices[j] = sorted_indices[j - 1];
+                j -= 1;
+            }
+            sorted_indices[j] = key;
+        }
+
+        let mut cumulative_p = 0.0f32;
+        let mut cutoff_idx = n;
+        for i in 0..n {
+            cumulative_p += logits[sorted_indices[i]];
+            if cumulative_p >= top_p {
+                cutoff_idx = i + 1;
+                break;
+            }
+        }
+
+        let top_sum = cumulative_p.max(1e-5);
+        let target_coin = coin * top_sum;
+        let mut acc = 0.0f32;
+        for i in 0..cutoff_idx {
+            let idx = sorted_indices[i];
+            acc += logits[idx];
+            if acc >= target_coin {
+                return idx;
+            }
+        }
+        sorted_indices[cutoff_idx.saturating_sub(1)]
+    } else {
+        let mut cdf = 0.0f32;
+        for (idx, &p) in logits.iter().enumerate() {
+            cdf += p;
+            if cdf >= coin {
+                return idx;
+            }
+        }
+        logits.len() - 1
+    }
+}
+
 /// Parses a `llama2.c` binary format header.
 pub fn parse_llama_header(data: &[u8]) -> Result<LlamaConfig, &'static str> {
     if data.len() < 28 {
@@ -757,11 +903,13 @@ pub fn parse_llama_header(data: &[u8]) -> Result<LlamaConfig, &'static str> {
     let n_layers = read_i32(8) as usize;
     let n_heads = read_i32(12) as usize;
     let n_kv_heads = read_i32(16) as usize;
-    let vocab_size = read_i32(20).unsigned_abs() as usize;
+    let raw_vocab = read_i32(20);
+    let shared_weights = raw_vocab > 0;
+    let vocab_size = raw_vocab.unsigned_abs() as usize;
     let seq_len = read_i32(24) as usize;
 
-    if dim == 0 || n_heads == 0 || dim % n_heads != 0 || n_heads % 4 != 0 {
-        return Err("Invalid Llama dimensions: dim and n_heads must be divisible by 4");
+    if dim == 0 || n_heads == 0 || n_kv_heads == 0 || dim % n_heads != 0 || n_heads % n_kv_heads != 0 {
+        return Err("Invalid Llama dimensions: dim must be divisible by n_heads, and n_heads divisible by n_kv_heads");
     }
 
     Ok(LlamaConfig {
@@ -772,6 +920,7 @@ pub fn parse_llama_header(data: &[u8]) -> Result<LlamaConfig, &'static str> {
         n_kv_heads,
         vocab_size,
         seq_len,
+        shared_weights,
     })
 }
 
@@ -864,6 +1013,7 @@ mod tests {
             n_kv_heads: 4,
             vocab_size: 128,
             seq_len: 32,
+            shared_weights: true,
         };
 
         let weight_floats = LlamaWeights::total_floats_for(&cfg);
@@ -895,6 +1045,7 @@ mod tests {
             n_kv_heads: 8,
             vocab_size: 64,
             seq_len: 16,
+            shared_weights: true,
         };
 
         let weight_floats = LlamaWeights::total_floats_for(&cfg);
@@ -914,5 +1065,90 @@ mod tests {
         run_llama_forward_step(&weights, &mut ctx, 10, 0);
         let tok = sample_greedy(unsafe { ctx.logits_slice() });
         assert!(tok < cfg.vocab_size);
+    }
+
+    #[test]
+    fn llama_gqa_and_unshared_weights_test() {
+        // GQA: 8 query heads, 2 KV heads (kv_mul = 4)
+        // unshared weights: shared_weights = false
+        let cfg = LlamaConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_layers: 2,
+            n_heads: 8,
+            n_kv_heads: 2,
+            vocab_size: 64,
+            seq_len: 16,
+            shared_weights: false,
+        };
+
+        let weight_floats = LlamaWeights::total_floats_for(&cfg);
+        let mut weight_buf = vec![0.015f32; weight_floats];
+        let mut weights = LlamaWeights::empty();
+        unsafe {
+            weights.init_from_buffer(cfg, weight_buf.as_mut_ptr());
+        }
+
+        let ctx_floats = SmpLlamaContext::total_floats_for(&cfg);
+        let mut ctx_buf = vec![0.0f32; ctx_floats];
+        let mut ctx = SmpLlamaContext::empty();
+        unsafe {
+            ctx.init_from_buffer(cfg, ctx_buf.as_mut_ptr());
+        }
+
+        run_llama_forward_step(&weights, &mut ctx, 12, 0);
+        let tok = sample_greedy(unsafe { ctx.logits_slice() });
+        assert!(tok < cfg.vocab_size);
+    }
+
+    #[test]
+    fn llama_ceiling_division_non_multiple_of_4_heads() {
+        // 6 query heads, 2 KV heads (kv_mul = 3)
+        let cfg = LlamaConfig {
+            dim: 48,
+            hidden_dim: 96,
+            n_layers: 1,
+            n_heads: 6,
+            n_kv_heads: 2,
+            vocab_size: 32,
+            seq_len: 8,
+            shared_weights: true,
+        };
+
+        let weight_floats = LlamaWeights::total_floats_for(&cfg);
+        let mut weight_buf = vec![0.01f32; weight_floats];
+        let mut weights = LlamaWeights::empty();
+        unsafe {
+            weights.init_from_buffer(cfg, weight_buf.as_mut_ptr());
+        }
+
+        let ctx_floats = SmpLlamaContext::total_floats_for(&cfg);
+        let mut ctx_buf = vec![0.0f32; ctx_floats];
+        let mut ctx = SmpLlamaContext::empty();
+        unsafe {
+            ctx.init_from_buffer(cfg, ctx_buf.as_mut_ptr());
+        }
+
+        run_llama_forward_step(&weights, &mut ctx, 5, 0);
+        let tok = sample_greedy(unsafe { ctx.logits_slice() });
+        assert!(tok < cfg.vocab_size);
+    }
+
+    #[test]
+    fn llama_temperature_and_topp_sampling_test() {
+        let logits = [1.0f32, 5.0, 2.0, 0.5];
+        let mut rng = 123456789u64;
+
+        // Greedy test
+        let tok_greedy = sample_greedy(&logits);
+        assert_eq!(tok_greedy, 1);
+
+        // Temperature 0.0 falls back to greedy
+        let tok_zero_temp = sample(&mut logits.clone(), 0.0, 0.9, &mut rng);
+        assert_eq!(tok_zero_temp, 1);
+
+        // Temperature > 0 sampling produces a valid token
+        let tok_sampled = sample(&mut logits.clone(), 0.8, 0.9, &mut rng);
+        assert!(tok_sampled < logits.len());
     }
 }

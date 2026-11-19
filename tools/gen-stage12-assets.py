@@ -43,13 +43,33 @@ if not os.path.exists(llama_path):
 
 # 2. TOKENIZER.BIN
 tok_path = 'build/esp/TOKENIZER.BIN'
-if not os.path.exists(tok_path):
-    tok_data = bytearray()
-    tok_data.extend(struct.pack('<I', 1)) # max_token_length
-    for i in range(128):
-        tok_data.extend(struct.pack('<fi', 0.0, 1))
-        tok_data.append(i)
+vocab_entries = [
+    (0.0, b"<unk>"),
+    (0.0, b"<s>"),
+    (0.0, b"</s>"),
+]
+for b in range(3, 120):
+    vocab_entries.append((0.0, bytes([b])))
 
-    with open(tok_path, 'wb') as f:
-        f.write(tok_data)
-    print('Generated', tok_path)
+merges = [
+    (10.0, b"GEN"),
+    (9.0, b"ES"),
+    (8.0, b"IS"),
+    (5.0, b"th"),
+    (4.0, b"in"),
+    (3.0, b"he"),
+    (2.0, b"re"),
+    (0.0, b"<0x0A>"),
+]
+vocab_entries.extend(merges)
+
+max_token_len = max(len(entry[1]) for entry in vocab_entries)
+tok_data = bytearray()
+tok_data.extend(struct.pack('<I', max_token_len))
+for score, piece in vocab_entries:
+    tok_data.extend(struct.pack('<fi', score, len(piece)))
+    tok_data.extend(piece)
+
+with open(tok_path, 'wb') as f:
+    f.write(tok_data)
+print('Generated', tok_path)

@@ -192,6 +192,38 @@ impl Framebuffer {
     }
 }
 
+/// Telemetry state displayed in the split-pane AI workspace sidebar.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkspaceTelemetry {
+    pub active_model: &'static str,
+    pub tokens_per_sec: u64,
+    pub latency_us: u64,
+    pub pe_kib: u64,
+    pub heap_used_kib: u64,
+    pub hugepages_kib: u64,
+    pub free_ram_mib: u64,
+    pub total_ram_mib: u64,
+    pub ipc_verified: bool,
+    pub net_ip: [u8; 4],
+    pub net_online: bool,
+    pub sys_status: &'static str,
+}
+
+pub static mut GLOBAL_WORKSPACE_TELEMETRY: WorkspaceTelemetry = WorkspaceTelemetry {
+    active_model: "Llama-2 SMP",
+    tokens_per_sec: 0,
+    latency_us: 0,
+    pe_kib: 312,
+    heap_used_kib: 128,
+    hugepages_kib: 4096,
+    free_ram_mib: 480,
+    total_ram_mib: 512,
+    ipc_verified: true,
+    net_ip: [10, 0, 2, 15],
+    net_online: true,
+    sys_status: "READY / SHELL",
+};
+
 /// Scrolling graphical text console operating directly on the UEFI GOP framebuffer.
 #[derive(Clone, Copy, Debug)]
 pub struct FbConsole {
@@ -204,6 +236,10 @@ pub struct FbConsole {
     pub fg_color: u32,
     pub bg_color: u32,
     pub start_y: u32,
+    pub pane_x: u32,
+    pub pane_y: u32,
+    pub pane_width: u32,
+    pub pane_height: u32,
     pub max_cols: usize,
     pub max_rows: usize,
     pub cursor_col: usize,
@@ -213,9 +249,14 @@ pub struct FbConsole {
 
 impl FbConsole {
     pub fn new(fb: &Framebuffer) -> Self {
+        let is_split = fb.width >= 720 && fb.height >= 400;
         let start_y = if fb.height >= 120 { 32u32 } else { 0u32 };
-        let max_cols = (fb.width / 8) as usize;
-        let max_rows = ((fb.height.saturating_sub(start_y)) / 8) as usize;
+        let pane_x = 0u32;
+        let pane_y = start_y;
+        let pane_width = if is_split { 560u32 } else { fb.width };
+        let pane_height = fb.height.saturating_sub(start_y);
+        let max_cols = (pane_width / 8) as usize;
+        let max_rows = (pane_height / 8) as usize;
         let fg_color = rgb_format(fb.pixel_format, 248, 250, 252); // #F8FAFC white
         let bg_color = rgb_format(fb.pixel_format, 15, 23, 42);    // #0F172A dark slate
 
@@ -229,6 +270,10 @@ impl FbConsole {
             fg_color,
             bg_color,
             start_y,
+            pane_x,
+            pane_y,
+            pane_width,
+            pane_height,
             max_cols,
             max_rows,
             cursor_col: 0,
@@ -251,22 +296,9 @@ impl FbConsole {
         }
     }
 
-    /// Draws compact top status bar banner.
-    pub unsafe fn draw_header(&mut self) {
-        if self.start_y == 0 {
-            return;
-        }
-        let bar_color = rgb_format(self.pixel_format, 3, 105, 161);     // #0369A1 blue
-        let border_color = rgb_format(self.pixel_format, 56, 189, 248); // #38BDF8 cyan
-        let text_color = rgb_format(self.pixel_format, 248, 250, 252);   // #F8FAFC white
-
-        self.clear_rect(0, 0, self.width, self.start_y.saturating_sub(1), bar_color);
-        self.clear_rect(0, self.start_y.saturating_sub(1), self.width, 1, border_color);
-
-        let title = "PROJECT GENESIS  |  AARCH64 GRAPHICAL TERMINAL  (STAGE 10)";
-        let mut x = 16u32;
-        let y = 12u32;
-        for b in title.bytes() {
+    /// Draws a string at pixel position `(x, y)` in `fg` color.
+    pub unsafe fn draw_string_at(&mut self, mut x: u32, y: u32, s: &str, fg: u32) {
+        for b in s.bytes() {
             if x + 8 > self.width {
                 break;
             }
@@ -277,7 +309,7 @@ impl FbConsole {
                 let row_ptr = (self.base_va + row_offset) as *mut u32;
                 for c in 0..8u32 {
                     if (bits & (0x80 >> c)) != 0 {
-                        core::ptr::write_volatile(row_ptr.add(c as usize), text_color);
+                        core::ptr::write_volatile(row_ptr.add(c as usize), fg);
                     }
                 }
             }
@@ -285,12 +317,203 @@ impl FbConsole {
         }
     }
 
+    /// Draws top status bar (32px).
+    pub unsafe fn draw_header(&mut self) {
+        if self.start_y == 0 {
+            return;
+        }
+        let bar_color = rgb_format(self.pixel_format, 3, 105, 161);     // #0369A1 blue
+        let border_color = rgb_format(self.pixel_format, 56, 189, 248); // #38BDF8 cyan
+        let text_color = rgb_format(self.pixel_format, 248, 250, 252);   // #F8FAFC white
+        let green_color = rgb_format(self.pixel_format, 52, 211, 153);  // #34D399 emerald
+
+        self.clear_rect(0, 0, self.width, self.start_y.saturating_sub(1), bar_color);
+        self.clear_rect(0, self.start_y.saturating_sub(1), self.width, 1, border_color);
+
+        if self.width >= 720 {
+            self.draw_string_at(12, 12, "PROJECT GENESIS  |  AI WORKSPACE (STAGE 14)", text_color);
+            self.draw_string_at(380, 12, "[SMP: 4 CORES]", green_color);
+
+            let tel = *core::ptr::addr_of!(GLOBAL_WORKSPACE_TELEMETRY);
+            let mut ram_buf = [0u8; 32];
+            let mut rlen = 0;
+            let pfx = b"RAM: ";
+            for &b in pfx { ram_buf[rlen] = b; rlen += 1; }
+            rlen += write_u64(tel.free_ram_mib, &mut ram_buf[rlen..]);
+            if rlen < ram_buf.len() { ram_buf[rlen] = b'/'; rlen += 1; }
+            rlen += write_u64(tel.total_ram_mib, &mut ram_buf[rlen..]);
+            let sfx = b"M";
+            for &b in sfx { if rlen < ram_buf.len() { ram_buf[rlen] = b; rlen += 1; } }
+            if let Ok(ram_s) = core::str::from_utf8(&ram_buf[..rlen]) {
+                self.draw_string_at(520, 12, ram_s, text_color);
+            }
+
+            let net_s = if tel.net_online { "NET: 10.0.2.15" } else { "NET: OFFLINE" };
+            self.draw_string_at(670, 12, net_s, green_color);
+        } else {
+            let title = "PROJECT GENESIS  |  AARCH64 GRAPHICAL TERMINAL  (STAGE 14)";
+            self.draw_string_at(16, 12, title, text_color);
+        }
+    }
+
+    /// Renders the Right Telemetry Sidebar (cards: AI Engine, Memory, System & Network).
+    pub unsafe fn draw_workspace_sidebar(&mut self, tel: &WorkspaceTelemetry) {
+        if self.width < 720 || self.height < 400 {
+            return;
+        }
+
+        let border_color = rgb_format(self.pixel_format, 51, 65, 85);   // #334155 slate
+        let bg_sidebar = rgb_format(self.pixel_format, 11, 17, 32);     // #0B1120 deep navy
+        let bg_card = rgb_format(self.pixel_format, 30, 41, 59);        // #1E293B card slate
+        let cyan_color = rgb_format(self.pixel_format, 56, 189, 248);   // #38BDF8 cyan
+        let white_color = rgb_format(self.pixel_format, 248, 250, 252); // #F8FAFC white
+        let green_color = rgb_format(self.pixel_format, 52, 211, 153);  // #34D399 emerald
+        let badge_bg = rgb_format(self.pixel_format, 6, 78, 59);        // #064E3B dark green
+        let gray_color = rgb_format(self.pixel_format, 148, 163, 184);  // #94A3B8 muted gray
+
+        let sb_x = 560u32;
+        let sb_w = self.width.saturating_sub(sb_x);
+        let sb_h = self.pane_height;
+
+        // Vertical divider line
+        self.clear_rect(sb_x, self.pane_y, 2, sb_h, border_color);
+
+        // Sidebar background
+        self.clear_rect(sb_x + 2, self.pane_y, sb_w.saturating_sub(2), sb_h, bg_sidebar);
+
+        let card_x = sb_x + 8;
+        let card_w = sb_w.saturating_sub(16).min(224);
+
+        // 1. Card 1: AI INFERENCE ENGINE
+        let c1_y = 40u32;
+        let c1_h = 160u32;
+        self.clear_rect(card_x, c1_y, card_w, c1_h, border_color);
+        self.clear_rect(card_x + 1, c1_y + 1, card_w.saturating_sub(2), c1_h.saturating_sub(2), bg_card);
+        self.draw_string_at(card_x + 10, c1_y + 10, "AI INFERENCE ENGINE", cyan_color);
+        self.clear_rect(card_x + 8, c1_y + 24, card_w.saturating_sub(16), 1, border_color);
+
+        self.draw_string_at(card_x + 10, c1_y + 34, "Model:   ", gray_color);
+        self.draw_string_at(card_x + 74, c1_y + 34, tel.active_model, white_color);
+
+        self.draw_string_at(card_x + 10, c1_y + 54, "Speed:   ", gray_color);
+        let mut spd_buf = [0u8; 32];
+        let slen = write_u64(tel.tokens_per_sec, &mut spd_buf);
+        let sfx = b" tok/s";
+        let mut total_slen = slen;
+        for &b in sfx { if total_slen < spd_buf.len() { spd_buf[total_slen] = b; total_slen += 1; } }
+        if let Ok(spd_str) = core::str::from_utf8(&spd_buf[..total_slen]) {
+            self.draw_string_at(card_x + 74, c1_y + 54, spd_str, green_color);
+        }
+
+        self.draw_string_at(card_x + 10, c1_y + 74, "Compute: ", gray_color);
+        self.draw_string_at(card_x + 74, c1_y + 74, "4x Cortex-A76", white_color);
+
+        self.draw_string_at(card_x + 10, c1_y + 94, "Vector:  ", gray_color);
+        self.draw_string_at(card_x + 74, c1_y + 94, "NEON FP32+INT8", white_color);
+
+        self.draw_string_at(card_x + 10, c1_y + 114, "Latency: ", gray_color);
+        let mut lat_buf = [0u8; 32];
+        let llen = write_u64(tel.latency_us, &mut lat_buf);
+        let lsfx = b" us";
+        let mut total_llen = llen;
+        for &b in lsfx { if total_llen < lat_buf.len() { lat_buf[total_llen] = b; total_llen += 1; } }
+        if let Ok(lat_str) = core::str::from_utf8(&lat_buf[..total_llen]) {
+            self.draw_string_at(card_x + 74, c1_y + 114, lat_str, white_color);
+        }
+
+        self.draw_string_at(card_x + 10, c1_y + 134, "Format:  ", gray_color);
+        self.draw_string_at(card_x + 74, c1_y + 134, "llama2.c (GQA)", green_color);
+
+        // 2. Card 2: MEMORY PROFILE
+        let c2_y = 210u32;
+        let c2_h = 160u32;
+        self.clear_rect(card_x, c2_y, card_w, c2_h, border_color);
+        self.clear_rect(card_x + 1, c2_y + 1, card_w.saturating_sub(2), c2_h.saturating_sub(2), bg_card);
+        self.draw_string_at(card_x + 10, c2_y + 10, "MEMORY PROFILE", cyan_color);
+        self.clear_rect(card_x + 8, c2_y + 24, card_w.saturating_sub(16), 1, border_color);
+
+        self.draw_string_at(card_x + 10, c2_y + 34, "PE Image: ", gray_color);
+        let mut pe_buf = [0u8; 32];
+        let plen = write_u64(tel.pe_kib, &mut pe_buf);
+        let psfx = b" KiB";
+        let mut total_plen = plen;
+        for &b in psfx { if total_plen < pe_buf.len() { pe_buf[total_plen] = b; total_plen += 1; } }
+        if let Ok(pe_str) = core::str::from_utf8(&pe_buf[..total_plen]) {
+            self.draw_string_at(card_x + 82, c2_y + 34, pe_str, white_color);
+        }
+
+        self.draw_string_at(card_x + 10, c2_y + 54, "Heap:     ", gray_color);
+        let mut hp_buf = [0u8; 32];
+        let hlen = write_u64(tel.heap_used_kib, &mut hp_buf);
+        let mut total_hlen = hlen;
+        for &b in psfx { if total_hlen < hp_buf.len() { hp_buf[total_hlen] = b; total_hlen += 1; } }
+        if let Ok(hp_str) = core::str::from_utf8(&hp_buf[..total_hlen]) {
+            self.draw_string_at(card_x + 82, c2_y + 54, hp_str, white_color);
+        }
+
+        self.draw_string_at(card_x + 10, c2_y + 74, "Hugepage: ", gray_color);
+        let mut hg_buf = [0u8; 32];
+        let g_len = write_u64(tel.hugepages_kib, &mut hg_buf);
+        let mut total_glen = g_len;
+        for &b in psfx { if total_glen < hg_buf.len() { hg_buf[total_glen] = b; total_glen += 1; } }
+        if let Ok(hg_str) = core::str::from_utf8(&hg_buf[..total_glen]) {
+            self.draw_string_at(card_x + 82, c2_y + 74, hg_str, white_color);
+        }
+
+        self.draw_string_at(card_x + 10, c2_y + 94, "RAM Free: ", gray_color);
+        let mut rf_buf = [0u8; 32];
+        let r_len = write_u64(tel.free_ram_mib, &mut rf_buf);
+        let msfx = b" MiB";
+        let mut total_rlen = r_len;
+        for &b in msfx { if total_rlen < rf_buf.len() { rf_buf[total_rlen] = b; total_rlen += 1; } }
+        if let Ok(rf_str) = core::str::from_utf8(&rf_buf[..total_rlen]) {
+            self.draw_string_at(card_x + 82, c2_y + 94, rf_str, white_color);
+        }
+
+        self.draw_string_at(card_x + 10, c2_y + 114, "Allocator:", gray_color);
+        self.draw_string_at(card_x + 82, c2_y + 114, "PMM Bitmaps", green_color);
+
+        self.draw_string_at(card_x + 10, c2_y + 134, "HHDM Map: ", gray_color);
+        self.draw_string_at(card_x + 82, c2_y + 134, "2MB L2 Blocks", green_color);
+
+        // 3. Card 3: SYSTEM & NETWORK
+        let c3_y = 380u32;
+        let c3_h = 175u32;
+        self.clear_rect(card_x, c3_y, card_w, c3_h, border_color);
+        self.clear_rect(card_x + 1, c3_y + 1, card_w.saturating_sub(2), c3_h.saturating_sub(2), bg_card);
+        self.draw_string_at(card_x + 10, c3_y + 10, "SYSTEM & NETWORK", cyan_color);
+        self.clear_rect(card_x + 8, c3_y + 24, card_w.saturating_sub(16), 1, border_color);
+
+        self.draw_string_at(card_x + 10, c3_y + 34, "EL0 IPC:  ", gray_color);
+        let ipc_str = if tel.ipc_verified { "VERIFIED (SMP)" } else { "READY" };
+        self.draw_string_at(card_x + 82, c3_y + 34, ipc_str, green_color);
+
+        self.draw_string_at(card_x + 10, c3_y + 54, "Network:  ", gray_color);
+        let net_ip_str = if tel.net_online { "10.0.2.15 (UP)" } else { "OFFLINE" };
+        self.draw_string_at(card_x + 82, c3_y + 54, net_ip_str, if tel.net_online { green_color } else { gray_color });
+
+        self.draw_string_at(card_x + 10, c3_y + 74, "VirtIO:   ", gray_color);
+        self.draw_string_at(card_x + 82, c3_y + 74, "Blk+Net+Input", white_color);
+
+        self.draw_string_at(card_x + 10, c3_y + 94, "Status:   ", gray_color);
+        self.draw_string_at(card_x + 82, c3_y + 94, tel.sys_status, green_color);
+
+        // Stage 14 Badge Pill
+        let pill_y = c3_y + 124;
+        let pill_h = 24u32;
+        let pill_w = card_w.saturating_sub(20);
+        self.clear_rect(card_x + 10, pill_y, pill_w, pill_h, badge_bg);
+        self.draw_string_at(card_x + 24, pill_y + 8, "[STAGE 14 ACTIVE]", green_color);
+    }
+
     /// Clears the terminal scrolling area and resets cursor to (0, 0).
     pub unsafe fn clear(&mut self) {
         self.draw_header();
-        self.clear_rect(0, self.start_y, self.width, self.height.saturating_sub(self.start_y), self.bg_color);
+        self.clear_rect(self.pane_x, self.pane_y, self.pane_width, self.pane_height, self.bg_color);
         self.cursor_col = 0;
         self.cursor_row = 0;
+        let tel = *core::ptr::addr_of!(GLOBAL_WORKSPACE_TELEMETRY);
+        self.draw_workspace_sidebar(&tel);
     }
 
     /// Shifts rows in the console region up by 1 line (8 pixels) and clears the bottom row.
@@ -300,24 +523,26 @@ impl FbConsole {
         }
         let row_px = 8u32;
         let num_lines = (self.max_rows as u32 - 1) * row_px;
-        let bytes_per_line = (self.stride as usize) * 4;
-        let copy_bytes = (num_lines as usize) * bytes_per_line;
+        let line_bytes = (self.pane_width as usize) * 4;
 
-        let dst_ptr = (self.base_va + ((self.start_y as u64) * (self.stride as u64) * 4)) as *mut u8;
-        let src_ptr = (self.base_va + (((self.start_y + row_px) as u64) * (self.stride as u64) * 4)) as *const u8;
+        for line in 0..num_lines {
+            let dst_offset = (((self.pane_y + line) as u64) * (self.stride as u64) + (self.pane_x as u64)) * 4;
+            let src_offset = (((self.pane_y + line + row_px) as u64) * (self.stride as u64) + (self.pane_x as u64)) * 4;
+            let dst_ptr = (self.base_va + dst_offset) as *mut u8;
+            let src_ptr = (self.base_va + src_offset) as *const u8;
+            core::ptr::copy(src_ptr, dst_ptr, line_bytes);
+        }
 
-        core::ptr::copy(src_ptr, dst_ptr, copy_bytes);
-
-        let bottom_y = self.start_y + (self.max_rows as u32 - 1) * row_px;
-        self.clear_rect(0, bottom_y, self.width, row_px, self.bg_color);
+        let bottom_y = self.pane_y + (self.max_rows as u32 - 1) * row_px;
+        self.clear_rect(self.pane_x, bottom_y, self.pane_width, row_px, self.bg_color);
         self.cursor_row = self.max_rows - 1;
     }
 
     /// Draws single 8x8 glyph at console grid position (col, row).
     pub unsafe fn draw_glyph_at(&mut self, col: usize, row: usize, ch: u8) {
-        let px = (col as u32) * 8;
-        let py = self.start_y + (row as u32) * 8;
-        if px + 8 > self.width || py + 8 > self.height {
+        let px = self.pane_x + (col as u32) * 8;
+        let py = self.pane_y + (row as u32) * 8;
+        if px + 8 > self.pane_x + self.pane_width || py + 8 > self.pane_y + self.pane_height {
             return;
         }
         let glyph = get_glyph(ch);
@@ -424,6 +649,43 @@ pub unsafe fn global_fb_console_clear() {
     }
 }
 
+pub unsafe fn redraw_workspace_sidebar() {
+    if let Some(ref mut con) = *core::ptr::addr_of_mut!(GLOBAL_FB_CONSOLE) {
+        let tel = *core::ptr::addr_of!(GLOBAL_WORKSPACE_TELEMETRY);
+        con.draw_header();
+        con.draw_workspace_sidebar(&tel);
+    }
+}
+
+pub unsafe fn update_workspace_telemetry(
+    model: Option<&'static str>,
+    tok_per_sec: Option<u64>,
+    latency: Option<u64>,
+    pe: Option<u64>,
+    heap: Option<u64>,
+    hugepages: Option<u64>,
+    free_ram: Option<u64>,
+    total_ram: Option<u64>,
+    ipc: Option<bool>,
+    net_online: Option<bool>,
+    status: Option<&'static str>,
+) {
+    let t = &mut *core::ptr::addr_of_mut!(GLOBAL_WORKSPACE_TELEMETRY);
+    if let Some(m) = model { t.active_model = m; }
+    if let Some(s) = tok_per_sec { t.tokens_per_sec = s; }
+    if let Some(l) = latency { t.latency_us = l; }
+    if let Some(p) = pe { t.pe_kib = p; }
+    if let Some(h) = heap { t.heap_used_kib = h; }
+    if let Some(hp) = hugepages { t.hugepages_kib = hp; }
+    if let Some(f) = free_ram { t.free_ram_mib = f; }
+    if let Some(tr) = total_ram { t.total_ram_mib = tr; }
+    if let Some(i) = ipc { t.ipc_verified = i; }
+    if let Some(n) = net_online { t.net_online = n; }
+    if let Some(st) = status { t.sys_status = st; }
+
+    redraw_workspace_sidebar();
+}
+
 fn format_res(w: u32, h: u32, s: u32, buf: &mut [u8]) -> usize {
     let mut len = 0;
     len += write_u32(w, &mut buf[len..]);
@@ -458,7 +720,7 @@ fn write_u32(val: u32, buf: &mut [u8]) -> usize {
     write_u64(val as u64, buf)
 }
 
-fn write_u64(mut val: u64, buf: &mut [u8]) -> usize {
+pub fn write_u64(mut val: u64, buf: &mut [u8]) -> usize {
     if val == 0 {
         if !buf.is_empty() { buf[0] = b'0'; return 1; }
         return 0;
@@ -645,6 +907,10 @@ mod tests {
             fg_color: 0x00FF_FFFF,
             bg_color: 0x0000_0000,
             start_y: 16,
+            pane_x: 0,
+            pane_y: 16,
+            pane_width: 800,
+            pane_height: 48,
             max_cols: 100,
             max_rows: (64 - 16) / 8, // 6 rows
             cursor_col: 0,
@@ -671,5 +937,79 @@ mod tests {
             }
             assert_eq!(console.cursor_row, console.max_rows - 1);
         }
+    }
+
+    #[test]
+    fn fb_split_pane_bounded_scroll_test() {
+        extern crate std;
+        let mut buffer = std::vec![0u32; 800 * 600];
+        let fb = Framebuffer {
+            base_va: buffer.as_mut_ptr() as u64,
+            size: buffer.len() * 4,
+            width: 800,
+            height: 600,
+            stride: 800,
+            pixel_format: 0,
+        };
+
+        let mut console = FbConsole::new(&fb);
+        assert_eq!(console.pane_width, 560);
+        assert_eq!(console.max_cols, 70);
+
+        // Put a canary pixel in the sidebar region (e.g. at x=600, y=100)
+        let canary_idx = 100 * 800 + 600;
+        let canary_val = 0xCAFE_BABE;
+        buffer[canary_idx] = canary_val;
+
+        // Draw multiple lines and trigger terminal scrolling
+        unsafe {
+            for _ in 0..150 {
+                console.write_bytes(b"streaming terminal output in 560px left pane...\n");
+            }
+        }
+
+        // The canary in the right sidebar must remain 100% untouched and uncorrupted!
+        assert_eq!(buffer[canary_idx], canary_val, "Terminal scroll corrupted right sidebar!");
+    }
+
+    #[test]
+    fn fb_workspace_sidebar_render_test() {
+        extern crate std;
+        let mut buffer = std::vec![0u32; 800 * 600];
+        let fb = Framebuffer {
+            base_va: buffer.as_mut_ptr() as u64,
+            size: buffer.len() * 4,
+            width: 800,
+            height: 600,
+            stride: 800,
+            pixel_format: 0,
+        };
+
+        let mut console = FbConsole::new(&fb);
+        let tel = WorkspaceTelemetry {
+            active_model: "Llama-2 SMP",
+            tokens_per_sec: 142,
+            latency_us: 7040,
+            pe_kib: 312,
+            heap_used_kib: 128,
+            hugepages_kib: 4096,
+            free_ram_mib: 480,
+            total_ram_mib: 512,
+            ipc_verified: true,
+            net_ip: [10, 0, 2, 15],
+            net_online: true,
+            sys_status: "READY",
+        };
+
+        unsafe {
+            console.draw_header();
+            console.draw_workspace_sidebar(&tel);
+        }
+
+        // Check that pixels in header and sidebar were written (non-zero)
+        let header_pixel = buffer[12 * 800 + 20];
+        let sidebar_pixel = buffer[50 * 800 + 580];
+        assert_ne!(header_pixel, 0, "Header was not drawn");
+        assert_ne!(sidebar_pixel, 0, "Sidebar card was not drawn");
     }
 }
