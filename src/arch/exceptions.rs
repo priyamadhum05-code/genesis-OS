@@ -14,7 +14,9 @@ pub struct TrapFrame {
     pub elr_el1: u64,    // byte 256
     pub esr_el1: u64,    // byte 264
     pub far_el1: u64,    // byte 272
-    pub _pad: u64,       // byte 280 (to maintain 16-byte stack alignment)
+    pub sp_el0: u64,     // byte 280
+    pub ttbr0_root: u64, // byte 288
+    pub pid: u64,        // byte 296
 }
 
 static STAGE4_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -58,6 +60,15 @@ pub fn stage4_vectors_va() -> u64 {
 pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) -> *mut TrapFrame {
     let uart = STAGE4_UART_VA.load(Ordering::Relaxed) as usize;
 
+    if kind == 4 {
+        // Current EL with SPx Sync (e.g. kernel_yield via SVC)
+        let ec = (frame.esr_el1 >> 26) & 0x3F;
+        if ec == 0x15 && frame.x[8] == 124 {
+            frame.x[0] = 0;
+            return crate::sched::scheduler_tick(frame as *mut TrapFrame);
+        }
+    }
+
     if kind == 5 || kind == 9 {
         // Current EL with SPx IRQ (5) or Lower EL AArch64 IRQ (9)
         let iar = unsafe { crate::arch::gic::acknowledge_irq() };
@@ -73,7 +84,7 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
 
             let count = STAGE4_TICKS.fetch_add(1, Ordering::SeqCst) + 1;
             let max_ticks = STAGE4_MAX_TICKS.load(Ordering::Relaxed);
-            if uart != 0 && count <= max_ticks {
+            if uart != 0 && max_ticks > 0 && count <= max_ticks {
                 unsafe {
                     crate::arch::serial::serial_write(uart, b"GENESIS: timer tick ");
                     crate::arch::serial::serial_decimal(uart, count);
@@ -103,7 +114,7 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
             // SVC instruction in AArch64
             let sys_num = frame.x[8];
             match sys_num {
-                1 => {
+                1 | 64 => {
                     // SYS_WRITE (fd = arg0, buf = arg1 / arg0, count = arg2 / arg1)
                     // Standard Linux AArch64: x0 = fd, x1 = buf, x2 = count
                     // Minimal genesis binary: x0 = buf, x1 = count or x0 = fd, x1 = buf, x2 = count
@@ -133,9 +144,25 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
                 93 => {
                     // SYS_EXIT (status = arg0)
                     let exit_code = frame.x[0] as i32;
-                    frame.elr_el1 = crate::proc::stage9_user_return_va();
-                    frame.spsr_el1 = 0x3C5; // EL1h with DAIF masked
-                    frame.x[0] = exit_code as u64;
+                    let is_multitask = crate::sched::is_current_task_multitask();
+                    if is_multitask {
+                        crate::sched::finish_current_task();
+                        return crate::sched::scheduler_tick(frame as *mut TrapFrame);
+                    } else {
+                        frame.elr_el1 = crate::proc::stage9_user_return_va();
+                        frame.spsr_el1 = 0x3C5; // EL1h with DAIF masked
+                        frame.x[0] = exit_code as u64;
+                        return frame as *mut TrapFrame;
+                    }
+                }
+                124 => {
+                    // SYS_YIELD
+                    frame.x[0] = 0;
+                    return crate::sched::scheduler_tick(frame as *mut TrapFrame);
+                }
+                172 => {
+                    // SYS_GETPID
+                    frame.x[0] = crate::sched::current_task_pid();
                     return frame as *mut TrapFrame;
                 }
                 _ => {
@@ -194,112 +221,112 @@ core::arch::global_asm!(
 
 stage4_vectors_start:
     // Slot 0 (0x000): Current EL with SP0 Sync
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #0
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 1 (0x080): Current EL with SP0 IRQ
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #1
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 2 (0x100): Current EL with SP0 FIQ
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #2
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 3 (0x180): Current EL with SP0 SError
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #3
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 4 (0x200): Current EL with SPx Sync (Instruction/Data Abort)
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #4
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 5 (0x280): Current EL with SPx IRQ
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #5
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 6 (0x300): Current EL with SPx FIQ
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #6
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 7 (0x380): Current EL with SPx SError
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #7
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 8 (0x400): Lower EL AArch64 Sync
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #8
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 9 (0x480): Lower EL AArch64 IRQ
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #9
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 10 (0x500): Lower EL AArch64 FIQ
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #10
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 11 (0x580): Lower EL AArch64 SError
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #11
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 12 (0x600): Lower EL AArch32 Sync
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #12
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 13 (0x680): Lower EL AArch32 IRQ
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #13
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 14 (0x700): Lower EL AArch32 FIQ
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #14
     b       stage4_save_and_dispatch
     .fill   28, 4, 0xd503201f
 
     // Slot 15 (0x780): Lower EL AArch32 SError
-    sub     sp, sp, #288
+    sub     sp, sp, #304
     stp     x0, x1, [sp, #0]
     mov     x1, #15
     b       stage4_save_and_dispatch
@@ -332,10 +359,17 @@ stage4_save_and_dispatch:
     stp     x2, x3, [sp, #248]
     stp     x4, x5, [sp, #264]
 
+    mrs     x6, sp_el0
+    str     x6, [sp, #280]
+
     mov     x0, sp          // arg 0 = &mut TrapFrame
     // x1 is already kind   // arg 1 = kind: u64
     bl      stage4_exception_dispatch
     mov     sp, x0          // switch to returned TrapFrame (for preemptive task switch)
+
+    // Restore SP_EL0
+    ldr     x6, [sp, #280]
+    msr     sp_el0, x6
 
     // Restore system registers
     ldp     x2, x3, [sp, #248]
@@ -360,7 +394,7 @@ stage4_save_and_dispatch:
     ldr     x30, [sp, #240]
 
     ldp     x0, x1, [sp, #0]
-    add     sp, sp, #288
+    add     sp, sp, #304
     eret
     "#
 );

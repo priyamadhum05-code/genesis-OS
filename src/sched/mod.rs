@@ -37,9 +37,12 @@ impl TaskFpContext {
 
 pub struct Task {
     pub id: usize,
+    pub pid: u64,
     pub state: TaskState,
     pub sp: u64,
     pub stack_top: u64,
+    pub ttbr0_root: u64,
+    pub sp_el0: u64,
     pub fp_ctx: TaskFpContext,
 }
 
@@ -47,9 +50,12 @@ impl Task {
     pub const fn empty() -> Self {
         Self {
             id: 0,
+            pid: 0,
             state: TaskState::Unused,
             sp: 0,
             stack_top: 0,
+            ttbr0_root: 0,
+            sp_el0: 0,
             fp_ctx: TaskFpContext::empty(),
         }
     }
@@ -101,8 +107,14 @@ pub static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 pub fn init_scheduler(main_stack_top: u64) {
     let mut sched = SCHEDULER.lock();
     sched.tasks[0].id = 0;
+    sched.tasks[0].pid = 0;
     sched.tasks[0].state = TaskState::Running;
     sched.tasks[0].stack_top = main_stack_top;
+    sched.tasks[0].ttbr0_root = 0;
+    sched.tasks[0].sp_el0 = 0;
+    for i in 1..MAX_TASKS {
+        sched.tasks[i] = Task::empty();
+    }
     sched.current = [0; 4];
     sched.active = true;
     sched.ticks = 0;
@@ -121,13 +133,55 @@ pub fn spawn_task(entry: extern "C" fn(u64), arg: u64, stack_top: u64) -> Result
                 (*frame_ptr).elr_el1 = entry as *const () as u64;
                 (*frame_ptr).esr_el1 = 0;
                 (*frame_ptr).far_el1 = 0;
-                (*frame_ptr)._pad = 0;
+                (*frame_ptr).sp_el0 = 0;
+                (*frame_ptr).ttbr0_root = 0;
+                (*frame_ptr).pid = 0;
             }
 
             sched.tasks[idx].id = idx;
+            sched.tasks[idx].pid = 0;
             sched.tasks[idx].state = TaskState::Ready;
             sched.tasks[idx].sp = frame_ptr as u64;
             sched.tasks[idx].stack_top = stack_top;
+            sched.tasks[idx].ttbr0_root = 0;
+            sched.tasks[idx].sp_el0 = 0;
+            sched.tasks[idx].fp_ctx = TaskFpContext::empty();
+            return Ok(idx);
+        }
+    }
+    Err(())
+}
+
+/// Spawns an EL0 user process into the scheduler with separate user page table and stack.
+pub fn spawn_user_process(
+    pid: u64,
+    entry_va: u64,
+    user_sp: u64,
+    ttbr0_root: u64,
+    kernel_stack_top: u64,
+) -> Result<usize, ()> {
+    let mut sched = SCHEDULER.lock();
+    for idx in 1..MAX_TASKS {
+        if sched.tasks[idx].state == TaskState::Unused || sched.tasks[idx].state == TaskState::Finished {
+            let frame_ptr = (kernel_stack_top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
+            unsafe {
+                (*frame_ptr).x = [0; 31];
+                (*frame_ptr).spsr_el1 = 0x0000_0000; // EL0t with interrupts unmasked
+                (*frame_ptr).elr_el1 = entry_va;
+                (*frame_ptr).esr_el1 = 0;
+                (*frame_ptr).far_el1 = 0;
+                (*frame_ptr).sp_el0 = user_sp;
+                (*frame_ptr).ttbr0_root = ttbr0_root;
+                (*frame_ptr).pid = pid;
+            }
+
+            sched.tasks[idx].id = idx;
+            sched.tasks[idx].pid = pid;
+            sched.tasks[idx].state = TaskState::Ready;
+            sched.tasks[idx].sp = frame_ptr as u64;
+            sched.tasks[idx].stack_top = kernel_stack_top;
+            sched.tasks[idx].ttbr0_root = ttbr0_root;
+            sched.tasks[idx].sp_el0 = user_sp;
             sched.tasks[idx].fp_ctx = TaskFpContext::empty();
             return Ok(idx);
         }
@@ -215,6 +269,9 @@ pub fn scheduler_tick_opt(current_frame: *mut TrapFrame, force_main: bool) -> *m
     let cpu = current_cpu_id().min(3);
     let cur_idx = sched.current[cpu];
     sched.tasks[cur_idx].sp = current_frame as u64;
+    unsafe {
+        sched.tasks[cur_idx].sp_el0 = (*current_frame).sp_el0;
+    }
 
     #[cfg(target_os = "uefi")]
     unsafe {
@@ -248,6 +305,42 @@ pub fn scheduler_tick_opt(current_frame: *mut TrapFrame, force_main: bool) -> *m
         restore_fp_context(&sched.tasks[next_idx].fp_ctx);
     }
 
+    #[cfg(target_os = "uefi")]
+    let next_ttbr0 = sched.tasks[next_idx].ttbr0_root;
+    #[cfg(target_os = "uefi")]
+    unsafe {
+        if next_ttbr0 != 0 {
+            // Switch to user TTBR0_EL1, clear TCR_EL1.EPD0, flush TLB
+            core::arch::asm!(
+                "msr ttbr0_el1, {0}",
+                "isb",
+                "mrs {1}, tcr_el1",
+                "bic {1}, {1}, #(1 << 7)", // EPD0 = 0
+                "msr tcr_el1, {1}",
+                "isb",
+                "tlbi vmalle1is",
+                "dsb ish",
+                "isb",
+                in(reg) next_ttbr0,
+                out(reg) _,
+                options(nostack)
+            );
+        } else {
+            // EL1-only task: set TCR_EL1.EPD0 = 1, flush TLB
+            core::arch::asm!(
+                "mrs {0}, tcr_el1",
+                "orr {0}, {0}, #(1 << 7)", // EPD0 = 1
+                "msr tcr_el1, {0}",
+                "isb",
+                "tlbi vmalle1is",
+                "dsb ish",
+                "isb",
+                out(reg) _,
+                options(nostack)
+            );
+        }
+    }
+
     if force_main {
         #[cfg(target_os = "uefi")]
         unsafe {
@@ -257,6 +350,48 @@ pub fn scheduler_tick_opt(current_frame: *mut TrapFrame, force_main: bool) -> *m
     }
 
     sched.tasks[next_idx].sp as *mut TrapFrame
+}
+
+pub fn current_task_pid() -> u64 {
+    let sched = SCHEDULER.lock();
+    let cpu = current_cpu_id().min(3);
+    let cur = sched.current[cpu];
+    sched.tasks[cur].pid
+}
+
+pub fn is_current_task_multitask() -> bool {
+    let sched = SCHEDULER.lock();
+    let cpu = current_cpu_id().min(3);
+    let cur = sched.current[cpu];
+    sched.active && cur != 0
+}
+
+pub fn finish_current_task() {
+    let mut sched = SCHEDULER.lock();
+    let cpu = current_cpu_id().min(3);
+    let cur = sched.current[cpu];
+    sched.tasks[cur].state = TaskState::Finished;
+}
+
+pub fn has_active_user_tasks() -> bool {
+    let sched = SCHEDULER.lock();
+    for i in 1..MAX_TASKS {
+        if sched.tasks[i].ttbr0_root != 0
+            && (sched.tasks[i].state == TaskState::Ready || sched.tasks[i].state == TaskState::Running)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn kernel_yield() {
+    #[cfg(target_os = "uefi")]
+    unsafe {
+        core::arch::asm!("svc #0", in("x8") 124u64, options(nomem, nostack));
+    }
+    #[cfg(not(target_os = "uefi"))]
+    core::hint::spin_loop();
 }
 
 pub extern "C" fn task_exit_trampoline() -> ! {
@@ -297,5 +432,59 @@ mod tests {
         assert_eq!(tf.x[0], 42);
         assert_eq!(tf.elr_el1, test_fn as *const () as u64);
         assert_eq!(tf.spsr_el1, 0x5);
+    }
+
+    #[test]
+    fn scheduler_user_process_spawning_and_multitask_round_robin() {
+        init_scheduler(0xFFFF_FFFF_8000_F000);
+        let mut fake_stack1 = [0u8; 1024];
+        let stack1_top = (fake_stack1.as_mut_ptr() as usize + fake_stack1.len()) as u64;
+        let mut fake_stack2 = [0u8; 1024];
+        let stack2_top = (fake_stack2.as_mut_ptr() as usize + fake_stack2.len()) as u64;
+
+        let t1 = spawn_user_process(101, 0x0040_0080, 0x0000_7FFF_FFFF_0000, 0x4100_0000, stack1_top).unwrap();
+        let t2 = spawn_user_process(102, 0x0040_0080, 0x0000_7FFF_FFFF_0000, 0x4200_0000, stack2_top).unwrap();
+        assert_eq!(t1, 1);
+        assert_eq!(t2, 2);
+
+        assert!(has_active_user_tasks());
+
+        let sched = SCHEDULER.lock();
+        assert_eq!(sched.tasks[1].pid, 101);
+        assert_eq!(sched.tasks[1].ttbr0_root, 0x4100_0000);
+        assert_eq!(sched.tasks[2].pid, 102);
+        assert_eq!(sched.tasks[2].ttbr0_root, 0x4200_0000);
+        drop(sched);
+
+        // Simulate tick from task 0: should select task 1
+        let mut main_frame = TrapFrame {
+            x: [0; 31],
+            spsr_el1: 5,
+            elr_el1: 0,
+            esr_el1: 0,
+            far_el1: 0,
+            sp_el0: 0,
+            ttbr0_root: 0,
+            pid: 0,
+        };
+        let frame1_ptr = scheduler_tick(&mut main_frame);
+        assert_eq!(current_task_pid(), 101);
+
+        // Simulate yield from task 1: should select task 2
+        let frame2_ptr = scheduler_tick(frame1_ptr);
+        assert_eq!(current_task_pid(), 102);
+
+        // Finish task 1 and task 2
+        {
+            let mut sched = SCHEDULER.lock();
+            sched.tasks[1].state = TaskState::Finished;
+            sched.tasks[2].state = TaskState::Finished;
+        }
+        assert!(!has_active_user_tasks());
+
+        // Next tick returns to task 0
+        let frame0_ptr = scheduler_tick(frame2_ptr);
+        assert_eq!(frame0_ptr as u64, &mut main_frame as *mut TrapFrame as u64);
+        assert_eq!(current_task_pid(), 0);
     }
 }

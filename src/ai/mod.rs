@@ -3,6 +3,7 @@
 pub mod matmul;
 pub mod nn;
 pub mod transformer;
+pub mod llm;
 
 pub use matmul::{
     neon_matmul_slice, scalar_matmul, smp_matmul_worker, verify_matrices, MATMUL_N,
@@ -17,4 +18,10 @@ pub use transformer::{
     smp_transformer_attn_ffn_worker, smp_transformer_qkv_worker, verify_transformer,
     SmpTransformerContext, SMP_TRANSFORMER_CTX, TRANSFORMER_D_FF, TRANSFORMER_D_MODEL,
     TRANSFORMER_MAGIC, TRANSFORMER_SEQ_LEN,
+};
+pub use llm::{
+    load_micro_llm_from_bytes, run_parallel_micro_llm_step, scalar_micro_llm_step,
+    verify_llm_step, MicroLlmWeights, TransformerBlockWeights, MICRO_LLM_D_FF,
+    MICRO_LLM_D_MODEL, MICRO_LLM_LAYERS, MICRO_LLM_MAGIC, MICRO_LLM_SEQ_LEN,
+    MICRO_LLM_VOCAB, SMP_MICRO_LLM_WEIGHTS,
 };

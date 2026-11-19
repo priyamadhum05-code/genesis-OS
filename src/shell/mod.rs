@@ -35,6 +35,8 @@ pub struct Shell<'a> {
     pub run_elf_fn: Option<unsafe fn(&[u8], usize) -> Result<i32, &'static str>>,
     pub infer_fn: Option<unsafe fn(&[u8], usize) -> Result<(usize, u64), &'static str>>,
     pub llm_fn: Option<unsafe fn(&[u8], usize) -> Result<u64, &'static str>>,
+    pub multitask_fn: Option<unsafe fn(&[u8], &[u8], usize) -> Result<(), &'static str>>,
+    pub generate_fn: Option<unsafe fn(&[u8], &str, usize) -> Result<(), &'static str>>,
 }
 
 impl<'a> Shell<'a> {
@@ -51,7 +53,7 @@ impl<'a> Shell<'a> {
 
         match cmd {
             "help" => {
-                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 10)\r\n");
+                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 11)\r\n");
                 serial_write(self.uart_va, b"Available commands:\r\n");
                 serial_write(self.uart_va, b"  help              - List available commands\r\n");
                 serial_write(self.uart_va, b"  info              - Display system status, memory, registers, and framebuffer\r\n");
@@ -64,6 +66,8 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  run <file>        - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
                 serial_write(self.uart_va, b"  infer [file]      - Run 4-core SMP INT8 NEON neural network inference\r\n");
                 serial_write(self.uart_va, b"  llm [file]        - Run 4-core SMP INT8 NEON transformer block\r\n");
+                serial_write(self.uart_va, b"  multitask         - Run preemptive multi-process EL0 scheduling (APP1 + APP2)\r\n");
+                serial_write(self.uart_va, b"  generate [seed]   - Run 4-core SMP autoregressive Micro-LLM text generation\r\n");
                 serial_write(self.uart_va, b"  halt / poweroff   - Power off system via PSCI SYSTEM_OFF\r\n");
             }
             "info" => {
@@ -378,6 +382,94 @@ impl<'a> Shell<'a> {
                             serial_write(self.uart_va, b"Error reading transformer file '");
                             serial_write(self.uart_va, filename.as_bytes());
                             serial_write(self.uart_va, b"': ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                }
+            }
+            "multitask" => {
+                if let Some(multi_fn) = self.multitask_fn {
+                    if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                        let half_cap = self.file_buf_cap / 2;
+                        let res1 = fat.read_file(
+                            dev,
+                            "APP1.ELF",
+                            self.file_buf_pa,
+                            self.file_buf_va,
+                            half_cap,
+                            self.scratch_pa,
+                            self.scratch_va,
+                        );
+                        let res2 = fat.read_file(
+                            dev,
+                            "APP2.ELF",
+                            self.file_buf_pa + half_cap as u64,
+                            self.file_buf_va + half_cap as u64,
+                            half_cap,
+                            self.scratch_pa,
+                            self.scratch_va,
+                        );
+                        match (res1, res2) {
+                            (Ok(len1), Ok(len2)) => {
+                                let app1_slice = core::slice::from_raw_parts(self.file_buf_va as *const u8, len1);
+                                let app2_slice = core::slice::from_raw_parts((self.file_buf_va + half_cap as u64) as *const u8, len2);
+                                match multi_fn(app1_slice, app2_slice, self.uart_va) {
+                                    Ok(()) => {
+                                        serial_write(self.uart_va, b"GENESIS: stage11 el0 multitask ok\r\n");
+                                    }
+                                    Err(e) => {
+                                        serial_write(self.uart_va, b"Multitask run failed: ");
+                                        serial_write(self.uart_va, e.as_bytes());
+                                        serial_write(self.uart_va, b"\r\n");
+                                    }
+                                }
+                            }
+                            _ => {
+                                serial_write(self.uart_va, b"Failed to load APP1.ELF or APP2.ELF from filesystem\r\n");
+                            }
+                        }
+                    } else {
+                        serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                    }
+                } else {
+                    serial_write(self.uart_va, b"Multitask runner not configured\r\n");
+                }
+            }
+            "generate" | "chat" => {
+                let prompt = if arg.is_empty() { "GENESIS " } else { arg };
+                if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                    let res = fat.read_file(
+                        dev,
+                        "MICRO_LLM.BIN",
+                        self.file_buf_pa,
+                        self.file_buf_va,
+                        self.file_buf_cap,
+                        self.scratch_pa,
+                        self.scratch_va,
+                    );
+                    match res {
+                        Ok(bytes) => {
+                            if let Some(gen_fn) = self.generate_fn {
+                                let model_slice = core::slice::from_raw_parts(self.file_buf_va as *const u8, bytes);
+                                match gen_fn(model_slice, prompt, self.uart_va) {
+                                    Ok(()) => {
+                                        serial_write(self.uart_va, b"GENESIS: stage11 micro-llm ok\r\n");
+                                    }
+                                    Err(e) => {
+                                        serial_write(self.uart_va, b"Generation failed: ");
+                                        serial_write(self.uart_va, e.as_bytes());
+                                        serial_write(self.uart_va, b"\r\n");
+                                    }
+                                }
+                            } else {
+                                serial_write(self.uart_va, b"LLM generator not configured\r\n");
+                            }
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error reading MICRO_LLM.BIN: ");
                             serial_write(self.uart_va, e.as_bytes());
                             serial_write(self.uart_va, b"\r\n");
                         }

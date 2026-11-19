@@ -7,10 +7,11 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{arch::asm, panic::PanicInfo, ptr, sync::atomic::{AtomicBool, AtomicU64, Ordering}};
 use genesis_stage1::{
     ai::{
-        load_model_from_bytes, load_transformer_from_bytes, run_parallel_nn_inference,
-        run_parallel_transformer, scalar_infer, scalar_matmul, scalar_transformer_block,
-        smp_matmul_worker, verify_inference, verify_matrices, verify_transformer, MATMUL_N,
-        SMP_NN_CTX, SMP_TRANSFORMER_CTX,
+        load_micro_llm_from_bytes, load_model_from_bytes, load_transformer_from_bytes,
+        run_parallel_micro_llm_step, run_parallel_nn_inference, run_parallel_transformer,
+        scalar_infer, scalar_matmul, scalar_micro_llm_step, scalar_transformer_block,
+        smp_matmul_worker, verify_inference, verify_llm_step, verify_matrices, verify_transformer,
+        MATMUL_N, SMP_MICRO_LLM_WEIGHTS, SMP_NN_CTX, SMP_TRANSFORMER_CTX,
     },
     arch::{
         dispatch_smp_work, parse_fdt_devices, psci_cpu_on, secondary_boot_stub, secondary_main,
@@ -1519,10 +1520,10 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             serial_write(uart, b"GENESIS: stage8 framebuffer skipped (headless mode)\r\n");
         }
 
-        // 2. Dedicated 64 KiB Buffer for Shell File Reading
-        let shell_file_pa = mapper.pmm_mut().allocate_contiguous_pages(16).unwrap();
+        // 2. Dedicated 128 KiB Buffer for Shell File Reading
+        let shell_file_pa = mapper.pmm_mut().allocate_contiguous_pages(32).unwrap();
         let shell_file_va = HHDM_BASE + shell_file_pa;
-        let shell_file_cap = 64 * 1024;
+        let shell_file_cap = 128 * 1024;
 
         // 3. Initialize Interactive Shell
         let total_ram_mib = (total_usable * 4) / 1024;
@@ -1543,6 +1544,8 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             run_elf_fn: Some(kernel_run_elf),
             infer_fn: Some(kernel_run_infer),
             llm_fn: Some(kernel_run_llm),
+            multitask_fn: Some(kernel_run_multitask),
+            generate_fn: Some(kernel_run_generate),
         };
 
         // 4. Automated Shell Self-Test (info, ls, bench)
@@ -1562,8 +1565,13 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         shell.execute_command("llm TRANSFORMER.BIN");
         serial_write(uart, b"GENESIS: stage10 milestone complete\r\n");
 
-        // 7. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 10)\r\n");
+        // 7. Stage 11 Automated Smoke-Test (multitask, generate)
+        shell.execute_command("multitask");
+        shell.execute_command("generate GENESIS ");
+        serial_write(uart, b"GENESIS: stage11 milestone complete\r\n");
+
+        // 8. Interactive Prompt Loop
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 11)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {
@@ -1713,6 +1721,154 @@ unsafe fn kernel_run_llm(model_data: &[u8], uart: usize) -> Result<u64, &'static
         let _ = (t0, t1, cntfrq, uart);
         Ok(500)
     }
+}
+
+unsafe fn kernel_run_multitask(
+    app1_data: &[u8],
+    app2_data: &[u8],
+    uart: usize,
+) -> Result<(), &'static str> {
+    let pmm_va = ensure_higher_half(ptr::addr_of_mut!(KERNEL_PMM) as usize as u64);
+    let pmm = &mut *(pmm_va as *mut PhysicalPageAllocator<KERNEL_PMM_WORDS>);
+    let max_pa = 1u64 << 48;
+
+    let initial_free = pmm.free_pages();
+
+    // 1. Load both EL0 processes
+    let proc1 = load_elf64(app1_data, pmm, HHDM_BASE, max_pa)?;
+    let proc2 = load_elf64(app2_data, pmm, HHDM_BASE, max_pa)?;
+
+    // 2. Allocate EL1 kernel stacks (4 pages = 16 KiB each)
+    let kstack1_pa = pmm.allocate_contiguous_pages(4).ok_or("Failed to alloc kstack1")?;
+    let kstack2_pa = pmm.allocate_contiguous_pages(4).ok_or("Failed to alloc kstack2")?;
+    let kstack1_top = HHDM_BASE + kstack1_pa + 16384;
+    let kstack2_top = HHDM_BASE + kstack2_pa + 16384;
+
+    // 3. Spawn both user processes into scheduler
+    let _task1_id = sched::spawn_user_process(1, proc1.entry_va, proc1.user_sp, proc1.ttbr0_root, kstack1_top)
+        .map_err(|_| "Failed to spawn task 1")?;
+    let _task2_id = sched::spawn_user_process(2, proc2.entry_va, proc2.user_sp, proc2.ttbr0_root, kstack2_top)
+        .map_err(|_| "Failed to spawn task 2")?;
+
+    #[cfg(target_os = "uefi")]
+    {
+        // 4. Arm timer for preemptive time-slicing
+        let timer_freq = ArmTimer::frequency();
+        let sched_interval = timer_freq / 200; // ~5 ms periodic tick
+        stage4_arm_timer_ticks(sched_interval, 0); // continuous timer
+        ArmTimer::arm_periodic(sched_interval);
+
+        // Unmask IRQs
+        asm!("msr daifclr, #2", options(nomem, nostack));
+
+        // Yield CPU to start user tasks immediately
+        sched::kernel_yield();
+
+        // 5. Wait for both user tasks to finish
+        while sched::has_active_user_tasks() {
+            sched::kernel_yield();
+        }
+
+        // 6. Disable timer IRQs
+        ArmTimer::disable();
+        asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+    }
+
+    // 7. Clean up kernel stacks & destroy user address spaces
+    let _ = pmm.free_contiguous_pages(kstack1_pa, 4);
+    let _ = pmm.free_contiguous_pages(kstack2_pa, 4);
+    destroy_user_process(&proc1, pmm, HHDM_BASE);
+    destroy_user_process(&proc2, pmm, HHDM_BASE);
+
+    // 8. Verify 100% PMM restoration
+    let final_free = pmm.free_pages();
+    if final_free != initial_free {
+        serial_write(uart, b"PMM LEAK DETECTED: initial=");
+        serial_decimal(uart, initial_free);
+        serial_write(uart, b", final=");
+        serial_decimal(uart, final_free);
+        serial_write(uart, b"\r\n");
+        return Err("PMM leak during multitask execution");
+    }
+
+    Ok(())
+}
+
+unsafe fn kernel_run_generate(
+    model_data: &[u8],
+    prompt_str: &str,
+    uart: usize,
+) -> Result<(), &'static str> {
+    let weights = &mut *core::ptr::addr_of_mut!(SMP_MICRO_LLM_WEIGHTS);
+    load_micro_llm_from_bytes(model_data, weights)?;
+
+    let mut tokens = [0u8; 16];
+    let prompt_bytes = prompt_str.as_bytes();
+    let prompt_len = prompt_bytes.len().min(16);
+    tokens[..prompt_len].copy_from_slice(&prompt_bytes[..prompt_len]);
+    let mut curr_len = prompt_len;
+
+    serial_write(uart, b"Prompt: \"");
+    serial_write(uart, &tokens[..prompt_len]);
+    serial_write(uart, b"\"\r\nOutput: ");
+    serial_write(uart, &tokens[..prompt_len]);
+
+    let smp_ctx = &mut *core::ptr::addr_of_mut!(SMP_TRANSFORMER_CTX);
+
+    let t0: u64;
+    let t1: u64;
+    let cntfrq: u64;
+    #[cfg(target_os = "uefi")]
+    {
+        asm!("mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
+        asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        t0 = 0;
+        cntfrq = 1_000_000;
+    }
+
+    let steps_to_gen = (16 - curr_len).min(8);
+    for s in 0..steps_to_gen {
+        let (parallel_tok, parallel_logits) = run_parallel_micro_llm_step(&tokens[..curr_len], weights, smp_ctx);
+
+        if s == 0 {
+            let (scalar_tok, scalar_logits) = scalar_micro_llm_step(&tokens[..curr_len], weights);
+            if !verify_llm_step(parallel_tok, &parallel_logits, scalar_tok, &scalar_logits) {
+                serial_write(uart, b"\r\nSTAGE11_LLM_VERIFY_FAIL\r\n");
+                return Err("Micro-LLM output mismatch against scalar reference");
+            }
+        }
+
+        serial_write(uart, &[parallel_tok]);
+        tokens[curr_len] = parallel_tok;
+        curr_len += 1;
+    }
+
+    #[cfg(target_os = "uefi")]
+    {
+        asm!("mrs {}, cntvct_el0", out(reg) t1, options(nomem, nostack));
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        t1 = 1000;
+    }
+
+    let ticks = t1.saturating_sub(t0);
+    let total_us = if cntfrq > 0 { (ticks * 1_000_000) / cntfrq } else { 0 };
+    let us_per_tok = if steps_to_gen > 0 { total_us / steps_to_gen as u64 } else { 0 };
+    let tok_per_sec = if total_us > 0 { (steps_to_gen as u64 * 1_000_000) / total_us } else { 0 };
+
+    serial_write(uart, b"\r\nGeneration stats: ");
+    serial_decimal(uart, tok_per_sec);
+    serial_write(uart, b" tokens/sec (");
+    serial_decimal(uart, us_per_tok);
+    serial_write(uart, b" us/token, ");
+    serial_decimal(uart, total_us);
+    serial_write(uart, b" us total, cores=4)\r\n");
+
+    Ok(())
 }
 
 unsafe fn find_pl011(fdt: *const u8, bound: usize) -> Option<usize> {
