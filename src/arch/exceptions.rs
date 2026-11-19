@@ -58,8 +58,8 @@ pub fn stage4_vectors_va() -> u64 {
 pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) -> *mut TrapFrame {
     let uart = STAGE4_UART_VA.load(Ordering::Relaxed) as usize;
 
-    if kind == 5 {
-        // Current EL with SPx IRQ
+    if kind == 5 || kind == 9 {
+        // Current EL with SPx IRQ (5) or Lower EL AArch64 IRQ (9)
         let iar = unsafe { crate::arch::gic::acknowledge_irq() };
         let intid = (iar & 0xFFFFFF) as u32;
 
@@ -94,6 +94,73 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
         }
         // INTIDs 1020..=1023 are spurious/special: do NOT write to ICC_EOIR1_EL1
         return frame as *mut TrapFrame;
+    }
+
+    if kind == 8 {
+        // Lower EL AArch64 Synchronous Exception (Syscalls / Faults)
+        let ec = (frame.esr_el1 >> 26) & 0x3F;
+        if ec == 0x15 {
+            // SVC instruction in AArch64
+            let sys_num = frame.x[8];
+            match sys_num {
+                1 => {
+                    // SYS_WRITE (fd = arg0, buf = arg1 / arg0, count = arg2 / arg1)
+                    // Standard Linux AArch64: x0 = fd, x1 = buf, x2 = count
+                    // Minimal genesis binary: x0 = buf, x1 = count or x0 = fd, x1 = buf, x2 = count
+                    let (buf, count) = if frame.x[1] > 0 && frame.x[2] > 0 {
+                        // Standard ABI: x1 = buf, x2 = count
+                        (frame.x[1], frame.x[2] as usize)
+                    } else {
+                        // Compact ABI: x0 = buf, x1 = count
+                        (frame.x[0], frame.x[1] as usize)
+                    };
+
+                    if buf < 0x0000_8000_0000_0000
+                        && buf.checked_add(count as u64).map_or(false, |end| end <= 0x0000_8000_0000_0000)
+                    {
+                        if uart != 0 {
+                            let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+                            unsafe {
+                                crate::arch::serial::serial_write(uart, slice);
+                            }
+                        }
+                        frame.x[0] = count as u64;
+                    } else {
+                        frame.x[0] = (-14i64) as u64; // -EFAULT
+                    }
+                    return frame as *mut TrapFrame;
+                }
+                93 => {
+                    // SYS_EXIT (status = arg0)
+                    let exit_code = frame.x[0] as i32;
+                    frame.elr_el1 = crate::proc::stage9_user_return_va();
+                    frame.spsr_el1 = 0x3C5; // EL1h with DAIF masked
+                    frame.x[0] = exit_code as u64;
+                    return frame as *mut TrapFrame;
+                }
+                _ => {
+                    frame.x[0] = (-38i64) as u64; // -ENOSYS
+                    return frame as *mut TrapFrame;
+                }
+            }
+        } else {
+            // Unexpected user-space exception (page fault, illegal instruction)
+            if uart != 0 {
+                unsafe {
+                    crate::arch::serial::serial_write(uart, b"GENESIS: el0 user-space fault EC=");
+                    crate::arch::serial::serial_hex(uart, ec);
+                    crate::arch::serial::serial_write(uart, b" ELR=");
+                    crate::arch::serial::serial_hex(uart, frame.elr_el1);
+                    crate::arch::serial::serial_write(uart, b" FAR=");
+                    crate::arch::serial::serial_hex(uart, frame.far_el1);
+                    crate::arch::serial::serial_write(uart, b"\r\n");
+                }
+            }
+            frame.elr_el1 = crate::proc::stage9_user_return_va();
+            frame.spsr_el1 = 0x3C5;
+            frame.x[0] = (-1i64) as u64;
+            return frame as *mut TrapFrame;
+        }
     }
 
     // Synchronous, SError, FIQ or unexpected exception: Diagnostic dump and halt

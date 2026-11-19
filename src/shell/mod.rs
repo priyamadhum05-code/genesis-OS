@@ -32,6 +32,8 @@ pub struct Shell<'a> {
     pub total_ram_mib: u64,
     pub free_ram_mib: u64,
     pub bench_fn: Option<fn(u64) -> (u64, u64)>,
+    pub run_elf_fn: Option<unsafe fn(&[u8], usize) -> Result<i32, &'static str>>,
+    pub infer_fn: Option<unsafe fn(&[u8], usize) -> Result<(usize, u64), &'static str>>,
 }
 
 impl<'a> Shell<'a> {
@@ -57,6 +59,8 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  hexdump <file>    - Display hexadecimal dump of a file\r\n");
                 serial_write(self.uart_va, b"  bench             - Run 4-core SMP NEON 64x64 MatMul benchmark\r\n");
                 serial_write(self.uart_va, b"  draw              - Redraw UEFI GOP framebuffer dashboard\r\n");
+                serial_write(self.uart_va, b"  run <file>        - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
+                serial_write(self.uart_va, b"  infer [file]      - Run 4-core SMP INT8 NEON neural network inference\r\n");
                 serial_write(self.uart_va, b"  halt / poweroff   - Power off system via PSCI SYSTEM_OFF\r\n");
             }
             "info" => {
@@ -229,6 +233,97 @@ impl<'a> Shell<'a> {
                     serial_write(self.uart_va, b" us)\r\n");
                 } else {
                     serial_write(self.uart_va, b"Benchmark function not configured\r\n");
+                }
+            }
+            "run" => {
+                if arg.is_empty() {
+                    serial_write(self.uart_va, b"Usage: run <file.elf>\r\n");
+                } else if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                    let res = fat.read_file(
+                        dev,
+                        arg,
+                        self.file_buf_pa,
+                        self.file_buf_va,
+                        self.file_buf_cap,
+                        self.scratch_pa,
+                        self.scratch_va,
+                    );
+                    match res {
+                        Ok(bytes) => {
+                            if let Some(run_fn) = self.run_elf_fn {
+                                let elf_slice = core::slice::from_raw_parts(self.file_buf_va as *const u8, bytes);
+                                match run_fn(elf_slice, self.uart_va) {
+                                    Ok(status) => {
+                                        serial_write(self.uart_va, b"\r\nProcess exited with status ");
+                                        serial_decimal(self.uart_va, status as u64);
+                                        serial_write(self.uart_va, b"\r\n");
+                                    }
+                                    Err(e) => {
+                                        serial_write(self.uart_va, b"ELF execution failed: ");
+                                        serial_write(self.uart_va, e.as_bytes());
+                                        serial_write(self.uart_va, b"\r\n");
+                                    }
+                                }
+                            } else {
+                                serial_write(self.uart_va, b"ELF runner not configured\r\n");
+                            }
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error reading file '");
+                            serial_write(self.uart_va, arg.as_bytes());
+                            serial_write(self.uart_va, b"': ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                }
+            }
+            "infer" => {
+                let filename = if arg.is_empty() { "MODEL.BIN" } else { arg };
+                if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                    let res = fat.read_file(
+                        dev,
+                        filename,
+                        self.file_buf_pa,
+                        self.file_buf_va,
+                        self.file_buf_cap,
+                        self.scratch_pa,
+                        self.scratch_va,
+                    );
+                    match res {
+                        Ok(bytes) => {
+                            if let Some(infer_fn) = self.infer_fn {
+                                let model_slice = core::slice::from_raw_parts(self.file_buf_va as *const u8, bytes);
+                                match infer_fn(model_slice, self.uart_va) {
+                                    Ok((pred, us)) => {
+                                        serial_write(self.uart_va, b"Inference predicted class: ");
+                                        serial_decimal(self.uart_va, pred as u64);
+                                        serial_write(self.uart_va, b" (");
+                                        serial_decimal(self.uart_va, us);
+                                        serial_write(self.uart_va, b" us)\r\n");
+                                    }
+                                    Err(e) => {
+                                        serial_write(self.uart_va, b"Inference failed: ");
+                                        serial_write(self.uart_va, e.as_bytes());
+                                        serial_write(self.uart_va, b"\r\n");
+                                    }
+                                }
+                            } else {
+                                serial_write(self.uart_va, b"Inference engine not configured\r\n");
+                            }
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error reading model file '");
+                            serial_write(self.uart_va, filename.as_bytes());
+                            serial_write(self.uart_va, b"': ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
                 }
             }
             "draw" => {

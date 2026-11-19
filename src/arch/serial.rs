@@ -62,10 +62,13 @@ pub unsafe fn serial_try_read_byte(uart: usize) -> Option<u8> {
     }
 }
 
-/// Blocks until a byte is received from PL011 UART.
+/// Blocks until a byte is received from PL011 UART or VirtIO-Input keyboard.
 pub unsafe fn serial_read_byte(uart: usize) -> u8 {
     loop {
         if let Some(b) = serial_try_read_byte(uart) {
+            return b;
+        }
+        if let Some(b) = crate::drivers::virtio_input::poll_global_virtio_input() {
             return b;
         }
         #[cfg(target_os = "uefi")]

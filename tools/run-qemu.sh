@@ -14,6 +14,7 @@ with open('build/esp/WEIGHTS.BIN', 'wb') as f:
         for j in range(64):
             f.write(struct.pack('<f', (k * 2 + j + 1) * 0.005))
 "
+python3 tools/gen-stage9-assets.py
 exec "$QEMU" -machine virt-11.1,gic-version=3 -cpu cortex-a76 -smp "${QEMU_SMP:-4}" -m 256M \
   -drive if=pflash,format=raw,unit=0,readonly=on,file="$FW/edk2-aarch64-code.fd" \
   -drive if=pflash,format=raw,unit=1,file=build/edk2-vars.fd \

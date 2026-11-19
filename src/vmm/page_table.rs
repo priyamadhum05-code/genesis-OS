@@ -122,6 +122,33 @@ impl PagePermissions {
         }
     }
 
+    pub const fn user_code() -> Self {
+        Self {
+            mem_type: MemoryType::NormalWriteBack,
+            access: AccessPermission::UserRo,
+            privileged_execute: false,
+            unprivileged_execute: true,
+        }
+    }
+
+    pub const fn user_rodata() -> Self {
+        Self {
+            mem_type: MemoryType::NormalWriteBack,
+            access: AccessPermission::UserRo,
+            privileged_execute: false,
+            unprivileged_execute: false,
+        }
+    }
+
+    pub const fn user_data() -> Self {
+        Self {
+            mem_type: MemoryType::NormalWriteBack,
+            access: AccessPermission::UserRw,
+            privileged_execute: false,
+            unprivileged_execute: false,
+        }
+    }
+
     /// Converts permission attributes into architectural descriptor bits.
     pub const fn to_descriptor_bits(&self) -> u64 {
         let mut bits = 0u64;
@@ -910,6 +937,32 @@ mod tests {
         assert_eq!((mmio_desc >> 2) & 0x7, 0);
         // PXN = 1 -> bit 53 == 1
         assert_eq!((mmio_desc >> 53) & 1, 1);
+
+        // Stage 9A: EL0 User-Space Permissions
+        // user_code(): AP = 0b11 (RO EL0+EL1), UXN = 0 (EL0 exec), PXN = 1 (EL1 NX)
+        let u_code = PagePermissions::user_code();
+        let u_code_desc = make_page_descriptor(0x0000_1000, u_code);
+        assert!(is_valid(u_code_desc));
+        assert_eq!((u_code_desc >> 6) & 0x3, 0b11); // AP = 0b11
+        assert_eq!((u_code_desc >> 53) & 1, 1);     // PXN = 1
+        assert_eq!((u_code_desc >> 54) & 1, 0);     // UXN = 0
+        assert_eq!((u_code_desc >> 2) & 0x7, 3);    // Normal WB-WA
+
+        // user_rodata(): AP = 0b11 (RO EL0+EL1), UXN = 1 (NX), PXN = 1 (EL1 NX)
+        let u_rodata = PagePermissions::user_rodata();
+        let u_ro_desc = make_page_descriptor(0x0000_2000, u_rodata);
+        assert!(is_valid(u_ro_desc));
+        assert_eq!((u_ro_desc >> 6) & 0x3, 0b11);   // AP = 0b11
+        assert_eq!((u_ro_desc >> 53) & 1, 1);       // PXN = 1
+        assert_eq!((u_ro_desc >> 54) & 1, 1);       // UXN = 1
+
+        // user_data(): AP = 0b01 (RW EL0+EL1), UXN = 1 (NX), PXN = 1 (EL1 NX)
+        let u_data = PagePermissions::user_data();
+        let u_data_desc = make_page_descriptor(0x0000_3000, u_data);
+        assert!(is_valid(u_data_desc));
+        assert_eq!((u_data_desc >> 6) & 0x3, 0b01); // AP = 0b01
+        assert_eq!((u_data_desc >> 53) & 1, 1);     // PXN = 1
+        assert_eq!((u_data_desc >> 54) & 1, 1);     // UXN = 1
     }
 
     #[test]

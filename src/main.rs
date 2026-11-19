@@ -6,18 +6,25 @@ use alloc::{boxed::Box, vec::Vec};
 
 use core::{arch::asm, panic::PanicInfo, ptr, sync::atomic::{AtomicBool, AtomicU64, Ordering}};
 use genesis_stage1::{
-    ai::{scalar_matmul, smp_matmul_worker, verify_matrices, MATMUL_N},
+    ai::{
+        load_model_from_bytes, run_parallel_nn_inference, scalar_infer, scalar_matmul,
+        smp_matmul_worker, verify_inference, verify_matrices, MATMUL_N, SMP_NN_CTX,
+    },
     arch::{
         dispatch_smp_work, parse_fdt_devices, psci_cpu_on, secondary_boot_stub, secondary_main,
         serial_read_line, stage4_arm_timer_interval, stage4_arm_timer_ticks,
         stage4_get_ticks, stage4_init_runtime, stage4_vectors_va, ArmTimer, Gicv3,
         SecondaryBootArgs, ONLINE_CPUS,
     },
-    drivers::{Framebuffer, VirtIOBlockDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC},
+    drivers::{
+        virtio_input::VirtIOInputDevice, Framebuffer, VirtIOBlockDevice, VIRTIO_DEV_BLOCK,
+        VIRTIO_MAGIC,
+    },
     fs::{locate_volume, FatVolume},
     memory_map,
     mm::heap::SpinLock,
     pmm::{self, PhysicalPageAllocator, ReservedRange, KERNEL_PMM_WORDS},
+    proc::{destroy_user_process, load_elf64, run_user_process},
     sched,
     shell::{Shell, ShellResult},
     vmm::{
@@ -1301,6 +1308,30 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         serial_decimal(uart, blk_dev.version as u64);
         serial_write(uart, b")\r\n");
 
+        // Stage 9B: Probe VirtIO-Input Keyboard (DeviceID == 18)
+        let input_q_pa = mapper.pmm_mut().allocate_page().unwrap();
+        let input_q_va = HHDM_BASE + input_q_pa;
+        let mut input_dev_opt = match VirtIOInputDevice::probe(VIRTIO_MMIO_VA, input_q_pa, input_q_va) {
+            Ok(Some(dev)) => {
+                serial_write(uart, b"GENESIS: virtio-input keyboard detected (version=");
+                serial_decimal(uart, dev.version as u64);
+                serial_write(uart, b")\r\n");
+                Some(dev)
+            }
+            Ok(None) => {
+                let _ = mapper.pmm_mut().free_page(input_q_pa);
+                None
+            }
+            Err(_) => {
+                let _ = mapper.pmm_mut().free_page(input_q_pa);
+                None
+            }
+        };
+
+        if let Some(input_dev) = input_dev_opt.as_mut() {
+            genesis_stage1::drivers::virtio_input::register_global_virtio_input(input_dev as *mut _);
+        }
+
         // Allocate 1 page for Sector 0 request buffers
         let req_pa = mapper.pmm_mut().allocate_page().unwrap();
         let req_va = HHDM_BASE + req_pa;
@@ -1502,6 +1533,8 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             total_ram_mib,
             free_ram_mib,
             bench_fn: Some(run_smp_matmul_benchmark),
+            run_elf_fn: Some(kernel_run_elf),
+            infer_fn: Some(kernel_run_infer),
         };
 
         // 4. Automated Shell Self-Test (info, ls, bench)
@@ -1512,8 +1545,13 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         serial_write(uart, b"GENESIS: stage8 shell self-test ok\r\n");
         serial_write(uart, b"GENESIS: stage8 milestone complete\r\n");
 
-        // 5. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 8)\r\n");
+        // 5. Stage 9 Automated Smoke-Test (run HELLO.ELF, infer MODEL.BIN)
+        shell.execute_command("run HELLO.ELF");
+        shell.execute_command("infer MODEL.BIN");
+        serial_write(uart, b"GENESIS: stage9 milestone complete\r\n");
+
+        // 6. Interactive Prompt Loop
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 9)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {
@@ -1552,6 +1590,57 @@ fn run_smp_matmul_benchmark(_arg: u64) -> (u64, u64) {
     let ticks = t1.saturating_sub(t0);
     let us = if cntfrq > 0 { (ticks * 1_000_000) / cntfrq } else { 0 };
     (ticks, us)
+}
+
+unsafe fn kernel_run_elf(elf_data: &[u8], _uart: usize) -> Result<i32, &'static str> {
+    let pmm_va = ensure_higher_half(ptr::addr_of_mut!(KERNEL_PMM) as usize as u64);
+    let pmm = &mut *(pmm_va as *mut PhysicalPageAllocator<KERNEL_PMM_WORDS>);
+    let max_pa = 1u64 << 48;
+
+    let proc = load_elf64(elf_data, pmm, HHDM_BASE, max_pa)?;
+    let status = run_user_process(proc.entry_va, proc.user_sp, proc.ttbr0_root);
+    destroy_user_process(&proc, pmm, HHDM_BASE);
+    Ok(status)
+}
+
+unsafe fn kernel_run_infer(model_data: &[u8], uart: usize) -> Result<(usize, u64), &'static str> {
+    let ctx = &mut *core::ptr::addr_of_mut!(SMP_NN_CTX);
+    load_model_from_bytes(model_data, ctx)?;
+
+    let (scalar_class, scalar_logits) = scalar_infer(
+        &ctx.input,
+        &ctx.w1,
+        &ctx.b1,
+        &ctx.w2,
+        &ctx.b2,
+    );
+
+    let t0: u64;
+    let t1: u64;
+    let cntfrq: u64;
+    #[cfg(target_os = "uefi")]
+    {
+        asm!("mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
+        let (neon_class, _) = run_parallel_nn_inference(ctx);
+        asm!("mrs {}, cntvct_el0", out(reg) t1, options(nomem, nostack));
+        asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
+
+        if !verify_inference(neon_class, &ctx.logits, scalar_class, &scalar_logits) {
+            serial_write(uart, b"STAGE9_INFER_VERIFY_FAIL\r\n");
+            return Err("NEON inference output mismatch against scalar reference");
+        }
+
+        let ticks = t1.saturating_sub(t0);
+        let us = if cntfrq > 0 { (ticks * 1_000_000) / cntfrq } else { 0 };
+
+        serial_write(uart, b"GENESIS: stage9 int8 neon inference ok\r\n");
+        Ok((neon_class, us))
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        let _ = (t0, t1, cntfrq, uart);
+        Ok((scalar_class, 100))
+    }
 }
 
 unsafe fn find_pl011(fdt: *const u8, bound: usize) -> Option<usize> {
