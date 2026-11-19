@@ -13,18 +13,25 @@ pub struct Framebuffer {
     pub pixel_format: u32,
 }
 
+/// Constructs a 32-bit color value from R, G, B components respecting GOP pixel format.
+/// Format 1 is BGR (most common in UEFI GOP), Format 0 is RGB.
+#[inline]
+pub fn rgb_format(pixel_format: u32, r: u8, g: u8, b: u8) -> u32 {
+    if pixel_format == 1 {
+        // PixelBlueGreenRedReserved8BitPerColor
+        (b as u32) | ((g as u32) << 8) | ((r as u32) << 16)
+    } else {
+        // PixelRedGreenBlueReserved8BitPerColor
+        (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+    }
+}
+
 impl Framebuffer {
     /// Constructs a 32-bit color value from R, G, B components respecting GOP pixel format.
     /// Format 1 is BGR (most common in UEFI GOP), Format 0 is RGB.
     #[inline]
     pub fn rgb(&self, r: u8, g: u8, b: u8) -> u32 {
-        if self.pixel_format == 1 {
-            // PixelBlueGreenRedReserved8BitPerColor
-            (b as u32) | ((g as u32) << 8) | ((r as u32) << 16)
-        } else {
-            // PixelRedGreenBlueReserved8BitPerColor
-            (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
-        }
+        rgb_format(self.pixel_format, r, g, b)
     }
 
     /// Sets pixel at `(x, y)` to `color`.
@@ -182,6 +189,238 @@ impl Framebuffer {
         // 4. Footer prompt
         let footer_y = (card_y + card_h + 20).min(self.height.saturating_sub(24));
         self.draw_string(card_x, footer_y, "Genesis Kernel Shell active on serial console. Type 'help' to begin.", text_gray, None);
+    }
+}
+
+/// Scrolling graphical text console operating directly on the UEFI GOP framebuffer.
+#[derive(Clone, Copy, Debug)]
+pub struct FbConsole {
+    pub base_va: u64,
+    pub size: usize,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pixel_format: u32,
+    pub fg_color: u32,
+    pub bg_color: u32,
+    pub start_y: u32,
+    pub max_cols: usize,
+    pub max_rows: usize,
+    pub cursor_col: usize,
+    pub cursor_row: usize,
+    pub ansi_state: u8,
+}
+
+impl FbConsole {
+    pub fn new(fb: &Framebuffer) -> Self {
+        let start_y = if fb.height >= 120 { 32u32 } else { 0u32 };
+        let max_cols = (fb.width / 8) as usize;
+        let max_rows = ((fb.height.saturating_sub(start_y)) / 8) as usize;
+        let fg_color = rgb_format(fb.pixel_format, 248, 250, 252); // #F8FAFC white
+        let bg_color = rgb_format(fb.pixel_format, 15, 23, 42);    // #0F172A dark slate
+
+        Self {
+            base_va: fb.base_va,
+            size: fb.size,
+            width: fb.width,
+            height: fb.height,
+            stride: fb.stride,
+            pixel_format: fb.pixel_format,
+            fg_color,
+            bg_color,
+            start_y,
+            max_cols,
+            max_rows,
+            cursor_col: 0,
+            cursor_row: 0,
+            ansi_state: 0,
+        }
+    }
+
+    /// Fills rectangle `(x, y, w, h)` with `color`.
+    pub unsafe fn clear_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: u32) {
+        let x_end = (x + w).min(self.width);
+        let y_end = (y + h).min(self.height);
+        for row in y..y_end {
+            let row_offset = ((row as u64) * (self.stride as u64) + (x as u64)) * 4;
+            let row_ptr = (self.base_va + row_offset) as *mut u32;
+            let count = (x_end.saturating_sub(x)) as usize;
+            for col in 0..count {
+                core::ptr::write_volatile(row_ptr.add(col), color);
+            }
+        }
+    }
+
+    /// Draws compact top status bar banner.
+    pub unsafe fn draw_header(&mut self) {
+        if self.start_y == 0 {
+            return;
+        }
+        let bar_color = rgb_format(self.pixel_format, 3, 105, 161);     // #0369A1 blue
+        let border_color = rgb_format(self.pixel_format, 56, 189, 248); // #38BDF8 cyan
+        let text_color = rgb_format(self.pixel_format, 248, 250, 252);   // #F8FAFC white
+
+        self.clear_rect(0, 0, self.width, self.start_y.saturating_sub(1), bar_color);
+        self.clear_rect(0, self.start_y.saturating_sub(1), self.width, 1, border_color);
+
+        let title = "PROJECT GENESIS  |  AARCH64 GRAPHICAL TERMINAL  (STAGE 10)";
+        let mut x = 16u32;
+        let y = 12u32;
+        for b in title.bytes() {
+            if x + 8 > self.width {
+                break;
+            }
+            let glyph = get_glyph(b);
+            for r in 0..8u32 {
+                let bits = glyph[r as usize];
+                let row_offset = (((y + r) as u64) * (self.stride as u64) + (x as u64)) * 4;
+                let row_ptr = (self.base_va + row_offset) as *mut u32;
+                for c in 0..8u32 {
+                    if (bits & (0x80 >> c)) != 0 {
+                        core::ptr::write_volatile(row_ptr.add(c as usize), text_color);
+                    }
+                }
+            }
+            x += 8;
+        }
+    }
+
+    /// Clears the terminal scrolling area and resets cursor to (0, 0).
+    pub unsafe fn clear(&mut self) {
+        self.draw_header();
+        self.clear_rect(0, self.start_y, self.width, self.height.saturating_sub(self.start_y), self.bg_color);
+        self.cursor_col = 0;
+        self.cursor_row = 0;
+    }
+
+    /// Shifts rows in the console region up by 1 line (8 pixels) and clears the bottom row.
+    pub unsafe fn scroll_up(&mut self) {
+        if self.max_rows <= 1 {
+            return;
+        }
+        let row_px = 8u32;
+        let num_lines = (self.max_rows as u32 - 1) * row_px;
+        let bytes_per_line = (self.stride as usize) * 4;
+        let copy_bytes = (num_lines as usize) * bytes_per_line;
+
+        let dst_ptr = (self.base_va + ((self.start_y as u64) * (self.stride as u64) * 4)) as *mut u8;
+        let src_ptr = (self.base_va + (((self.start_y + row_px) as u64) * (self.stride as u64) * 4)) as *const u8;
+
+        core::ptr::copy(src_ptr, dst_ptr, copy_bytes);
+
+        let bottom_y = self.start_y + (self.max_rows as u32 - 1) * row_px;
+        self.clear_rect(0, bottom_y, self.width, row_px, self.bg_color);
+        self.cursor_row = self.max_rows - 1;
+    }
+
+    /// Draws single 8x8 glyph at console grid position (col, row).
+    pub unsafe fn draw_glyph_at(&mut self, col: usize, row: usize, ch: u8) {
+        let px = (col as u32) * 8;
+        let py = self.start_y + (row as u32) * 8;
+        if px + 8 > self.width || py + 8 > self.height {
+            return;
+        }
+        let glyph = get_glyph(ch);
+        for r in 0..8u32 {
+            let bits = glyph[r as usize];
+            let row_offset = (((py + r) as u64) * (self.stride as u64) + (px as u64)) * 4;
+            let row_ptr = (self.base_va + row_offset) as *mut u32;
+            for c in 0..8u32 {
+                let color = if (bits & (0x80 >> c)) != 0 {
+                    self.fg_color
+                } else {
+                    self.bg_color
+                };
+                core::ptr::write_volatile(row_ptr.add(c as usize), color);
+            }
+        }
+    }
+
+    /// Emulates terminal character processing with cursor movement, line wrap, backspace, and scroll.
+    pub unsafe fn write_char(&mut self, b: u8) {
+        if self.ansi_state == 1 {
+            if b == b'[' {
+                self.ansi_state = 2;
+            } else {
+                self.ansi_state = 0;
+            }
+            return;
+        } else if self.ansi_state == 2 {
+            if (0x40..=0x7E).contains(&b) {
+                if b == b'J' {
+                    self.clear();
+                } else if b == b'H' {
+                    self.cursor_col = 0;
+                    self.cursor_row = 0;
+                }
+                self.ansi_state = 0;
+            }
+            return;
+        }
+
+        if b == 0x1B {
+            self.ansi_state = 1;
+            return;
+        }
+
+        match b {
+            b'\n' => {
+                self.cursor_col = 0;
+                self.cursor_row += 1;
+                if self.cursor_row >= self.max_rows {
+                    self.scroll_up();
+                }
+            }
+            b'\r' => {
+                self.cursor_col = 0;
+            }
+            0x08 => {
+                if self.cursor_col > 0 {
+                    self.cursor_col -= 1;
+                }
+            }
+            b'\t' => {
+                let next = (self.cursor_col + 4) & !3;
+                self.cursor_col = next.min(self.max_cols.saturating_sub(1));
+            }
+            32..=126 => {
+                if self.cursor_col >= self.max_cols {
+                    self.cursor_col = 0;
+                    self.cursor_row += 1;
+                    if self.cursor_row >= self.max_rows {
+                        self.scroll_up();
+                    }
+                }
+                self.draw_glyph_at(self.cursor_col, self.cursor_row, b);
+                self.cursor_col += 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// Writes a slice of bytes into the console.
+    pub unsafe fn write_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_char(b);
+        }
+    }
+}
+
+static mut GLOBAL_FB_CONSOLE: Option<FbConsole> = None;
+
+pub unsafe fn register_global_fb_console(console: FbConsole) {
+    *core::ptr::addr_of_mut!(GLOBAL_FB_CONSOLE) = Some(console);
+}
+
+pub unsafe fn global_fb_console_write(bytes: &[u8]) {
+    if let Some(ref mut con) = *core::ptr::addr_of_mut!(GLOBAL_FB_CONSOLE) {
+        con.write_bytes(bytes);
+    }
+}
+
+pub unsafe fn global_fb_console_clear() {
+    if let Some(ref mut con) = *core::ptr::addr_of_mut!(GLOBAL_FB_CONSOLE) {
+        con.clear();
     }
 }
 
@@ -390,5 +629,47 @@ mod tests {
         // Blue: R=0x00, G=0x00, B=0xFF
         assert_eq!(fb_rgb.rgb(0x00, 0x00, 0xFF), 0x00FF0000);
         assert_eq!(fb_bgr.rgb(0x00, 0x00, 0xFF), 0x000000FF);
+    }
+
+    #[test]
+    fn fb_console_cursor_and_scroll_test() {
+        extern crate std;
+        let mut buffer = std::vec![0u32; 800 * 64];
+        let mut console = FbConsole {
+            base_va: buffer.as_mut_ptr() as u64,
+            size: buffer.len() * 4,
+            width: 800,
+            height: 64,
+            stride: 800,
+            pixel_format: 0,
+            fg_color: 0x00FF_FFFF,
+            bg_color: 0x0000_0000,
+            start_y: 16,
+            max_cols: 100,
+            max_rows: (64 - 16) / 8, // 6 rows
+            cursor_col: 0,
+            cursor_row: 0,
+            ansi_state: 0,
+        };
+
+        unsafe {
+            console.write_bytes(b"hello world\n");
+            assert_eq!(console.cursor_col, 0);
+            assert_eq!(console.cursor_row, 1);
+
+            console.write_bytes(b"abc");
+            assert_eq!(console.cursor_col, 3);
+            assert_eq!(console.cursor_row, 1);
+
+            // Backspace: \x08 \x08 moves col 3 -> 2 -> 3 -> 2
+            console.write_bytes(b"\x08 \x08");
+            assert_eq!(console.cursor_col, 2);
+
+            // Fill rows to trigger scroll
+            for _ in 0..10 {
+                console.write_bytes(b"line\n");
+            }
+            assert_eq!(console.cursor_row, console.max_rows - 1);
+        }
     }
 }

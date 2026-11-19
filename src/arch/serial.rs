@@ -15,6 +15,7 @@ pub unsafe fn serial_write(uart: usize, bytes: &[u8]) {
         }
         mmio_write(uart, *byte as u32);
     }
+    crate::drivers::fb::global_fb_console_write(bytes);
 }
 
 pub unsafe fn serial_hex(uart: usize, value: u64) {

@@ -197,13 +197,22 @@ impl FatVolume {
             let target_8_3 = to_8_3(comp);
             let is_last = idx == comp_count - 1;
 
-            let (entry_clus, entry_size, is_dir) = self.find_entry_in_dir(
+            let (entry_clus, entry_size, is_dir) = match self.find_entry_in_dir(
                 dev,
                 curr_dir_clus,
                 &target_8_3,
                 scratch_pa,
                 scratch_va,
-            )?;
+            ) {
+                Ok(val) => val,
+                Err(e) => {
+                    if let Some(short_8_3) = to_short_8_3(comp) {
+                        self.find_entry_in_dir(dev, curr_dir_clus, &short_8_3, scratch_pa, scratch_va)?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
 
             if is_last {
                 if is_dir {
@@ -236,34 +245,35 @@ impl FatVolume {
             let clus_lba = self.cluster_to_lba(curr_clus);
             let sectors_to_read = self.sec_per_clus as u16;
 
-            // Read cluster sectors into scratch buffer, then copy to destination
-            // If this is a partial final cluster, read into scratch buffer to avoid overwriting past file_size
-            if bytes_left < clus_bytes {
-                dev.read_sectors(clus_lba, sectors_to_read, scratch_pa, scratch_va)?;
-                core::ptr::copy_nonoverlapping(
-                    scratch_va as *const u8,
-                    (dest_va + dest_offset as u64) as *mut u8,
-                    bytes_left,
-                );
-                break;
-            } else {
-                if dest_offset + clus_bytes <= dest_cap {
-                    dev.read_sectors(
-                        clus_lba,
-                        sectors_to_read,
-                        dest_pa + dest_offset as u64,
-                        dest_va + dest_offset as u64,
-                    )?;
-                } else {
-                    dev.read_sectors(clus_lba, sectors_to_read, scratch_pa, scratch_va)?;
-                    core::ptr::copy_nonoverlapping(
-                        scratch_va as *const u8,
-                        (dest_va + dest_offset as u64) as *mut u8,
-                        clus_bytes,
-                    );
+            if dest_offset + clus_bytes <= dest_cap {
+                dev.read_sectors(
+                    clus_lba,
+                    sectors_to_read,
+                    dest_pa + dest_offset as u64,
+                    dest_va + dest_offset as u64,
+                )?;
+                if bytes_left <= clus_bytes {
+                    break;
                 }
                 bytes_left -= clus_bytes;
                 dest_offset += clus_bytes;
+            } else {
+                let mut clus_bytes_left = bytes_left.min(clus_bytes);
+                let mut sec_off = 0u64;
+                while clus_bytes_left > 0 {
+                    let chunk = clus_bytes_left.min(4096);
+                    let secs = ((chunk + 511) / 512) as u16;
+                    dev.read_sectors(clus_lba + sec_off, secs, scratch_pa, scratch_va)?;
+                    core::ptr::copy_nonoverlapping(
+                        scratch_va as *const u8,
+                        (dest_va + dest_offset as u64) as *mut u8,
+                        chunk,
+                    );
+                    clus_bytes_left -= chunk;
+                    dest_offset += chunk;
+                    sec_off += secs as u64;
+                }
+                break;
             }
 
             if bytes_left == 0 {
@@ -470,13 +480,22 @@ impl FatVolume {
 
         for comp in &components[..comp_count] {
             let target_8_3 = to_8_3(comp);
-            let (entry_clus, _size, is_dir) = self.find_entry_in_dir(
+            let (entry_clus, _size, is_dir) = match self.find_entry_in_dir(
                 dev,
                 curr_dir_clus,
                 &target_8_3,
                 scratch_pa,
                 scratch_va,
-            )?;
+            ) {
+                Ok(val) => val,
+                Err(e) => {
+                    if let Some(short_8_3) = to_short_8_3(comp) {
+                        self.find_entry_in_dir(dev, curr_dir_clus, &short_8_3, scratch_pa, scratch_va)?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
             if !is_dir {
                 return Err("Path component is not a directory");
             }
@@ -620,6 +639,34 @@ pub fn to_8_3(name: &str) -> [u8; 11] {
     res
 }
 
+/// Generates the standard DOS/VFAT 8.3 numeric tail representation for long filenames.
+/// E.g. `"TRANSFORMER.BIN"` -> `Some(b"TRANSF~1BIN")`.
+pub fn to_short_8_3(name: &str) -> Option<[u8; 11]> {
+    let mut parts = name.splitn(2, '.');
+    let base = parts.next().unwrap_or("");
+    let ext = parts.next().unwrap_or("");
+    if base.len() <= 8 && !base.contains('~') {
+        return None;
+    }
+    let mut res = [b' '; 11];
+    let mut b_idx = 0;
+    for ch in base.bytes().take(6) {
+        res[b_idx] = ch.to_ascii_uppercase();
+        b_idx += 1;
+    }
+    if b_idx < 8 {
+        res[b_idx] = b'~';
+        res[b_idx + 1] = b'1';
+    }
+
+    let mut e_idx = 8;
+    for ch in ext.bytes().take(3) {
+        res[e_idx] = ch.to_ascii_uppercase();
+        e_idx += 1;
+    }
+    Some(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +678,8 @@ mod tests {
         assert_eq!(&to_8_3("BOOTAA64.EFI"), b"BOOTAA64EFI");
         assert_eq!(&to_8_3("EFI"), b"EFI        ");
         assert_eq!(&to_8_3("a.b"), b"A       B  ");
+        assert_eq!(to_short_8_3("TRANSFORMER.BIN"), Some(*b"TRANSF~1BIN"));
+        assert_eq!(to_short_8_3("HELLO.ELF"), None);
     }
 
     #[test]

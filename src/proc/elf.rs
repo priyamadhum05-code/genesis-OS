@@ -253,21 +253,80 @@ pub unsafe fn destroy_user_page_table<const N: usize>(
                 }
                 let _ = pmm.free_page(l3_pa);
             }
-            let _ = pmm.free_page(l1_pa);
+            let _ = pmm.free_page(l2_pa);
         }
-        let _ = pmm.free_page(l0_pa_intermediate(l0_entry));
+        let _ = pmm.free_page(l1_pa);
     }
     let _ = pmm.free_page(root_pa);
 }
 
-#[inline]
-fn l0_pa_intermediate(entry: u64) -> u64 {
-    crate::vmm::page_table::output_address(entry)
-}
-
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use std::boxed::Box;
+    use crate::pmm::PhysicalPageAllocator;
+
+    fn make_test_map(base_paddr: u64, pages: u64) -> std::vec::Vec<u8> {
+        let mut desc = std::vec![0u8; 40];
+        desc[0..4].copy_from_slice(&7u32.to_le_bytes()); // ConventionalMemory = 7
+        desc[8..16].copy_from_slice(&base_paddr.to_le_bytes());
+        desc[16..24].copy_from_slice(&base_paddr.to_le_bytes());
+        desc[24..32].copy_from_slice(&pages.to_le_bytes());
+        desc
+    }
+
+    #[test]
+    fn elf_destroy_user_process_zero_leak_and_double_free() {
+        #[repr(align(4096))]
+        struct Mem([u8; 128 * 4096]);
+        let mut mem = Box::new(Mem([0; 128 * 4096]));
+        let base_ptr = mem.0.as_mut_ptr() as u64;
+
+        let mut pmm = PhysicalPageAllocator::<2>::new();
+        let map = make_test_map(0, 128);
+        unsafe {
+            pmm.init_from_memory_map(map.as_ptr(), map.len(), 40, &[]).unwrap();
+        }
+
+        let initial_free = pmm.free_pages();
+
+        // Build a minimal valid ELF64 with 1 PT_LOAD segment
+        let mut elf_buf = [0u8; 256];
+        elf_buf[0..4].copy_from_slice(&ELF_MAGIC);
+        elf_buf[4] = ELF_CLASS_64;
+        elf_buf[5] = ELF_DATA_2LSB;
+        elf_buf[6] = 1;
+        elf_buf[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        elf_buf[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // e_entry
+        elf_buf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        elf_buf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        elf_buf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf_buf[56..58].copy_from_slice(&1u16.to_le_bytes());  // e_phnum
+
+        let ph_off = 64;
+        elf_buf[ph_off..ph_off + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf_buf[ph_off + 4..ph_off + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+        elf_buf[ph_off + 8..ph_off + 16].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        elf_buf[ph_off + 16..ph_off + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_vaddr
+        elf_buf[ph_off + 24..ph_off + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_paddr
+        elf_buf[ph_off + 32..ph_off + 40].copy_from_slice(&64u64.to_le_bytes()); // p_filesz
+        elf_buf[ph_off + 40..ph_off + 48].copy_from_slice(&64u64.to_le_bytes()); // p_memsz
+        elf_buf[ph_off + 48..ph_off + 56].copy_from_slice(&4096u64.to_le_bytes()); // p_align
+
+        let proc = load_elf64(&elf_buf, &mut pmm, base_ptr, 128 * 4096).unwrap();
+        assert!(pmm.free_pages() < initial_free);
+
+        unsafe {
+            destroy_user_process(&proc, &mut pmm, base_ptr);
+        }
+
+        assert_eq!(
+            pmm.free_pages(),
+            initial_free,
+            "All pages must be 100% restored with zero leak and zero double-free"
+        );
+    }
 
     #[test]
     fn elf64_header_parsing_and_validation() {

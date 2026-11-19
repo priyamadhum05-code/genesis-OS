@@ -34,6 +34,7 @@ pub struct Shell<'a> {
     pub bench_fn: Option<fn(u64) -> (u64, u64)>,
     pub run_elf_fn: Option<unsafe fn(&[u8], usize) -> Result<i32, &'static str>>,
     pub infer_fn: Option<unsafe fn(&[u8], usize) -> Result<(usize, u64), &'static str>>,
+    pub llm_fn: Option<unsafe fn(&[u8], usize) -> Result<u64, &'static str>>,
 }
 
 impl<'a> Shell<'a> {
@@ -50,10 +51,11 @@ impl<'a> Shell<'a> {
 
         match cmd {
             "help" => {
-                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 8)\r\n");
+                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 10)\r\n");
                 serial_write(self.uart_va, b"Available commands:\r\n");
                 serial_write(self.uart_va, b"  help              - List available commands\r\n");
                 serial_write(self.uart_va, b"  info              - Display system status, memory, registers, and framebuffer\r\n");
+                serial_write(self.uart_va, b"  clear             - Clear graphical terminal console and serial screen\r\n");
                 serial_write(self.uart_va, b"  ls [path]         - List directory contents on FAT32 volume\r\n");
                 serial_write(self.uart_va, b"  cat <file>        - Print text contents of a file\r\n");
                 serial_write(self.uart_va, b"  hexdump <file>    - Display hexadecimal dump of a file\r\n");
@@ -61,6 +63,7 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  draw              - Redraw UEFI GOP framebuffer dashboard\r\n");
                 serial_write(self.uart_va, b"  run <file>        - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
                 serial_write(self.uart_va, b"  infer [file]      - Run 4-core SMP INT8 NEON neural network inference\r\n");
+                serial_write(self.uart_va, b"  llm [file]        - Run 4-core SMP INT8 NEON transformer block\r\n");
                 serial_write(self.uart_va, b"  halt / poweroff   - Power off system via PSCI SYSTEM_OFF\r\n");
             }
             "info" => {
@@ -333,6 +336,54 @@ impl<'a> Shell<'a> {
                     serial_write(self.uart_va, b"UEFI GOP framebuffer dashboard redrawn.\r\n");
                 } else {
                     serial_write(self.uart_va, b"UEFI GOP framebuffer not available (headless mode)\r\n");
+                }
+            }
+            "clear" => {
+                crate::drivers::fb::global_fb_console_clear();
+                serial_write(self.uart_va, b"\x1B[2J\x1B[H");
+            }
+            "llm" => {
+                let filename = if arg.is_empty() { "TRANSFORMER.BIN" } else { arg };
+                if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                    let res = fat.read_file(
+                        dev,
+                        filename,
+                        self.file_buf_pa,
+                        self.file_buf_va,
+                        self.file_buf_cap,
+                        self.scratch_pa,
+                        self.scratch_va,
+                    );
+                    match res {
+                        Ok(bytes) => {
+                            if let Some(llm_fn) = self.llm_fn {
+                                let model_slice = core::slice::from_raw_parts(self.file_buf_va as *const u8, bytes);
+                                match llm_fn(model_slice, self.uart_va) {
+                                    Ok(us) => {
+                                        serial_write(self.uart_va, b"GENESIS: stage10 neon transformer ok (cores=4, ");
+                                        serial_decimal(self.uart_va, us);
+                                        serial_write(self.uart_va, b" us)\r\n");
+                                    }
+                                    Err(e) => {
+                                        serial_write(self.uart_va, b"Transformer execution failed: ");
+                                        serial_write(self.uart_va, e.as_bytes());
+                                        serial_write(self.uart_va, b"\r\n");
+                                    }
+                                }
+                            } else {
+                                serial_write(self.uart_va, b"Transformer runner not configured\r\n");
+                            }
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error reading transformer file '");
+                            serial_write(self.uart_va, filename.as_bytes());
+                            serial_write(self.uart_va, b"': ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
                 }
             }
             "halt" | "poweroff" => {

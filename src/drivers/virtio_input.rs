@@ -203,8 +203,8 @@ impl VirtIOInputDevice {
         }
         dev.write32(VIRTIO_REG_QUEUE_NUM, INPUT_QUEUE_SIZE as u32);
 
-        // Zero queue memory
-        core::ptr::write_bytes(queue_va as *mut u8, 0, 4096);
+        // Zero queue memory (2 contiguous pages = 8192 bytes for legacy used ring alignment)
+        core::ptr::write_bytes(queue_va as *mut u8, 0, 8192);
 
         if version >= 2 {
             let desc_pa = queue_pa;
@@ -243,6 +243,14 @@ impl VirtIOInputDevice {
         // DRIVER_OK (4)
         let cur = dev.read32(VIRTIO_REG_STATUS);
         dev.write32(VIRTIO_REG_STATUS, cur | 4);
+
+        // Clean cache to PoC on descriptors and avail ring before queue notification
+        #[cfg(target_os = "uefi")]
+        {
+            core::arch::asm!("dc cvac, {0}", in(reg) queue_va, options(nostack));
+            core::arch::asm!("dc cvac, {0}", in(reg) (queue_va + 256), options(nostack));
+            core::arch::asm!("dsb sy", options(nostack));
+        }
 
         // Notify device that receive buffers are available
         dev.write32(VIRTIO_REG_QUEUE_NOTIFY, 0);

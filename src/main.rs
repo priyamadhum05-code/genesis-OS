@@ -7,8 +7,10 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{arch::asm, panic::PanicInfo, ptr, sync::atomic::{AtomicBool, AtomicU64, Ordering}};
 use genesis_stage1::{
     ai::{
-        load_model_from_bytes, run_parallel_nn_inference, scalar_infer, scalar_matmul,
-        smp_matmul_worker, verify_inference, verify_matrices, MATMUL_N, SMP_NN_CTX,
+        load_model_from_bytes, load_transformer_from_bytes, run_parallel_nn_inference,
+        run_parallel_transformer, scalar_infer, scalar_matmul, scalar_transformer_block,
+        smp_matmul_worker, verify_inference, verify_matrices, verify_transformer, MATMUL_N,
+        SMP_NN_CTX, SMP_TRANSFORMER_CTX,
     },
     arch::{
         dispatch_smp_work, parse_fdt_devices, psci_cpu_on, secondary_boot_stub, secondary_main,
@@ -17,8 +19,8 @@ use genesis_stage1::{
         SecondaryBootArgs, ONLINE_CPUS,
     },
     drivers::{
-        virtio_input::VirtIOInputDevice, Framebuffer, VirtIOBlockDevice, VIRTIO_DEV_BLOCK,
-        VIRTIO_MAGIC,
+        register_global_fb_console, virtio_input::VirtIOInputDevice, FbConsole, Framebuffer,
+        VirtIOBlockDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC,
     },
     fs::{locate_volume, FatVolume},
     memory_map,
@@ -1309,7 +1311,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         serial_write(uart, b")\r\n");
 
         // Stage 9B: Probe VirtIO-Input Keyboard (DeviceID == 18)
-        let input_q_pa = mapper.pmm_mut().allocate_page().unwrap();
+        let input_q_pa = mapper.pmm_mut().allocate_contiguous_pages(2).unwrap();
         let input_q_va = HHDM_BASE + input_q_pa;
         let mut input_dev_opt = match VirtIOInputDevice::probe(VIRTIO_MMIO_VA, input_q_pa, input_q_va) {
             Ok(Some(dev)) => {
@@ -1320,10 +1322,12 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             }
             Ok(None) => {
                 let _ = mapper.pmm_mut().free_page(input_q_pa);
+                let _ = mapper.pmm_mut().free_page(input_q_pa + 4096);
                 None
             }
             Err(_) => {
                 let _ = mapper.pmm_mut().free_page(input_q_pa);
+                let _ = mapper.pmm_mut().free_page(input_q_pa + 4096);
                 None
             }
         };
@@ -1506,6 +1510,9 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             let total_ram_mib = (total_usable * 4) / 1024;
             let free_ram_mib = (mapper.pmm_mut().free_pages() * 4) / 1024;
             fb.draw_dashboard(cpus, free_ram_mib, total_ram_mib, true);
+            let mut fb_console = FbConsole::new(&fb);
+            fb_console.clear();
+            register_global_fb_console(fb_console);
             fb_opt = Some(fb);
             serial_write(uart, b"GENESIS: stage8 framebuffer initialized ok\r\n");
         } else {
@@ -1535,6 +1542,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             bench_fn: Some(run_smp_matmul_benchmark),
             run_elf_fn: Some(kernel_run_elf),
             infer_fn: Some(kernel_run_infer),
+            llm_fn: Some(kernel_run_llm),
         };
 
         // 4. Automated Shell Self-Test (info, ls, bench)
@@ -1550,8 +1558,12 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         shell.execute_command("infer MODEL.BIN");
         serial_write(uart, b"GENESIS: stage9 milestone complete\r\n");
 
-        // 6. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 9)\r\n");
+        // 6. Stage 10 Automated Smoke-Test (llm TRANSFORMER.BIN)
+        shell.execute_command("llm TRANSFORMER.BIN");
+        serial_write(uart, b"GENESIS: stage10 milestone complete\r\n");
+
+        // 7. Interactive Prompt Loop
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 10)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {
@@ -1640,6 +1652,66 @@ unsafe fn kernel_run_infer(model_data: &[u8], uart: usize) -> Result<(usize, u64
     {
         let _ = (t0, t1, cntfrq, uart);
         Ok((scalar_class, 100))
+    }
+}
+
+unsafe fn kernel_run_llm(model_data: &[u8], uart: usize) -> Result<u64, &'static str> {
+    let ctx = &mut *core::ptr::addr_of_mut!(SMP_TRANSFORMER_CTX);
+    load_transformer_from_bytes(model_data, ctx)?;
+
+    let t0: u64;
+    let t1: u64;
+    let cntfrq: u64;
+    #[cfg(target_os = "uefi")]
+    {
+        asm!("mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
+        let parallel_out = run_parallel_transformer(ctx);
+        asm!("mrs {}, cntvct_el0", out(reg) t1, options(nomem, nostack));
+        asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
+
+        let scalar_out = scalar_transformer_block(
+            &ctx.input,
+            &ctx.wq,
+            &ctx.bq,
+            &ctx.wk,
+            &ctx.bk,
+            &ctx.wv,
+            &ctx.bv,
+            &ctx.w_ff1,
+            &ctx.b_ff1,
+            &ctx.w_ff2,
+            &ctx.b_ff2,
+        );
+
+        if !verify_transformer(&parallel_out, &scalar_out) {
+            serial_write(uart, b"STAGE10_TRANSFORMER_VERIFY_FAIL\r\n");
+            return Err("Transformer output mismatch with scalar reference");
+        }
+
+        let ticks = t1.saturating_sub(t0);
+        let us = if cntfrq > 0 { (ticks * 1_000_000) / cntfrq } else { 0 };
+
+        serial_write(uart, b"Transformer block token 0 output sample: [");
+        for i in 0..4 {
+            let val = ctx.output[i];
+            if val < 0 {
+                serial_write(uart, b"-");
+                serial_decimal(uart, (-val) as u64);
+            } else {
+                serial_decimal(uart, val as u64);
+            }
+            if i < 3 {
+                serial_write(uart, b", ");
+            }
+        }
+        serial_write(uart, b", ...]\r\n");
+
+        Ok(us)
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        let _ = (t0, t1, cntfrq, uart);
+        Ok(500)
     }
 }
 
