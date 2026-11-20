@@ -49,10 +49,55 @@ impl Framebuffer {
         self.draw_rect(0, 0, self.width, self.height, color);
     }
 
-    /// Copies `bytes` directly from an off-screen Write-Back backbuffer into this framebuffer.
+    /// Copies `bytes` directly from an off-screen Write-Back backbuffer into this framebuffer
+    /// using fast 64-byte 128-bit NEON vector chunks and 64-bit unaligned transfers.
     pub unsafe fn blit_from(&mut self, src_va: u64, bytes: usize) {
         let copy_len = bytes.min(self.size);
-        core::ptr::copy_nonoverlapping(src_va as *const u8, self.base_va as *mut u8, copy_len);
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut src = src_va as *const u8;
+            let mut dst = self.base_va as *mut u8;
+            let mut rem = copy_len;
+            while rem >= 64 {
+                core::arch::asm!(
+                    "ldp q0, q1, [{src}]",
+                    "ldp q2, q3, [{src}, #32]",
+                    "stp q0, q1, [{dst}]",
+                    "stp q2, q3, [{dst}, #32]",
+                    src = inout(reg) src => _,
+                    dst = inout(reg) dst => _,
+                    options(nostack)
+                );
+                src = src.add(64);
+                dst = dst.add(64);
+                rem -= 64;
+            }
+            while rem >= 8 {
+                let val = core::ptr::read_unaligned(src as *const u64);
+                core::ptr::write_unaligned(dst as *mut u64, val);
+                src = src.add(8);
+                dst = dst.add(8);
+                rem -= 8;
+            }
+            if rem > 0 {
+                core::ptr::copy_nonoverlapping(src, dst, rem);
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut src = src_va as *const u64;
+            let mut dst = self.base_va as *mut u64;
+            let count_u64 = copy_len / 8;
+            for _ in 0..count_u64 {
+                core::ptr::write_unaligned(dst, core::ptr::read_unaligned(src));
+                src = src.add(1);
+                dst = dst.add(1);
+            }
+            let rem = copy_len % 8;
+            if rem > 0 {
+                core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, rem);
+            }
+        }
     }
 
     /// Draws a filled rectangle from `(x, y)` with width `w` and height `h`.

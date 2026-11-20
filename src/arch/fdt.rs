@@ -15,6 +15,12 @@ pub struct FdtTimerInfo {
     pub virt_ppi: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct FdtPciInfo {
+    pub ecam_base: u64,
+    pub ecam_size: u64,
+}
+
 #[derive(Clone, Copy)]
 struct Node {
     parent_ac: u32,
@@ -209,6 +215,120 @@ pub unsafe fn parse_fdt_devices(fdt: *const u8, cap: usize) -> (Option<FdtGicInf
     }
 
     (found_gic, found_timer)
+}
+
+pub unsafe fn parse_fdt_pci(fdt: *const u8, cap: usize) -> Option<FdtPciInfo> {
+    if !valid_fdt(fdt, cap) {
+        return None;
+    }
+
+    let total = be32(fdt.add(4)) as usize;
+    let so = be32(fdt.add(8)) as usize;
+    let stro = be32(fdt.add(12)) as usize;
+    let ss = be32(fdt.add(32)) as usize;
+    let sz = be32(fdt.add(36)) as usize;
+    if so.checked_add(sz).unwrap_or(usize::MAX) > total || stro.checked_add(ss).unwrap_or(usize::MAX) > total {
+        return None;
+    }
+
+    let strings = fdt.add(stro);
+    let (mut p, end) = (fdt.add(so), fdt.add(so + sz));
+    let mut nodes = [Node::empty(); 32];
+    let mut depth = 0usize;
+
+    while p.add(4) <= end {
+        let token = be32(p);
+        p = p.add(4);
+        match token {
+            1 => {
+                if depth >= nodes.len() {
+                    return None;
+                }
+                let parent = if depth == 0 {
+                    Node::empty()
+                } else {
+                    nodes[depth - 1]
+                };
+                nodes[depth] = Node {
+                    parent_ac: parent.child_ac,
+                    parent_sc: parent.child_sc,
+                    child_ac: parent.child_ac,
+                    child_sc: parent.child_sc,
+                    is_gic: false,
+                    is_gic_v3: false,
+                    is_timer: false,
+                    disabled: false,
+                    reg_ptr: core::ptr::null(),
+                    reg_len: 0,
+                    irq_ptr: core::ptr::null(),
+                    irq_len: 0,
+                };
+                depth += 1;
+                while p < end && *p != 0 {
+                    p = p.add(1);
+                }
+                p = align4(p.add(1));
+            }
+            2 => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                let n = nodes[depth];
+                if !n.disabled && n.is_gic && !n.reg_ptr.is_null() {
+                    let ac = n.parent_ac as usize;
+                    let sc = n.parent_sc as usize;
+                    let stride = (ac + sc) * 4;
+                    if n.reg_len >= stride {
+                        let ecam_base = read_cells(n.reg_ptr, ac);
+                        let ecam_size = read_cells(n.reg_ptr.add(ac * 4), sc);
+                        return Some(FdtPciInfo {
+                            ecam_base,
+                            ecam_size,
+                        });
+                    }
+                }
+            }
+            3 => {
+                if depth == 0 || p.add(8) > end {
+                    return None;
+                }
+                let len = be32(p) as usize;
+                let nameoff = be32(p.add(4)) as usize;
+                p = p.add(8);
+                if p.add(len) > end || nameoff >= ss {
+                    return None;
+                }
+                let name = cstr(strings.add(nameoff), ss - nameoff);
+                let val = p;
+                let node = &mut nodes[depth - 1];
+                match name {
+                    b"#address-cells" if len >= 4 => node.child_ac = be32(val),
+                    b"#size-cells" if len >= 4 => node.child_sc = be32(val),
+                    b"compatible" => {
+                        if has_string(val, len, b"pci-host-ecam-generic") {
+                            node.is_gic = true;
+                        }
+                    }
+                    b"status" => {
+                        let status = cstr(val, len);
+                        node.disabled = status == b"disabled" || status == b"fail";
+                    }
+                    b"reg" => {
+                        node.reg_ptr = val;
+                        node.reg_len = len;
+                    }
+                    _ => {}
+                }
+                p = align4(p.add(len));
+            }
+            4 => {}
+            9 => break,
+            _ => return None,
+        }
+    }
+
+    None
 }
 
 unsafe fn valid_fdt(p: *const u8, cap: usize) -> bool {

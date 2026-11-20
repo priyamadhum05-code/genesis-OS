@@ -80,6 +80,7 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  write <file> <text> - Write text contents to a file\r\n");
                 serial_write(self.uart_va, b"  hexdump <file>    - Display hexadecimal dump of a file\r\n");
                 serial_write(self.uart_va, b"  desktop           - Launch double-buffered graphical desktop\r\n");
+                serial_write(self.uart_va, b"  lspci             - List all discovered PCIe devices on Bus 0\r\n");
                 serial_write(self.uart_va, b"  bench             - Run 4-core SMP NEON 64x64 MatMul benchmark\r\n");
                 serial_write(self.uart_va, b"  draw              - Redraw UEFI GOP framebuffer dashboard\r\n");
                 serial_write(self.uart_va, b"  run <file>        - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
@@ -531,6 +532,21 @@ impl<'a> Shell<'a> {
             "clear" => {
                 crate::drivers::fb::global_fb_console_clear();
                 serial_write(self.uart_va, b"\x1B[2J\x1B[H");
+            }
+            "lspci" => {
+                let dev_count = unsafe { crate::drivers::pci::PCI_DEVICE_COUNT };
+                if dev_count == 0 {
+                    serial_write(self.uart_va, b"No PCIe devices discovered.\r\n");
+                } else {
+                    serial_write(self.uart_va, b"Discovered PCIe Devices (Bus 0):\r\n");
+                    for i in 0..dev_count {
+                        let dev = unsafe { &crate::drivers::pci::PCI_DEVICES[i] };
+                        let mut buf = [0u8; 128];
+                        let s = crate::drivers::pci::format_pci_device(dev, &mut buf);
+                        serial_write(self.uart_va, s.as_bytes());
+                        serial_write(self.uart_va, b"\r\n");
+                    }
+                }
             }
             "llm" => {
                 let filename = if arg.is_empty() { "TRANSFORMER.BIN" } else { arg };

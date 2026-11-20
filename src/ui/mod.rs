@@ -17,7 +17,8 @@ use crate::{
 pub const WIN_TERMINAL: usize = 0;
 pub const WIN_SYSMON: usize = 1;
 pub const WIN_EXPLORER: usize = 2;
-pub const WINDOW_COUNT: usize = 3;
+pub const WIN_EDITOR: usize = 3;
+pub const WINDOW_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Window {
@@ -115,6 +116,13 @@ pub struct DesktopCompositor {
     pub file_preview_is_hex: bool,
     pub current_dir: [u8; 32],
     pub current_dir_len: usize,
+    pub editor_buf: [u8; 1024],
+    pub editor_len: usize,
+    pub editor_cursor: usize,
+    pub editor_filename: [u8; 32],
+    pub editor_filename_len: usize,
+    pub editor_status: [u8; 64],
+    pub editor_status_len: usize,
     pub free_ram_mib: u64,
     pub total_ram_mib: u64,
     pub heap_used_bytes: usize,
@@ -273,6 +281,19 @@ impl DesktopCompositor {
             closed: false,
         };
 
+        let ed_w = (((avail_w - gap) * 55) / 100).max(280) as u32;
+        let w_editor = Window {
+            id: WIN_EDITOR,
+            title: "Text Editor",
+            x: margin + 30,
+            y: top_y + 20,
+            w: ed_w,
+            h: top_row_h,
+            focused: false,
+            minimized: true,
+            closed: false,
+        };
+
         let mut comp = Self {
             backbuffer_va,
             buffer_bytes,
@@ -280,8 +301,8 @@ impl DesktopCompositor {
             height,
             stride,
             pixel_format,
-            windows: [w_term, w_sysmon, w_explorer],
-            z_order: [WIN_SYSMON, WIN_EXPLORER, WIN_TERMINAL],
+            windows: [w_term, w_sysmon, w_explorer, w_editor],
+            z_order: [WIN_EDITOR, WIN_SYSMON, WIN_EXPLORER, WIN_TERMINAL],
             drag_win: None,
             drag_offset_x: 0,
             drag_offset_y: 0,
@@ -300,6 +321,13 @@ impl DesktopCompositor {
             file_preview_is_hex: false,
             current_dir: [0; 32],
             current_dir_len: 0,
+            editor_buf: [0; 1024],
+            editor_len: 0,
+            editor_cursor: 0,
+            editor_filename: [0; 32],
+            editor_filename_len: 0,
+            editor_status: [0; 64],
+            editor_status_len: 0,
             free_ram_mib: 384,
             total_ram_mib: 512,
             heap_used_bytes: 48 * 1024,
@@ -328,6 +356,120 @@ impl DesktopCompositor {
         let len = bytes.len().min(self.current_dir.len());
         self.current_dir[..len].copy_from_slice(&bytes[..len]);
         self.current_dir_len = len;
+    }
+
+    pub fn set_editor_status(&mut self, status: &str) {
+        let bytes = status.as_bytes();
+        let len = bytes.len().min(self.editor_status.len());
+        self.editor_status[..len].copy_from_slice(&bytes[..len]);
+        self.editor_status_len = len;
+    }
+
+    pub fn editor_status_str(&self) -> &str {
+        if self.editor_status_len == 0 {
+            "Ready"
+        } else {
+            core::str::from_utf8(&self.editor_status[..self.editor_status_len]).unwrap_or("Ready")
+        }
+    }
+
+    pub fn editor_filename_str(&self) -> &str {
+        if self.editor_filename_len == 0 {
+            "UNNAMED.TXT"
+        } else {
+            core::str::from_utf8(&self.editor_filename[..self.editor_filename_len]).unwrap_or("UNNAMED.TXT")
+        }
+    }
+
+    pub fn open_file_in_editor(&mut self, filename: &str, content: &[u8]) {
+        self.editor_filename = [0; 32];
+        let flen = filename.len().min(31);
+        self.editor_filename[..flen].copy_from_slice(&filename.as_bytes()[..flen]);
+        self.editor_filename_len = flen;
+
+        self.editor_buf = [0; 1024];
+        let clen = content.len().min(1024);
+        self.editor_buf[..clen].copy_from_slice(&content[..clen]);
+        self.editor_len = clen;
+        self.editor_cursor = 0;
+
+        self.set_editor_status("File loaded");
+        self.windows[WIN_EDITOR].minimized = false;
+        self.windows[WIN_EDITOR].closed = false;
+        self.bring_to_front(WIN_EDITOR);
+    }
+
+    pub unsafe fn save_editor_file(
+        &mut self,
+        fat: Option<&FatVolume>,
+        mut dev: Option<&mut VirtIOBlockDevice>,
+        scratch_pa: u64,
+        scratch_va: u64,
+    ) {
+        if self.editor_filename_len == 0 {
+            self.set_editor_status("No filename");
+            return;
+        }
+
+        let filename = match core::str::from_utf8(&self.editor_filename[..self.editor_filename_len]) {
+            Ok(s) => s,
+            Err(_) => {
+                self.set_editor_status("Invalid filename");
+                return;
+            }
+        };
+
+        if let (Some(fat_vol), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+            match fat_vol.write_file(d, filename, &self.editor_buf[..self.editor_len], scratch_pa, scratch_va) {
+                Ok(()) => {
+                    self.set_editor_status("File saved OK");
+                    self.refresh_explorer(fat_vol, d, scratch_pa, scratch_va);
+                }
+                Err(_) => {
+                    self.set_editor_status("Error saving file");
+                }
+            }
+        } else {
+            self.set_editor_status("Filesystem not available");
+        }
+    }
+
+    pub fn handle_editor_key(&mut self, key: u8) {
+        if key == 8 || key == 127 {
+            // Backspace
+            if self.editor_cursor > 0 && self.editor_len > 0 {
+                let cur = self.editor_cursor;
+                for i in cur..self.editor_len {
+                    self.editor_buf[i - 1] = self.editor_buf[i];
+                }
+                self.editor_buf[self.editor_len - 1] = 0;
+                self.editor_cursor -= 1;
+                self.editor_len -= 1;
+                self.set_editor_status("Editing");
+            }
+        } else if key == b'\n' || key == b'\r' {
+            if self.editor_len < 1024 {
+                let cur = self.editor_cursor;
+                for i in (cur..self.editor_len).rev() {
+                    self.editor_buf[i + 1] = self.editor_buf[i];
+                }
+                self.editor_buf[cur] = b'\n';
+                self.editor_cursor += 1;
+                self.editor_len += 1;
+                self.set_editor_status("Editing");
+            }
+        } else if key >= 32 && key <= 126 {
+            if self.editor_len < 1024 {
+                let cur = self.editor_cursor;
+                for i in (cur..self.editor_len).rev() {
+                    self.editor_buf[i + 1] = self.editor_buf[i];
+                }
+                self.editor_buf[cur] = key;
+                self.editor_cursor += 1;
+                self.editor_len += 1;
+                self.set_editor_status("Editing");
+            }
+        }
     }
 
     pub fn append_term_line(&mut self, text: &str) {
@@ -638,6 +780,8 @@ impl DesktopCompositor {
                     self.toggle_or_focus(WIN_SYSMON);
                 } else if px >= 222 && px <= 296 {
                     self.toggle_or_focus(WIN_EXPLORER);
+                } else if px >= 302 && px <= 362 {
+                    self.toggle_or_focus(WIN_EDITOR);
                 }
             } else {
                 // Check windows in reverse Z-order (topmost first)
@@ -674,9 +818,35 @@ impl DesktopCompositor {
                             self.drag_win = Some(win_id);
                             self.drag_offset_x = px - win.x;
                             self.drag_offset_y = py - win.y;
+                        } else if win_id == WIN_EDITOR {
+                            // Check [SAVE] button
+                            let save_x = win.x + 8;
+                            let save_y = win.y + 24;
+                            if px >= save_x && px <= save_x + 60 && py >= save_y && py <= save_y + 20 {
+                                self.save_editor_file(fat, dev, scratch_pa, scratch_va);
+                            }
                         } else if win_id == WIN_EXPLORER {
-                            // Click in left file list
+                            // Check [OPEN IN EDITOR] button in right preview pane
                             let div_x = win.x + ((win.w as i32 * 38) / 100);
+                            let preview_box_w = (win.w as i32).saturating_sub((div_x - win.x) + 24);
+                            let btn_w = 120i32;
+                            let btn_x = preview_box_w.saturating_sub(btn_w + 8) + div_x + 12;
+                            let btn_y = win.y + 24;
+                            if px >= btn_x && px <= btn_x + btn_w && py >= btn_y && py <= btn_y + 18 {
+                                if self.selected_file < self.file_count && !self.files[self.selected_file].is_dir {
+                                    let entry = self.files[self.selected_file];
+                                    let fname = entry.name_str();
+                                    if let (Some(f), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+                                        let mut scratch_buf = [0u8; 1024];
+                                        if let Ok(bytes) = f.read_file(d, fname, scratch_pa, scratch_va, 1024, scratch_pa, scratch_va) {
+                                            core::ptr::copy_nonoverlapping(scratch_va as *const u8, scratch_buf.as_mut_ptr(), bytes.min(1024));
+                                            self.open_file_in_editor(fname, &scratch_buf[..bytes.min(1024)]);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Click in left file list
                             let rel_y = py - (win.y + 46);
                             if rel_y >= 0 && px < div_x {
                                 let clicked_idx = self.file_scroll + (rel_y / 15) as usize;
@@ -742,6 +912,11 @@ impl DesktopCompositor {
         scratch_pa: u64,
         scratch_va: u64,
     ) -> bool {
+        if self.windows[WIN_EDITOR].focused && !self.windows[WIN_EDITOR].closed && !self.windows[WIN_EDITOR].minimized {
+            self.handle_editor_key(key);
+            return true;
+        }
+
         if !self.windows[WIN_TERMINAL].focused || self.windows[WIN_TERMINAL].closed || self.windows[WIN_TERMINAL].minimized {
             return false;
         }
@@ -799,10 +974,23 @@ impl DesktopCompositor {
         match cmd {
             "help" => {
                 self.append_term_line("Commands: help, ls, cat, write, info,");
-                self.append_term_line("  ramstat, bench, clear, halt");
+                self.append_term_line("  ramstat, bench, lspci, clear, halt");
             }
             "clear" => {
                 self.term_line_count = 0;
+            }
+            "lspci" => {
+                let dev_count = unsafe { crate::drivers::pci::PCI_DEVICE_COUNT };
+                if dev_count == 0 {
+                    self.append_term_line("No PCIe devices discovered");
+                } else {
+                    for i in 0..dev_count {
+                        let dev = unsafe { &crate::drivers::pci::PCI_DEVICES[i] };
+                        let mut buf = [0u8; 128];
+                        let s = crate::drivers::pci::format_pci_device(dev, &mut buf);
+                        self.append_term_line(s);
+                    }
+                }
             }
             "info" => {
                 self.append_term_line("Genesis OS v0.16 (AArch64)");
@@ -1059,6 +1247,7 @@ impl DesktopCompositor {
         let term_open = !self.windows[WIN_TERMINAL].closed && !self.windows[WIN_TERMINAL].minimized;
         let sys_open = !self.windows[WIN_SYSMON].closed && !self.windows[WIN_SYSMON].minimized;
         let exp_open = !self.windows[WIN_EXPLORER].closed && !self.windows[WIN_EXPLORER].minimized;
+        let edit_open = !self.windows[WIN_EDITOR].closed && !self.windows[WIN_EDITOR].minimized;
 
         let btn_open_col = self.rgb(45, 62, 80);
         let btn_closed_col = self.rgb(24, 33, 47);
@@ -1074,6 +1263,10 @@ impl DesktopCompositor {
         self.draw_rect(222, 3, 74, 21, if exp_open { btn_open_col } else { btn_closed_col });
         self.draw_rect_outline(222, 3, 74, 21, col_border);
         self.draw_string(230, 9, "EXPLORER", if exp_open { col_cyan } else { col_muted }, None);
+
+        self.draw_rect(302, 3, 56, 21, if edit_open { btn_open_col } else { btn_closed_col });
+        self.draw_rect_outline(302, 3, 56, 21, col_border);
+        self.draw_string(312, 9, "EDIT", if edit_open { col_cyan } else { col_muted }, None);
 
         // Right Taskbar Stats (Uptime, SMP, RAM)
         let mut up_buf = [0u8; 16];
@@ -1296,6 +1489,15 @@ impl DesktopCompositor {
                     self.draw_rect(px, cy + 18, preview_box_w, preview_box_h, self.rgb(18, 24, 38));
                     self.draw_rect_outline(px, cy + 18, preview_box_w, preview_box_h, col_border);
 
+                    if file_count > 0 && selected < file_count && !files[selected].is_dir {
+                        let btn_w = 120u32;
+                        let btn_h = 16u32;
+                        let btn_x = preview_box_w.saturating_sub(btn_w + 8) + px;
+                        self.draw_rect(btn_x, cy + 2, btn_w, btn_h, self.rgb(37, 99, 235));
+                        self.draw_rect_outline(btn_x, cy + 2, btn_w, btn_h, col_border);
+                        self.draw_string(btn_x + 6, cy + 6, "[OPEN IN EDITOR]", col_white, None);
+                    }
+
                     if file_count > 0 && selected < file_count {
                         let entry = &files[selected];
                         // File info header
@@ -1347,6 +1549,102 @@ impl DesktopCompositor {
                         self.draw_string(px + 8, cy + 70, status_str, col_muted, None);
                     } else {
                         self.draw_string(px + 8, cy + 28, "No file selected", col_muted, None);
+                    }
+                }
+                WIN_EDITOR => {
+                    let mut fn_buf = [0u8; 32];
+                    let fn_len = self.editor_filename_len.min(32);
+                    fn_buf[..fn_len].copy_from_slice(&self.editor_filename[..fn_len]);
+                    let fn_str = if fn_len == 0 {
+                        "UNNAMED.TXT"
+                    } else {
+                        core::str::from_utf8(&fn_buf[..fn_len]).unwrap_or("UNNAMED.TXT")
+                    };
+
+                    let mut st_buf = [0u8; 64];
+                    let st_len = self.editor_status_len.min(64);
+                    st_buf[..st_len].copy_from_slice(&self.editor_status[..st_len]);
+                    let status_s = if st_len == 0 {
+                        "Ready"
+                    } else {
+                        core::str::from_utf8(&st_buf[..st_len]).unwrap_or("Ready")
+                    };
+
+                    let ed_cursor = self.editor_cursor;
+                    let ed_len = self.editor_len;
+                    let ed_buf = self.editor_buf;
+
+                    // Header toolbar: [SAVE] button and filename
+                    let save_w = 52u32;
+                    let save_h = 18u32;
+                    self.draw_rect(cx, cy, save_w, save_h, self.rgb(22, 101, 52)); // Green-800
+                    self.draw_rect_outline(cx, cy, save_w, save_h, col_green);
+                    self.draw_string(cx + 8, cy + 5, "[SAVE]", col_white, None);
+                    self.draw_string(cx + save_w + 12, cy + 5, fn_str, col_cyan, None);
+
+                    // Text area box
+                    let text_box_y = cy + save_h + 6;
+                    let text_box_w = win.w.saturating_sub(24);
+                    let text_box_h = win.h.saturating_sub(save_h + 46);
+                    self.draw_rect(cx, text_box_y, text_box_w, text_box_h, self.rgb(15, 23, 42));
+                    self.draw_rect_outline(cx, text_box_y, text_box_w, text_box_h, col_border);
+
+                    // Render lines of text in editor_buf
+                    let mut row = 0u32;
+                    let mut col = 0u32;
+                    let max_rows = (text_box_h.saturating_sub(8) / 12).min(16);
+                    let text_x = cx + 8;
+                    let text_y = text_box_y + 6;
+
+                    let mut line_buf = [0u8; 64];
+                    let mut line_len = 0usize;
+                    let buf_slice = &ed_buf[..ed_len];
+
+                    for (idx, &byte) in buf_slice.iter().enumerate() {
+                        if idx == ed_cursor && win.focused && row < max_rows {
+                            self.draw_rect(text_x + col * 8, text_y + row * 12, 2, 10, col_yellow);
+                        }
+
+                        if byte == b'\n' {
+                            if row < max_rows && line_len > 0 {
+                                if let Ok(s) = core::str::from_utf8(&line_buf[..line_len]) {
+                                    self.draw_string(text_x, text_y + row * 12, s, col_white, None);
+                                }
+                            }
+                            row += 1;
+                            col = 0;
+                            line_len = 0;
+                        } else if byte >= 32 && byte <= 126 {
+                            if line_len < 64 {
+                                line_buf[line_len] = byte;
+                                line_len += 1;
+                            }
+                            col += 1;
+                        }
+                    }
+                    if row < max_rows && line_len > 0 {
+                        if let Ok(s) = core::str::from_utf8(&line_buf[..line_len]) {
+                            self.draw_string(text_x, text_y + row * 12, s, col_white, None);
+                        }
+                    }
+                    if ed_cursor == ed_len && win.focused && row < max_rows {
+                        self.draw_rect(text_x + col * 8, text_y + row * 12, 2, 10, col_yellow);
+                    }
+
+                    // Status bar at bottom of editor window
+                    let status_y = text_box_y + text_box_h + 4;
+                    self.draw_string(cx, status_y, status_s, col_muted, None);
+
+                    let mut pos_buf = [0u8; 32];
+                    let mut pp = 0;
+                    let pos_pre = b"Len: ";
+                    pos_buf[pp..pp + pos_pre.len()].copy_from_slice(pos_pre); pp += pos_pre.len();
+                    pp += write_u64_to_buf(ed_len as u64, &mut pos_buf[pp..]);
+                    let pos_mid = b" B | Pos: ";
+                    pos_buf[pp..pp + pos_mid.len()].copy_from_slice(pos_mid); pp += pos_mid.len();
+                    pp += write_u64_to_buf(ed_cursor as u64, &mut pos_buf[pp..]);
+                    if let Ok(pos_s) = core::str::from_utf8(&pos_buf[..pp]) {
+                        self.draw_string(cx + text_box_w.saturating_sub(140), status_y, pos_s, col_muted, None);
                     }
                 }
                 _ => {}
@@ -1406,6 +1704,9 @@ pub unsafe fn run_desktop_gui(
 
     comp.render_frame(&pointer);
     comp.blit(fb);
+    if let Some(gpu_ptr) = crate::drivers::virtio_gpu::get_global_virtio_gpu() {
+        let _ = (*gpu_ptr).flush();
+    }
 
     loop {
         let mut need_render = false;
@@ -1419,7 +1720,7 @@ pub unsafe fn run_desktop_gui(
         }
 
         if let Some(key) = poll_global_virtio_input() {
-            if key == 27 || (key == b'q' && !comp.windows[WIN_TERMINAL].focused) {
+            if key == 27 || (key == b'q' && !comp.windows[WIN_TERMINAL].focused && !comp.windows[WIN_EDITOR].focused) {
                 break;
             }
             if comp.handle_key_ctx(key, fat, dev.as_deref_mut(), scratch_pa, scratch_va) {
@@ -1430,7 +1731,7 @@ pub unsafe fn run_desktop_gui(
         let rx_status = core::ptr::read_volatile((uart_va + 0x018) as *const u32);
         if (rx_status & (1 << 4)) == 0 {
             let byte = core::ptr::read_volatile(uart_va as *const u32) as u8;
-            if byte == 27 || (byte == b'q' && !comp.windows[WIN_TERMINAL].focused) {
+            if byte == 27 || (byte == b'q' && !comp.windows[WIN_TERMINAL].focused && !comp.windows[WIN_EDITOR].focused) {
                 break;
             }
             if comp.handle_key_ctx(byte, fat, dev.as_deref_mut(), scratch_pa, scratch_va) {
@@ -1446,6 +1747,9 @@ pub unsafe fn run_desktop_gui(
 
             comp.render_frame(&pointer);
             comp.blit(fb);
+            if let Some(gpu_ptr) = crate::drivers::virtio_gpu::get_global_virtio_gpu() {
+                let _ = (*gpu_ptr).flush();
+            }
         }
 
         for _ in 0..10_000 {
@@ -1468,7 +1772,7 @@ mod tests {
         let va = mock_buf.as_mut_ptr() as u64;
 
         let mut comp = DesktopCompositor::new(va, 800, 600, 800, 1);
-        assert_eq!(comp.windows.len(), 3);
+        assert_eq!(comp.windows.len(), 4);
         assert_eq!(comp.z_order[WINDOW_COUNT - 1], WIN_TERMINAL);
         assert!(comp.windows[WIN_TERMINAL].focused);
         assert!(!comp.windows[WIN_SYSMON].focused);
@@ -1666,5 +1970,51 @@ mod tests {
         let preview_str = core::str::from_utf8(&comp.file_preview[..comp.file_preview_len]).unwrap();
         assert_eq!(preview_str, "7F 45 4C 46 02 01 01 00");
         assert!(comp.file_preview_is_hex);
+    }
+
+    #[test]
+    fn compositor_editor_typing_and_backspace_test() {
+        let mut mock_buf = vec![0u8; 800 * 600 * 4];
+        let va = mock_buf.as_mut_ptr() as u64;
+        let mut comp = DesktopCompositor::new(va, 800, 600, 800, 1);
+
+        comp.toggle_or_focus(WIN_EDITOR);
+        assert!(comp.windows[WIN_EDITOR].focused);
+        assert!(!comp.windows[WIN_EDITOR].minimized);
+
+        assert!(comp.handle_key(b'H'));
+        assert!(comp.handle_key(b'i'));
+        assert_eq!(&comp.editor_buf[..comp.editor_len], b"Hi");
+        assert_eq!(comp.editor_cursor, 2);
+
+        // Insert newline
+        assert!(comp.handle_key(b'\n'));
+        assert!(comp.handle_key(b'A'));
+        assert_eq!(&comp.editor_buf[..comp.editor_len], b"Hi\nA");
+        assert_eq!(comp.editor_cursor, 4);
+
+        // Backspace
+        assert!(comp.handle_key(0x08));
+        assert_eq!(&comp.editor_buf[..comp.editor_len], b"Hi\n");
+        assert_eq!(comp.editor_cursor, 3);
+    }
+
+    #[test]
+    fn compositor_editor_open_and_save_test() {
+        let mut mock_buf = vec![0u8; 800 * 600 * 4];
+        let va = mock_buf.as_mut_ptr() as u64;
+        let mut comp = DesktopCompositor::new(va, 800, 600, 800, 1);
+
+        comp.open_file_in_editor("MYNOTE.TXT", b"Genesis Stage 17");
+        assert_eq!(comp.editor_filename_str(), "MYNOTE.TXT");
+        assert_eq!(&comp.editor_buf[..comp.editor_len], b"Genesis Stage 17");
+        assert_eq!(comp.editor_len, 16);
+        assert!(comp.windows[WIN_EDITOR].focused);
+        assert!(!comp.windows[WIN_EDITOR].minimized);
+
+        // Type at cursor 0
+        comp.handle_editor_key(b'>');
+        assert_eq!(&comp.editor_buf[..comp.editor_len], b">Genesis Stage 17");
+        assert_eq!(comp.editor_len, 17);
     }
 }

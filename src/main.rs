@@ -16,13 +16,14 @@ use genesis_stage1::{
         SMP_MICRO_LLM_WEIGHTS, SMP_NN_CTX, SMP_TRANSFORMER_CTX,
     },
     arch::{
-        dispatch_smp_work, parse_fdt_devices, psci_cpu_on, secondary_boot_stub, secondary_main,
+        dispatch_smp_work, parse_fdt_devices, parse_fdt_pci, psci_cpu_on, secondary_boot_stub, secondary_main,
         serial_read_line, stage4_arm_timer_interval, stage4_arm_timer_ticks,
         stage4_get_ticks, stage4_init_runtime, stage4_vectors_va, ArmTimer, Gicv3,
         SecondaryBootArgs, ONLINE_CPUS,
     },
     drivers::{
-        global_fb_console_write, register_global_fb_console, update_workspace_telemetry,
+        global_fb_console_write, pci::{find_pci_device, scan_bus_0, PCI_BAR_VA_BASE, PCI_ECAM_DEFAULT_BASE, PCI_ECAM_VA_BASE},
+        register_global_fb_console, update_workspace_telemetry, virtio_gpu::{register_global_virtio_gpu, VirtIOGpuDevice},
         virtio_input::VirtIOInputDevice, write_u64, FbConsole, Framebuffer, VirtIOBlockDevice,
         VirtIONetDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC,
     },
@@ -1431,6 +1432,54 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         let req_pa = mapper.pmm_mut().allocate_page().unwrap();
         let req_va = HHDM_BASE + req_pa;
 
+        // Stage 17A: PCIe ECAM Bus Enumeration
+        let fdt_pci = if !fdt_ptr.is_null() {
+            parse_fdt_pci(fdt_ptr, fdt_size)
+        } else {
+            None
+        };
+        let pci_ecam_pa = match fdt_pci {
+            Some(p) => p.ecam_base,
+            None => PCI_ECAM_DEFAULT_BASE,
+        };
+
+        if let Err(e) = mapper.map_mmio_range(PCI_ECAM_VA_BASE, pci_ecam_pa, 256) {
+            serial_write(uart, b"STAGE17_MAP_PCI_ECAM_FAIL: ");
+            serial_hex(uart, e.code());
+            serial_write(uart, b"\r\n");
+        } else {
+            let pci_dev_count = scan_bus_0(PCI_ECAM_VA_BASE);
+            serial_write(uart, b"GENESIS: pcie bus 0 scanned (devices=");
+            serial_decimal(uart, pci_dev_count as u64);
+            serial_write(uart, b")\r\n");
+        }
+
+        // Stage 17B: Probe VirtIO-GPU 2D Driver over VirtIO-PCI (0x1AF4:0x1050)
+        let mut virtio_gpu_opt: Option<VirtIOGpuDevice> = None;
+        if let Some(gpu_pci_dev) = find_pci_device(0x1AF4, 0x1050) {
+            serial_write(uart, b"GENESIS: virtio-gpu pci device detected at 00:");
+            serial_decimal(uart, gpu_pci_dev.dev as u64);
+            serial_write(uart, b".0\r\n");
+
+            let bar_pa = if gpu_pci_dev.bars[1] != 0 {
+                gpu_pci_dev.bars[1]
+            } else if gpu_pci_dev.bars[0] != 0 {
+                gpu_pci_dev.bars[0]
+            } else {
+                0
+            };
+
+            if bar_pa != 0 {
+                if let Ok(()) = mapper.map_mmio_range(PCI_BAR_VA_BASE, bar_pa, 64) {
+                    let mut gpu_dev = VirtIOGpuDevice::empty();
+                    if let Ok(()) = gpu_dev.init(&gpu_pci_dev, mapper.pmm_mut(), HHDM_BASE, PCI_BAR_VA_BASE) {
+                        serial_write(uart, b"GENESIS: virtio-gpu controlq initialized ok\r\n");
+                        virtio_gpu_opt = Some(gpu_dev);
+                    }
+                }
+            }
+        }
+
         let sig = match blk_dev.read_sector_0(req_pa, req_va) {
             Ok(s) => s,
             Err(e) => {
@@ -1605,6 +1654,12 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             fb_console.clear();
             register_global_fb_console(fb_console);
             fb_opt = Some(fb);
+            if let (Some(gpu), Some(fb)) = (virtio_gpu_opt.as_mut(), fb_opt.as_ref()) {
+                if let Ok(()) = gpu.init_2d_scanout(fb.width, fb.height, handoff.fb_base) {
+                    serial_write(uart, b"GENESIS: virtio-gpu 2d scanout initialized ok\r\n");
+                    register_global_virtio_gpu(gpu as *mut VirtIOGpuDevice);
+                }
+            }
             serial_write(uart, b"GENESIS: stage8 framebuffer initialized ok\r\n");
         } else {
             serial_write(uart, b"GENESIS: stage8 framebuffer skipped (headless mode)\r\n");
@@ -1798,6 +1853,58 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         }
         serial_write(uart, b"GENESIS: stage16 milestone complete\r\n");
 
+        // 13. Stage 17 Automated Smoke-Test & Verification (PCIe ECAM, VirtIO-GPU, & WIN_EDITOR)
+        serial_write(uart, b"GENESIS: stage17 starting (pcie ecam, virtio-gpu & gui editor)\r\n");
+
+        // Shell command lspci verification
+        shell.execute_command("lspci");
+
+        if backbuf_va != 0 {
+            use genesis_stage1::ui::{DesktopCompositor, PointerState, WIN_EDITOR};
+            let fb_w = if let Some(ref fb) = shell.fb { fb.width } else { 800 };
+            let fb_h = if let Some(ref fb) = shell.fb { fb.height } else { 600 };
+            let fb_stride = if let Some(ref fb) = shell.fb { fb.stride } else { 800 };
+            let fb_fmt = if let Some(ref fb) = shell.fb { fb.pixel_format } else { 1 };
+
+            let mut comp = DesktopCompositor::new(backbuf_va, fb_w, fb_h, fb_stride, fb_fmt);
+            comp.free_ram_mib = free_ram_mib;
+            comp.total_ram_mib = total_ram_mib;
+            comp.heap_used_bytes = HEAP_ALLOCATOR.allocated_bytes();
+            comp.heap_total_bytes = HEAP_ALLOCATOR.total_bytes();
+            comp.cpus_online = ONLINE_CPUS.load(Ordering::Relaxed) as u64;
+
+            // Test opening file in editor
+            comp.open_file_in_editor("EDITOR_NOTE.TXT", b"Genesis Stage 17 Text Editor Test");
+            assert_eq!(comp.editor_len, 33);
+            assert!(comp.windows[WIN_EDITOR].focused);
+
+            // Test typing in editor
+            comp.handle_editor_key(b'!');
+            assert_eq!(comp.editor_len, 34);
+
+            // Test saving file from editor to FAT32
+            comp.save_editor_file(shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
+
+            // Test GUI Terminal lspci
+            comp.execute_term_command("lspci", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
+
+            // Render frame and blit
+            let ptr_center = PointerState { x: (fb_w / 2) as i32, y: (fb_h / 2) as i32, left_button: false, right_button: false };
+            comp.render_frame(&ptr_center);
+            if let Some(ref mut fb) = shell.fb {
+                comp.blit(fb);
+            }
+
+            // If VirtIO-GPU was initialized and scanout attached, flush test
+            if let Some(ref mut gpu) = virtio_gpu_opt {
+                let _ = gpu.flush();
+            }
+
+            serial_write(uart, b"GENESIS: stage17 pcie & editor ok\r\n");
+        }
+
+        serial_write(uart, b"GENESIS: stage17 milestone complete\r\n");
+
         // Auto-Boot to Desktop in GUI Mode:
         // When GOP framebuffer is active (e.g. ./tools/run-qemu-gui.sh), launch GUI.
         // In headless mode (./tools/run-qemu.sh), shell.fb is None, so drop straight to serial genesis> shell.
@@ -1814,8 +1921,8 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             );
         }
 
-        // 13. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 16)\r\n");
+        // 14. Interactive Prompt Loop
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 17)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {

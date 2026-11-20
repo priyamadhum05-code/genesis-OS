@@ -11,7 +11,7 @@ pub use exceptions::{
     stage4_arm_timer_interval, stage4_arm_timer_ticks, stage4_get_ticks, stage4_init_runtime,
     stage4_vectors_va, TrapFrame,
 };
-pub use fdt::{parse_fdt_devices, FdtGicInfo, FdtTimerInfo};
+pub use fdt::{parse_fdt_devices, parse_fdt_pci, FdtGicInfo, FdtPciInfo, FdtTimerInfo};
 pub use gic::{acknowledge_irq, end_of_irq, Gicv3};
 pub use psci::{
     dispatch_smp_work, psci_cpu_on, psci_system_off, secondary_boot_stub, secondary_main,
