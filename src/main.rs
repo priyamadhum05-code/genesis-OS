@@ -269,15 +269,51 @@ pub extern "efiapi" fn efi_main(image: usize, system_table: *mut SystemTable) ->
         if gop_status == EFI_SUCCESS && !gop.is_null() {
             let mode_ptr = (*gop).mode;
             if !mode_ptr.is_null() {
-                let mode = &*mode_ptr;
-                if mode.frame_buffer_base != 0 && mode.frame_buffer_size != 0 && !mode.info.is_null() {
-                    let info = &*mode.info;
-                    fb_base = mode.frame_buffer_base;
-                    fb_size = mode.frame_buffer_size as u64;
-                    fb_width = info.horizontal_resolution;
-                    fb_height = info.vertical_resolution;
-                    fb_stride = info.pixels_per_scan_line;
-                    fb_pixel_format = info.pixel_format;
+                if (*gop).query_mode != 0 && (*gop).set_mode != 0 {
+                    type EfiGopQueryMode = extern "efiapi" fn(*mut EfiGraphicsOutputProtocol, u32, *mut usize, *mut *mut EfiGraphicsOutputModeInformation) -> usize;
+                    type EfiGopSetMode = extern "efiapi" fn(*mut EfiGraphicsOutputProtocol, u32) -> usize;
+                    let query_mode_fn: EfiGopQueryMode = core::mem::transmute((*gop).query_mode);
+                    let set_mode_fn: EfiGopSetMode = core::mem::transmute((*gop).set_mode);
+                    let max_modes = (*mode_ptr).max_mode;
+                    let current_mode = (*mode_ptr).mode;
+                    let mut best_mode = current_mode;
+                    let mut best_score = 0u32;
+                    for m in 0..max_modes {
+                        let mut info_size: usize = 0;
+                        let mut info_ptr: *mut EfiGraphicsOutputModeInformation = ptr::null_mut();
+                        let q_status = query_mode_fn(gop, m, &mut info_size, &mut info_ptr);
+                        if q_status == EFI_SUCCESS && !info_ptr.is_null() {
+                            let info = &*info_ptr;
+                            if info.pixel_format == 0 || info.pixel_format == 1 {
+                                let (w, h) = (info.horizontal_resolution, info.vertical_resolution);
+                                let score = if w == 1280 && h == 800 { 30 }
+                                            else if w == 1024 && h == 768 { 20 }
+                                            else if (w == 1280 && h == 720) || (w == 1280 && h == 1024) { 15 }
+                                            else if w == 800 && h == 600 { 10 }
+                                            else { 1 };
+                                if score > best_score {
+                                    best_score = score;
+                                    best_mode = m;
+                                }
+                            }
+                        }
+                    }
+                    if best_score > 0 && best_mode != current_mode {
+                        let _ = set_mode_fn(gop, best_mode);
+                    }
+                }
+                let final_mode_ptr = (*gop).mode;
+                if !final_mode_ptr.is_null() {
+                    let mode = &*final_mode_ptr;
+                    if mode.frame_buffer_base != 0 && mode.frame_buffer_size != 0 && !mode.info.is_null() {
+                        let info = &*mode.info;
+                        fb_base = mode.frame_buffer_base;
+                        fb_size = mode.frame_buffer_size as u64;
+                        fb_width = info.horizontal_resolution;
+                        fb_height = info.vertical_resolution;
+                        fb_stride = info.pixels_per_scan_line;
+                        fb_pixel_format = info.pixel_format;
+                    }
                 }
             }
         }
@@ -1574,8 +1610,14 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             serial_write(uart, b"GENESIS: stage8 framebuffer skipped (headless mode)\r\n");
         }
 
-        // Stage 15C: Allocate Write-Back Cached Framebuffer Backbuffer (1.92 MiB = 480 pages)
-        let backbuf_pa = mapper.pmm_mut().allocate_contiguous_pages(480).unwrap_or(0);
+        // Stage 15C & 16: Allocate Dynamic Write-Back Cached Framebuffer Backbuffer
+        let backbuf_bytes = if let Some(ref fb) = fb_opt {
+            (fb.stride as usize * fb.height as usize * 4).max(800 * 600 * 4)
+        } else {
+            800 * 600 * 4
+        };
+        let backbuf_pages = (backbuf_bytes + 4095) / 4096;
+        let backbuf_pa = mapper.pmm_mut().allocate_contiguous_pages(backbuf_pages).unwrap_or(0);
         let backbuf_va = if backbuf_pa != 0 { HHDM_BASE + backbuf_pa } else { 0 };
         genesis_stage1::ui::register_global_backbuffer(backbuf_va);
 
@@ -1717,8 +1759,63 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             serial_write(uart, b"GENESIS: stage15 milestone complete\r\n");
         }
 
-        // 12. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 15)\r\n");
+        // 12. Stage 16 Automated Smoke-Test & Verification (Real Desktop Kernel Wiring & Dynamic GOP)
+        serial_write(uart, b"GENESIS: stage16 starting (real desktop kernel wiring & dynamic gop)\r\n");
+        if backbuf_va != 0 {
+            use genesis_stage1::ui::{DesktopCompositor, PointerState};
+            let fb_w = if let Some(ref fb) = shell.fb { fb.width } else { 800 };
+            let fb_h = if let Some(ref fb) = shell.fb { fb.height } else { 600 };
+            let fb_stride = if let Some(ref fb) = shell.fb { fb.stride } else { 800 };
+            let fb_fmt = if let Some(ref fb) = shell.fb { fb.pixel_format } else { 1 };
+
+            let mut comp = DesktopCompositor::new(backbuf_va, fb_w, fb_h, fb_stride, fb_fmt);
+            comp.free_ram_mib = free_ram_mib;
+            comp.total_ram_mib = total_ram_mib;
+            comp.heap_used_bytes = HEAP_ALLOCATOR.allocated_bytes();
+            comp.heap_total_bytes = HEAP_ALLOCATOR.total_bytes();
+            comp.cpus_online = ONLINE_CPUS.load(Ordering::Relaxed) as u64;
+
+            if let (Some(f), Some(ref mut d)) = (shell.fat, shell.dev.as_deref_mut()) {
+                comp.refresh_explorer(f, d, scratch_pa, scratch_va);
+            }
+
+            comp.execute_term_command("help", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
+            comp.execute_term_command("info", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
+            comp.execute_term_command("ramstat", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
+            comp.execute_term_command("bench", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
+            comp.execute_term_command("ls", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
+            comp.execute_term_command("cat TEST.TXT", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
+            comp.execute_term_command("write GUI_NOTE.TXT genesis stage 16 desktop", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
+
+            assert!(comp.file_count > 0);
+
+            let ptr_center = PointerState { x: (fb_w / 2) as i32, y: (fb_h / 2) as i32, left_button: false, right_button: false };
+            comp.render_frame(&ptr_center);
+            if let Some(ref mut fb) = shell.fb {
+                comp.blit(fb);
+            }
+            serial_write(uart, b"GENESIS: stage16 desktop kernel wiring ok\r\n");
+        }
+        serial_write(uart, b"GENESIS: stage16 milestone complete\r\n");
+
+        // Auto-Boot to Desktop in GUI Mode:
+        // When GOP framebuffer is active (e.g. ./tools/run-qemu-gui.sh), launch GUI.
+        // In headless mode (./tools/run-qemu.sh), shell.fb is None, so drop straight to serial genesis> shell.
+        if let Some(fb) = shell.fb.as_deref_mut() {
+            genesis_stage1::ui::run_desktop_gui(
+                fb,
+                uart,
+                shell.fat,
+                shell.dev.as_deref_mut(),
+                scratch_pa,
+                scratch_va,
+                free_ram_mib,
+                total_ram_mib,
+            );
+        }
+
+        // 13. Interactive Prompt Loop
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 16)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {
