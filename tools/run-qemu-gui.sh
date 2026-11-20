@@ -27,6 +27,9 @@ exec "$QEMU" -machine virt-11.1,gic-version=3 -cpu cortex-a76 -smp "${QEMU_SMP:-
   -device virtio-tablet-device \
   -device ramfb \
   -device virtio-gpu-pci \
+  -device qemu-xhci,id=xhci \
+  -device usb-kbd \
+  -device usb-mouse \
   -serial stdio \
   -monitor unix:build/qemu-monitor.sock,server=on,wait=off \
   -display default -no-reboot "$@"

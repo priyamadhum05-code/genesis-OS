@@ -22,10 +22,11 @@ use genesis_stage1::{
         SecondaryBootArgs, ONLINE_CPUS,
     },
     drivers::{
-        global_fb_console_write, pci::{find_pci_device, scan_bus_0, PCI_BAR_VA_BASE, PCI_ECAM_DEFAULT_BASE, PCI_ECAM_VA_BASE},
+        global_fb_console_write, pci::{find_pci_by_class, find_pci_device, pci_enable_bus_master, scan_bus_0, PCI_BAR_VA_BASE, PCI_ECAM_DEFAULT_BASE, PCI_ECAM_VA_BASE},
         register_global_fb_console, update_workspace_telemetry, virtio_gpu::{register_global_virtio_gpu, VirtIOGpuDevice},
         virtio_input::VirtIOInputDevice, write_u64, FbConsole, Framebuffer, VirtIOBlockDevice,
         VirtIONetDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC,
+        xhci::{get_global_xhci_ref, register_global_xhci, XhciDevice, XHCI_MMIO_VA_BASE},
     },
     fs::{locate_volume, FatVolume},
     memory_map,
@@ -1480,6 +1481,40 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             }
         }
 
+        // Stage 18: Probe PCIe USB 3.0 xHCI Controller (0x0C:0x03:0x30)
+        let mut _xhci_detected = false;
+        if let Some(xhci_pci_dev) = find_pci_by_class(0x0C, 0x03, 0x30) {
+            serial_write(uart, b"GENESIS: pcie xhci controller detected at 00:");
+            serial_decimal(uart, xhci_pci_dev.dev as u64);
+            serial_write(uart, b".");
+            serial_decimal(uart, xhci_pci_dev.func as u64);
+            serial_write(uart, b"\r\n");
+
+            // Enable PCI Bus Master and Memory Space
+            pci_enable_bus_master(PCI_ECAM_VA_BASE, xhci_pci_dev.bus, xhci_pci_dev.dev, xhci_pci_dev.func);
+
+            let bar0_pa = xhci_pci_dev.bars[0];
+            if bar0_pa != 0 {
+                let bar_pages = ((xhci_pci_dev.bar_sizes[0].max(65536) + 4095) / 4096) as usize;
+                if let Ok(()) = mapper.map_mmio_range(XHCI_MMIO_VA_BASE, bar0_pa, bar_pages) {
+                    let mut xhci_dev = XhciDevice::empty();
+                    if let Ok(()) = xhci_dev.init(&xhci_pci_dev, mapper.pmm_mut(), HHDM_BASE, XHCI_MMIO_VA_BASE) {
+                        serial_write(uart, b"GENESIS: xhci controller initialized (version=0x");
+                        serial_hex(uart, xhci_dev.hciversion as u64);
+                        serial_write(uart, b", ports=");
+                        serial_decimal(uart, xhci_dev.max_ports as u64);
+                        serial_write(uart, b")\r\n");
+                        register_global_xhci(xhci_dev);
+                        _xhci_detected = true;
+                    } else {
+                        serial_write(uart, b"GENESIS: xhci init returned error\r\n");
+                    }
+                } else {
+                    serial_write(uart, b"GENESIS: xhci bar0 map failed\r\n");
+                }
+            }
+        }
+
         let sig = match blk_dev.read_sector_0(req_pa, req_va) {
             Ok(s) => s,
             Err(e) => {
@@ -1885,8 +1920,9 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             // Test saving file from editor to FAT32
             comp.save_editor_file(shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
 
-            // Test GUI Terminal lspci
+            // Test GUI Terminal lspci & lsusb
             comp.execute_term_command("lspci", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
+            comp.execute_term_command("lsusb", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
 
             // Render frame and blit
             let ptr_center = PointerState { x: (fb_w / 2) as i32, y: (fb_h / 2) as i32, left_button: false, right_button: false };
@@ -1905,6 +1941,20 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
 
         serial_write(uart, b"GENESIS: stage17 milestone complete\r\n");
 
+        // Stage 18: PCIe USB 3.0 xHCI Controller Driver
+        serial_write(uart, b"GENESIS: stage18 starting (pcie usb 3.0 xhci controller)\r\n");
+        if let Some(xhci) = get_global_xhci_ref() {
+            shell.execute_command("lsusb");
+            if xhci.noop_success {
+                serial_write(uart, b"GENESIS: stage18 xhci ok\r\n");
+            } else {
+                serial_write(uart, b"GENESIS: stage18 xhci failed (noop)\r\n");
+            }
+        } else {
+            serial_write(uart, b"GENESIS: stage18 xhci skipped (no controller)\r\n");
+        }
+        serial_write(uart, b"GENESIS: stage18 milestone complete\r\n");
+
         // Auto-Boot to Desktop in GUI Mode:
         // When GOP framebuffer is active (e.g. ./tools/run-qemu-gui.sh), launch GUI.
         // In headless mode (./tools/run-qemu.sh), shell.fb is None, so drop straight to serial genesis> shell.
@@ -1922,7 +1972,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         }
 
         // 14. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 17)\r\n");
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 18)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {

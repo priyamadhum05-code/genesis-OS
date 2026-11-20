@@ -974,7 +974,7 @@ impl DesktopCompositor {
         match cmd {
             "help" => {
                 self.append_term_line("Commands: help, ls, cat, write, info,");
-                self.append_term_line("  ramstat, bench, lspci, clear, halt");
+                self.append_term_line("  ramstat, bench, lspci, lsusb, clear, halt");
             }
             "clear" => {
                 self.term_line_count = 0;
@@ -990,6 +990,36 @@ impl DesktopCompositor {
                         let s = crate::drivers::pci::format_pci_device(dev, &mut buf);
                         self.append_term_line(s);
                     }
+                }
+            }
+            "lsusb" => {
+                if let Some(xhci) = unsafe { crate::drivers::xhci::get_global_xhci_ref() } {
+                    self.append_term_line("=== xHCI USB 3.0 Host Controller ===");
+                    let mut line_buf = [0u8; 96];
+                    let s = crate::drivers::xhci::format_xhci_info(xhci, &mut line_buf);
+                    self.append_term_line(s);
+
+                    if xhci.noop_success {
+                        self.append_term_line("Command Ring: NOOP verified (Success)");
+                    } else {
+                        self.append_term_line("Command Ring: NOOP not verified");
+                    }
+                    let mut dev_count = 0;
+                    for p in 1..=xhci.max_ports {
+                        if let Some(info) = unsafe { xhci.read_port_status(p) } {
+                            let mut p_buf = [0u8; 96];
+                            let ps = crate::drivers::xhci::format_port_status(&info, &mut p_buf);
+                            if info.connected {
+                                dev_count += 1;
+                                self.append_term_line(ps);
+                            }
+                        }
+                    }
+                    if dev_count == 0 {
+                        self.append_term_line("No USB devices attached to root ports");
+                    }
+                } else {
+                    self.append_term_line("No xHCI USB controller detected");
                 }
             }
             "info" => {
@@ -1938,6 +1968,8 @@ mod tests {
             comp.execute_term_command("info", None, None, 0, 0);
             comp.execute_term_command("ramstat", None, None, 0, 0);
             comp.execute_term_command("bench", None, None, 0, 0);
+            comp.execute_term_command("lspci", None, None, 0, 0);
+            comp.execute_term_command("lsusb", None, None, 0, 0);
 
             comp.execute_term_command("clear", None, None, 0, 0);
             assert_eq!(comp.term_line_count, 0);

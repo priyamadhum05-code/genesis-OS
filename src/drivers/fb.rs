@@ -64,8 +64,12 @@ impl Framebuffer {
                     "ldp q2, q3, [{src}, #32]",
                     "stp q0, q1, [{dst}]",
                     "stp q2, q3, [{dst}, #32]",
-                    src = inout(reg) src => _,
-                    dst = inout(reg) dst => _,
+                    src = in(reg) src,
+                    dst = in(reg) dst,
+                    out("v0") _,
+                    out("v1") _,
+                    out("v2") _,
+                    out("v3") _,
                     options(nostack)
                 );
                 src = src.add(64);

@@ -311,6 +311,25 @@ pub unsafe fn find_pci_device(vendor_id: u16, device_id: u16) -> Option<PciDevic
     None
 }
 
+/// Find a device by class_code, subclass, and prog_if
+pub unsafe fn find_pci_by_class(class_code: u8, subclass: u8, prog_if: u8) -> Option<PciDeviceInfo> {
+    for i in 0..PCI_DEVICE_COUNT {
+        if PCI_DEVICES[i].class_code == class_code
+            && PCI_DEVICES[i].subclass == subclass
+            && PCI_DEVICES[i].prog_if == prog_if
+        {
+            return Some(PCI_DEVICES[i]);
+        }
+    }
+    None
+}
+
+/// Enable PCI Memory Space (bit 1) and Bus Master (bit 2)
+pub unsafe fn pci_enable_bus_master(ecam_va: u64, bus: u8, dev: u8, func: u8) {
+    let cmd = pci_read_u16(ecam_va, bus, dev, func, 0x04);
+    pci_write_u16(ecam_va, bus, dev, func, 0x04, cmd | 0x0006);
+}
+
 /// Return human-readable class description
 pub fn pci_class_description(class_code: u8, subclass: u8) -> &'static str {
     match class_code {
@@ -334,6 +353,10 @@ pub fn pci_class_description(class_code: u8, subclass: u8) -> &'static str {
             0x01 => "ISA bridge",
             0x04 => "PCI-to-PCI bridge",
             _ => "Bridge device",
+        },
+        0x0C => match subclass {
+            0x03 => "USB controller",
+            _ => "Serial bus controller",
         },
         _ => "Other device",
     }
@@ -398,7 +421,16 @@ pub fn format_pci_device<'a>(dev: &PciDeviceInfo, buf: &'a mut [u8]) -> &'a str 
             buf[p] = b'0' + (b as u8); p += 1;
             let eq = b"=0x";
             buf[p..p + eq.len()].copy_from_slice(eq); p += eq.len();
-            hex8(dev.bars[b] as u32, &mut buf[p..p + 8]); p += 8;
+            if dev.bars[b] > 0xFFFF_FFFF {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for i in 0..16 {
+                    buf[p + 15 - i] = HEX[((dev.bars[b] >> (i * 4)) & 0xF) as usize];
+                }
+                p += 16;
+            } else {
+                hex8(dev.bars[b] as u32, &mut buf[p..p + 8]);
+                p += 8;
+            }
             break;
         }
     }

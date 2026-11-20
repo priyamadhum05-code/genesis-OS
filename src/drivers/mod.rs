@@ -6,6 +6,7 @@ pub mod virtio_blk;
 pub mod virtio_gpu;
 pub mod virtio_input;
 pub mod virtio_net;
+pub mod xhci;
 
 pub use fb::{
     global_fb_console_clear, global_fb_console_write, redraw_workspace_sidebar,
@@ -20,3 +21,8 @@ pub use virtio_blk::{VirtIOBlockDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC, VIRTIO_M
 pub use virtio_gpu::{get_global_virtio_gpu, register_global_virtio_gpu, VirtIOGpuDevice};
 pub use virtio_input::{VirtIOInputDevice, VirtioInputEvent, VIRTIO_DEV_INPUT};
 pub use virtio_net::{VirtIONetDevice, VIRTIO_DEV_NET};
+pub use xhci::{
+    format_port_status, format_xhci_info, get_global_xhci, get_global_xhci_ref,
+    port_speed_str, register_global_xhci, ErstEntry, Trb, UsbPortInfo, XhciDevice,
+    XHCI_MMIO_VA_BASE,
+};

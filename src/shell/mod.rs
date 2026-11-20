@@ -81,6 +81,7 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  hexdump <file>    - Display hexadecimal dump of a file\r\n");
                 serial_write(self.uart_va, b"  desktop           - Launch double-buffered graphical desktop\r\n");
                 serial_write(self.uart_va, b"  lspci             - List all discovered PCIe devices on Bus 0\r\n");
+                serial_write(self.uart_va, b"  lsusb             - Display USB 3.0 xHCI controller and port status\r\n");
                 serial_write(self.uart_va, b"  bench             - Run 4-core SMP NEON 64x64 MatMul benchmark\r\n");
                 serial_write(self.uart_va, b"  draw              - Redraw UEFI GOP framebuffer dashboard\r\n");
                 serial_write(self.uart_va, b"  run <file>        - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
@@ -546,6 +547,39 @@ impl<'a> Shell<'a> {
                         serial_write(self.uart_va, s.as_bytes());
                         serial_write(self.uart_va, b"\r\n");
                     }
+                }
+            }
+            "lsusb" => {
+                if let Some(xhci) = unsafe { crate::drivers::xhci::get_global_xhci_ref() } {
+                    serial_write(self.uart_va, b"=== xHCI USB 3.0 Host Controller ===\r\n");
+                    let mut line_buf = [0u8; 128];
+                    let s = crate::drivers::xhci::format_xhci_info(xhci, &mut line_buf);
+                    serial_write(self.uart_va, s.as_bytes());
+                    serial_write(self.uart_va, b"\r\n");
+
+                    if xhci.noop_success {
+                        serial_write(self.uart_va, b"Command Ring:     NOOP command verified (Completion Code: 1 Success)\r\n");
+                    } else {
+                        serial_write(self.uart_va, b"Command Ring:     NOOP command not verified\r\n");
+                    }
+                    serial_write(self.uart_va, b"Root Hub Ports:\r\n");
+                    let mut dev_count = 0;
+                    for p in 1..=xhci.max_ports {
+                        if let Some(info) = unsafe { xhci.read_port_status(p) } {
+                            let mut p_buf = [0u8; 128];
+                            let ps = crate::drivers::xhci::format_port_status(&info, &mut p_buf);
+                            serial_write(self.uart_va, ps.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                            if info.connected {
+                                dev_count += 1;
+                            }
+                        }
+                    }
+                    serial_write(self.uart_va, b"Total USB Devices Detected: ");
+                    serial_decimal(self.uart_va, dev_count as u64);
+                    serial_write(self.uart_va, b"\r\n");
+                } else {
+                    serial_write(self.uart_va, b"No xHCI USB host controller detected.\r\n");
                 }
             }
             "llm" => {
