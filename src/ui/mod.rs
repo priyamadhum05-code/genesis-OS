@@ -1018,6 +1018,18 @@ impl DesktopCompositor {
                     if dev_count == 0 {
                         self.append_term_line("No USB devices attached to root ports");
                     }
+
+                    let (devs, count) = unsafe { crate::drivers::usb_hid::get_enumerated_devices() };
+                    if count > 0 {
+                        self.append_term_line("Enumerated USB Devices:");
+                        for i in 0..count {
+                            if let Some(ref dev) = devs[i] {
+                                let mut buf = [0u8; 96];
+                                let s = crate::drivers::usb_hid::format_usb_device(dev, &mut buf);
+                                self.append_term_line(s);
+                            }
+                        }
+                    }
                 } else {
                     self.append_term_line("No xHCI USB controller detected");
                 }
@@ -1749,7 +1761,24 @@ pub unsafe fn run_desktop_gui(
             }
         }
 
+        let (usb_ptr, usb_changed) = crate::drivers::usb_hid::poll_usb_mouse(fb.width, fb.height);
+        if usb_changed {
+            pointer = usb_ptr;
+            if comp.handle_pointer_ctx(&pointer, fat, dev.as_deref_mut(), scratch_pa, scratch_va) {
+                need_render = true;
+            }
+        }
+
         if let Some(key) = poll_global_virtio_input() {
+            if key == 27 || (key == b'q' && !comp.windows[WIN_TERMINAL].focused && !comp.windows[WIN_EDITOR].focused) {
+                break;
+            }
+            if comp.handle_key_ctx(key, fat, dev.as_deref_mut(), scratch_pa, scratch_va) {
+                need_render = true;
+            }
+        }
+
+        if let Some(key) = crate::drivers::usb_hid::poll_usb_keyboard() {
             if key == 27 || (key == b'q' && !comp.windows[WIN_TERMINAL].focused && !comp.windows[WIN_EDITOR].focused) {
                 break;
             }

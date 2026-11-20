@@ -72,6 +72,9 @@ pub unsafe fn serial_read_byte(uart: usize) -> u8 {
         if let Some(b) = crate::drivers::virtio_input::poll_global_virtio_input() {
             return b;
         }
+        if let Some(b) = crate::drivers::usb_hid::poll_usb_keyboard() {
+            return b;
+        }
         #[cfg(target_os = "uefi")]
         core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
         #[cfg(not(target_os = "uefi"))]

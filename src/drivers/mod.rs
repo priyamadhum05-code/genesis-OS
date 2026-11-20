@@ -7,6 +7,7 @@ pub mod virtio_gpu;
 pub mod virtio_input;
 pub mod virtio_net;
 pub mod xhci;
+pub mod usb_hid;
 
 pub use fb::{
     global_fb_console_clear, global_fb_console_write, redraw_workspace_sidebar,

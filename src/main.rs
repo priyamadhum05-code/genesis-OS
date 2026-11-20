@@ -27,6 +27,7 @@ use genesis_stage1::{
         virtio_input::VirtIOInputDevice, write_u64, FbConsole, Framebuffer, VirtIOBlockDevice,
         VirtIONetDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC,
         xhci::{get_global_xhci_ref, register_global_xhci, XhciDevice, XHCI_MMIO_VA_BASE},
+        usb_hid::{enumerate_usb_devices, get_enumerated_count},
     },
     fs::{locate_volume, FatVolume},
     memory_map,
@@ -1504,7 +1505,11 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
                         serial_write(uart, b", ports=");
                         serial_decimal(uart, xhci_dev.max_ports as u64);
                         serial_write(uart, b")\r\n");
+                        let dev_count = enumerate_usb_devices(&mut xhci_dev, mapper.pmm_mut(), HHDM_BASE);
                         register_global_xhci(xhci_dev);
+                        serial_write(uart, b"GENESIS: usb enumeration complete (found ");
+                        serial_decimal(uart, dev_count as u64);
+                        serial_write(uart, b" devices)\r\n");
                         _xhci_detected = true;
                     } else {
                         serial_write(uart, b"GENESIS: xhci init returned error\r\n");
@@ -1955,6 +1960,18 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         }
         serial_write(uart, b"GENESIS: stage18 milestone complete\r\n");
 
+        // Stage 19: xHCI USB Device Enumeration & USB HID Keyboard/Mouse Driver
+        serial_write(uart, b"GENESIS: stage19 starting (usb hid keyboard & mouse)\r\n");
+        if let Some(_xhci) = get_global_xhci_ref() {
+            let count = get_enumerated_count();
+            serial_write(uart, b"GENESIS: stage19 usb hid ok (devices=");
+            serial_decimal(uart, count as u64);
+            serial_write(uart, b")\r\n");
+        } else {
+            serial_write(uart, b"GENESIS: stage19 usb hid skipped (no controller)\r\n");
+        }
+        serial_write(uart, b"GENESIS: stage19 milestone complete\r\n");
+
         // Auto-Boot to Desktop in GUI Mode:
         // When GOP framebuffer is active (e.g. ./tools/run-qemu-gui.sh), launch GUI.
         // In headless mode (./tools/run-qemu.sh), shell.fb is None, so drop straight to serial genesis> shell.
@@ -1972,7 +1989,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         }
 
         // 14. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 18)\r\n");
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 19)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {

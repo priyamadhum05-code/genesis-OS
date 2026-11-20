@@ -578,6 +578,19 @@ impl<'a> Shell<'a> {
                     serial_write(self.uart_va, b"Total USB Devices Detected: ");
                     serial_decimal(self.uart_va, dev_count as u64);
                     serial_write(self.uart_va, b"\r\n");
+
+                    let (devs, count) = unsafe { crate::drivers::usb_hid::get_enumerated_devices() };
+                    if count > 0 {
+                        serial_write(self.uart_va, b"Enumerated USB Devices:\r\n");
+                        for i in 0..count {
+                            if let Some(ref dev) = devs[i] {
+                                let mut buf = [0u8; 128];
+                                let s = crate::drivers::usb_hid::format_usb_device(dev, &mut buf);
+                                serial_write(self.uart_va, s.as_bytes());
+                                serial_write(self.uart_va, b"\r\n");
+                            }
+                        }
+                    }
                 } else {
                     serial_write(self.uart_va, b"No xHCI USB host controller detected.\r\n");
                 }
