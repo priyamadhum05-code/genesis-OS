@@ -65,7 +65,7 @@ impl<'a> Shell<'a> {
 
         match cmd {
             "help" => {
-                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 14)\r\n");
+                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 20)\r\n");
                 serial_write(self.uart_va, b"Available commands:\r\n");
                 serial_write(self.uart_va, b"  help              - List available commands\r\n");
                 serial_write(self.uart_va, b"  info              - Display system status, memory, registers, and framebuffer\r\n");
@@ -82,6 +82,11 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  desktop           - Launch double-buffered graphical desktop\r\n");
                 serial_write(self.uart_va, b"  lspci             - List all discovered PCIe devices on Bus 0\r\n");
                 serial_write(self.uart_va, b"  lsusb             - Display USB 3.0 xHCI controller and port status\r\n");
+                serial_write(self.uart_va, b"  nvmeinfo          - Display PCIe NVMe SSD controller & capacity\r\n");
+                serial_write(self.uart_va, b"  nvmeread <lba>    - Read and hex-dump LBA sector from NVMe SSD\r\n");
+                serial_write(self.uart_va, b"  usbstorage        - Display USB Mass Storage (SCSI) information\r\n");
+                serial_write(self.uart_va, b"  cpuinfo           - Display AArch64 MIDR, features & hardware telemetry\r\n");
+                serial_write(self.uart_va, b"  gpuinfo           - Display VirtIO-GPU 2D/3D VirGL acceleration status\r\n");
                 serial_write(self.uart_va, b"  bench             - Run 4-core SMP NEON 64x64 MatMul benchmark\r\n");
                 serial_write(self.uart_va, b"  draw              - Redraw UEFI GOP framebuffer dashboard\r\n");
                 serial_write(self.uart_va, b"  run <file>        - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
@@ -593,6 +598,132 @@ impl<'a> Shell<'a> {
                     }
                 } else {
                     serial_write(self.uart_va, b"No xHCI USB host controller detected.\r\n");
+                }
+            }
+            "nvmeinfo" => {
+                if let Some(nvme) = crate::drivers::nvme::get_global_nvme_ref() {
+                    serial_write(self.uart_va, b"=== PCIe NVMe SSD Controller ===\r\n");
+                    serial_write(self.uart_va, b"Model:          ");
+                    serial_write(self.uart_va, nvme.model_str().as_bytes());
+                    serial_write(self.uart_va, b"\r\nSerial:         ");
+                    serial_write(self.uart_va, nvme.serial_str().as_bytes());
+                    serial_write(self.uart_va, b"\r\nTotal Blocks:   ");
+                    serial_decimal(self.uart_va, nvme.total_blocks);
+                    serial_write(self.uart_va, b"\r\nLBA Data Size:  ");
+                    serial_decimal(self.uart_va, nvme.lba_bytes as u64);
+                    serial_write(self.uart_va, b" bytes\r\nCapacity:       ");
+                    let mib = (nvme.total_blocks * nvme.lba_bytes as u64) / 1024 / 1024;
+                    serial_decimal(self.uart_va, mib);
+                    serial_write(self.uart_va, b" MiB\r\n");
+                } else {
+                    serial_write(self.uart_va, b"No NVMe PCIe SSD controller detected.\r\n");
+                }
+            }
+            "nvmeread" => {
+                let lba: u64 = if arg.is_empty() {
+                    0
+                } else {
+                    let mut val = 0u64;
+                    for &b in arg.as_bytes() {
+                        if b >= b'0' && b <= b'9' {
+                            val = val * 10 + (b - b'0') as u64;
+                        }
+                    }
+                    val
+                };
+                if let Some(nvme) = crate::drivers::nvme::get_global_nvme() {
+                    serial_write(self.uart_va, b"Reading LBA ");
+                    serial_decimal(self.uart_va, lba);
+                    serial_write(self.uart_va, b" from NVMe SSD...\r\n");
+                    match unsafe { nvme.read_lba(lba, 1, self.scratch_pa, self.scratch_va) } {
+                        Ok(()) => {
+                            serial_write(self.uart_va, b"NVMe LBA hex dump (first 128 bytes):\r\n");
+                            let ptr = self.scratch_va as *const u8;
+                            for row in 0..8 {
+                                let offset = row * 16;
+                                serial_write(self.uart_va, b"  ");
+                                serial_hex(self.uart_va, offset as u64);
+                                serial_write(self.uart_va, b": ");
+                                for col in 0..16 {
+                                    let byte = unsafe { core::ptr::read_volatile(ptr.add(offset + col)) };
+                                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                                    let hi = HEX[(byte >> 4) as usize];
+                                    let lo = HEX[(byte & 0xF) as usize];
+                                    let b_str = [hi, lo, b' '];
+                                    serial_write(self.uart_va, &b_str);
+                                }
+                                serial_write(self.uart_va, b" |");
+                                for col in 0..16 {
+                                    let byte = unsafe { core::ptr::read_volatile(ptr.add(offset + col)) };
+                                    let ch = if byte >= 32 && byte <= 126 { byte } else { b'.' };
+                                    serial_write(self.uart_va, &[ch]);
+                                }
+                                serial_write(self.uart_va, b"|\r\n");
+                            }
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"NVMe read failed: ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"No NVMe device available\r\n");
+                }
+            }
+            "usbstorage" => {
+                if let Some(msc) = crate::drivers::usb_msc::get_global_usb_msc_ref() {
+                    serial_write(self.uart_va, b"=== USB Mass Storage (SCSI / BOT) ===\r\n");
+                    serial_write(self.uart_va, b"Vendor:         ");
+                    serial_write(self.uart_va, msc.vendor_str().as_bytes());
+                    serial_write(self.uart_va, b"\r\nProduct:        ");
+                    serial_write(self.uart_va, msc.product_str().as_bytes());
+                    serial_write(self.uart_va, b"\r\nRevision:       ");
+                    serial_write(self.uart_va, msc.revision_str().as_bytes());
+                    serial_write(self.uart_va, b"\r\nTotal Blocks:   ");
+                    serial_decimal(self.uart_va, msc.total_blocks);
+                    serial_write(self.uart_va, b"\r\nBlock Size:     ");
+                    serial_decimal(self.uart_va, msc.block_size as u64);
+                    serial_write(self.uart_va, b" bytes\r\nCapacity:       ");
+                    let mib = (msc.total_blocks * msc.block_size as u64) / 1024 / 1024;
+                    serial_decimal(self.uart_va, mib);
+                    serial_write(self.uart_va, b" MiB\r\n");
+                } else {
+                    serial_write(self.uart_va, b"No USB Mass Storage device detected.\r\n");
+                }
+            }
+            "cpuinfo" => {
+                serial_write(self.uart_va, b"=== AArch64 CPU & Hardware Telemetry ===\r\n");
+                let t = crate::arch::cpu::query_cpu_telemetry();
+                let mut buf = [0u8; 512];
+                let s = crate::arch::cpu::format_cpu_summary(&t, &mut buf);
+                serial_write(self.uart_va, s.as_bytes());
+                serial_write(self.uart_va, b"\r\n");
+            }
+            "gpuinfo" => {
+                if let Some(gpu_ptr) = crate::drivers::virtio_gpu::get_global_virtio_gpu() {
+                    let gpu = unsafe { &*gpu_ptr };
+                    serial_write(self.uart_va, b"=== VirtIO-GPU 2D / 3D Controller ===\r\n");
+                    serial_write(self.uart_va, b"Mode:           ");
+                    if gpu.is_virgl {
+                        serial_write(self.uart_va, b"3D (VirGL Hardware Accelerated)\r\n");
+                    } else {
+                        serial_write(self.uart_va, b"2D Native\r\n");
+                    }
+                    serial_write(self.uart_va, b"Resolution:     ");
+                    serial_decimal(self.uart_va, gpu.width as u64);
+                    serial_write(self.uart_va, b"x");
+                    serial_decimal(self.uart_va, gpu.height as u64);
+                    serial_write(self.uart_va, b"\r\nPixel Format:   B8G8R8X8_UNORM (32 bpp)\r\n");
+                    serial_write(self.uart_va, b"Scanout Res ID: ");
+                    serial_decimal(self.uart_va, gpu.resource_id as u64);
+                    serial_write(self.uart_va, b"\r\nCapset Count:   ");
+                    serial_decimal(self.uart_va, gpu.capset_count as u64);
+                    serial_write(self.uart_va, b"\r\nFlush Count:    ");
+                    serial_decimal(self.uart_va, gpu.flush_count);
+                    serial_write(self.uart_va, b"\r\n");
+                } else {
+                    serial_write(self.uart_va, b"VirtIO-GPU not active (using UEFI GOP / Framebuffer console).\r\n");
                 }
             }
             "llm" => {

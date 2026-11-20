@@ -23,11 +23,13 @@ use genesis_stage1::{
     },
     drivers::{
         global_fb_console_write, pci::{find_pci_by_class, find_pci_device, pci_enable_bus_master, scan_bus_0, PCI_BAR_VA_BASE, PCI_ECAM_DEFAULT_BASE, PCI_ECAM_VA_BASE},
-        register_global_fb_console, update_workspace_telemetry, virtio_gpu::{register_global_virtio_gpu, VirtIOGpuDevice},
+        register_global_fb_console, update_workspace_telemetry, virtio_gpu::{get_global_virtio_gpu, register_global_virtio_gpu, VirtIOGpuDevice},
         virtio_input::VirtIOInputDevice, write_u64, FbConsole, Framebuffer, VirtIOBlockDevice,
         VirtIONetDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC,
         xhci::{get_global_xhci_ref, register_global_xhci, XhciDevice, XHCI_MMIO_VA_BASE},
         usb_hid::{enumerate_usb_devices, get_enumerated_count},
+        nvme::{get_global_nvme_ref, register_global_nvme, NvmeDevice, NVME_MMIO_VA_BASE},
+        usb_msc::get_global_usb_msc_ref,
     },
     fs::{locate_volume, FatVolume},
     memory_map,
@@ -1463,16 +1465,29 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             serial_decimal(uart, gpu_pci_dev.dev as u64);
             serial_write(uart, b".0\r\n");
 
-            let bar_pa = if gpu_pci_dev.bars[1] != 0 {
+            pci_enable_bus_master(PCI_ECAM_VA_BASE, gpu_pci_dev.bus, gpu_pci_dev.dev, gpu_pci_dev.func);
+
+            let mut common_bar = 0usize;
+            for i in 0..gpu_pci_dev.cap_count {
+                if gpu_pci_dev.capabilities[i].cfg_type == genesis_stage1::drivers::pci::VIRTIO_PCI_CAP_COMMON_CFG {
+                    common_bar = gpu_pci_dev.capabilities[i].bar as usize;
+                    break;
+                }
+            }
+
+            let bar_pa = if common_bar < 6 && gpu_pci_dev.bars[common_bar] != 0 {
+                gpu_pci_dev.bars[common_bar]
+            } else if gpu_pci_dev.bars[4] != 0 {
+                gpu_pci_dev.bars[4]
+            } else if gpu_pci_dev.bars[1] != 0 {
                 gpu_pci_dev.bars[1]
-            } else if gpu_pci_dev.bars[0] != 0 {
-                gpu_pci_dev.bars[0]
             } else {
-                0
+                gpu_pci_dev.bars[0]
             };
 
             if bar_pa != 0 {
-                if let Ok(()) = mapper.map_mmio_range(PCI_BAR_VA_BASE, bar_pa, 64) {
+                let bar_pages = ((gpu_pci_dev.bar_sizes[common_bar].max(16384) + 4095) / 4096) as usize;
+                if let Ok(()) = mapper.map_mmio_range(PCI_BAR_VA_BASE, bar_pa, bar_pages.max(16)) {
                     let mut gpu_dev = VirtIOGpuDevice::empty();
                     if let Ok(()) = gpu_dev.init(&gpu_pci_dev, mapper.pmm_mut(), HHDM_BASE, PCI_BAR_VA_BASE) {
                         serial_write(uart, b"GENESIS: virtio-gpu controlq initialized ok\r\n");
@@ -1516,6 +1531,37 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
                     }
                 } else {
                     serial_write(uart, b"GENESIS: xhci bar0 map failed\r\n");
+                }
+            }
+        }
+
+        // Stage 20: Probe PCIe NVMe SSD Controller (0x01:0x08:0x02)
+        if let Some(nvme_pci_dev) = find_pci_by_class(0x01, 0x08, 0x02) {
+            serial_write(uart, b"GENESIS: pcie nvme ssd controller detected at 00:");
+            serial_decimal(uart, nvme_pci_dev.dev as u64);
+            serial_write(uart, b".");
+            serial_decimal(uart, nvme_pci_dev.func as u64);
+            serial_write(uart, b"\r\n");
+
+            pci_enable_bus_master(PCI_ECAM_VA_BASE, nvme_pci_dev.bus, nvme_pci_dev.dev, nvme_pci_dev.func);
+
+            let bar0_pa = nvme_pci_dev.bars[0];
+            if bar0_pa != 0 {
+                let bar_pages = ((nvme_pci_dev.bar_sizes[0].max(16384) + 4095) / 4096) as usize;
+                if let Ok(()) = mapper.map_mmio_range(NVME_MMIO_VA_BASE, bar0_pa, bar_pages) {
+                    let mut nvme_dev = NvmeDevice::empty();
+                    if let Ok(()) = nvme_dev.init(&nvme_pci_dev, mapper.pmm_mut(), HHDM_BASE, NVME_MMIO_VA_BASE) {
+                        serial_write(uart, b"GENESIS: nvme controller initialized (model=");
+                        serial_write(uart, nvme_dev.model_str().as_bytes());
+                        serial_write(uart, b", blocks=");
+                        serial_decimal(uart, nvme_dev.total_blocks);
+                        serial_write(uart, b")\r\n");
+                        register_global_nvme(nvme_dev);
+                    } else {
+                        serial_write(uart, b"GENESIS: nvme init returned error\r\n");
+                    }
+                } else {
+                    serial_write(uart, b"GENESIS: nvme bar0 map failed\r\n");
                 }
             }
         }
@@ -1702,6 +1748,9 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             }
             serial_write(uart, b"GENESIS: stage8 framebuffer initialized ok\r\n");
         } else {
+            if let Some(gpu) = virtio_gpu_opt.as_mut() {
+                register_global_virtio_gpu(gpu as *mut VirtIOGpuDevice);
+            }
             serial_write(uart, b"GENESIS: stage8 framebuffer skipped (headless mode)\r\n");
         }
 
@@ -1972,6 +2021,43 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         }
         serial_write(uart, b"GENESIS: stage19 milestone complete\r\n");
 
+        // Stage 20: PCIe NVMe SSD, USB Mass Storage, CPU Telemetry & VirtIO-GPU 3D (VirGL)
+        serial_write(uart, b"GENESIS: stage20 starting (nvme, usb-msc, cpu-telemetry & virgl)\r\n");
+        if let Some(nvme) = get_global_nvme_ref() {
+            serial_write(uart, b"GENESIS: stage20 nvme ok (blocks=");
+            serial_decimal(uart, nvme.total_blocks);
+            serial_write(uart, b" lba_bytes=");
+            serial_decimal(uart, nvme.lba_bytes as u64);
+            serial_write(uart, b")\r\n");
+        } else {
+            serial_write(uart, b"GENESIS: stage20 nvme skipped (no controller)\r\n");
+        }
+
+        if let Some(msc) = get_global_usb_msc_ref() {
+            serial_write(uart, b"GENESIS: stage20 usb msc ok (blocks=");
+            serial_decimal(uart, msc.total_blocks);
+            serial_write(uart, b" block_size=");
+            serial_decimal(uart, msc.block_size as u64);
+            serial_write(uart, b")\r\n");
+        } else {
+            serial_write(uart, b"GENESIS: stage20 usb msc skipped (no device)\r\n");
+        }
+
+        let _cpu_t = genesis_stage1::arch::cpu::query_cpu_telemetry();
+        serial_write(uart, b"GENESIS: stage20 cpu telemetry ok\r\n");
+
+        if let Some(gpu_ptr) = get_global_virtio_gpu() {
+            let gpu = &*gpu_ptr;
+            let mode = if gpu.is_virgl { "3D" } else { "2D" };
+            serial_write(uart, b"GENESIS: stage20 virtio-gpu 2d/3d ok (mode=");
+            serial_write(uart, mode.as_bytes());
+            serial_write(uart, b")\r\n");
+        } else {
+            serial_write(uart, b"GENESIS: stage20 virtio-gpu skipped (no gpu)\r\n");
+        }
+
+        serial_write(uart, b"GENESIS: stage20 milestone complete\r\n");
+
         // Auto-Boot to Desktop in GUI Mode:
         // When GOP framebuffer is active (e.g. ./tools/run-qemu-gui.sh), launch GUI.
         // In headless mode (./tools/run-qemu.sh), shell.fb is None, so drop straight to serial genesis> shell.
@@ -1989,7 +2075,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         }
 
         // 14. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 19)\r\n");
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 20)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {

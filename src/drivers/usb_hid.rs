@@ -7,6 +7,7 @@
 use core::ptr;
 use crate::pmm::PhysicalPageAllocator;
 use crate::drivers::virtio_input::PointerState;
+use crate::drivers::usb_msc::{register_global_usb_msc, UsbMscDevice};
 use crate::drivers::xhci::{
     clean_dcache_range, get_global_xhci, invalidate_dcache_range, port_speed_str,
     write_endpoint_context, write_input_control_context, write_slot_context,
@@ -19,6 +20,7 @@ pub enum UsbDeviceKind {
     Unknown,
     Keyboard,
     Mouse,
+    MassStorage,
     Other(u8),
 }
 
@@ -27,6 +29,7 @@ impl UsbDeviceKind {
         match self {
             UsbDeviceKind::Keyboard => "HID Keyboard",
             UsbDeviceKind::Mouse => "HID Mouse",
+            UsbDeviceKind::MassStorage => "USB Mass Storage",
             UsbDeviceKind::Other(_) => "USB HID Other",
             UsbDeviceKind::Unknown => "Unknown Device",
         }
@@ -323,12 +326,15 @@ pub unsafe fn enumerate_usb_devices<const WORDS: usize>(
 
         let cfg_buf = core::slice::from_raw_parts(ctrl_va as *const u8, fetch_len);
 
-        // Parse descriptors for HID interface & Interrupt IN endpoint
+        // Parse descriptors for HID / MSC interfaces & endpoints
         let mut offset = 0;
         let mut cur_iface_num = 0u8;
         let mut is_hid_iface = false;
+        let mut is_msc_iface = false;
         let mut detected_kind = UsbDeviceKind::Unknown;
         let mut found_ep: Option<(u8, u8, u16, u8, UsbDeviceKind)> = None;
+        let mut msc_in_ep: Option<(u8, u16)> = None;
+        let mut msc_out_ep: Option<(u8, u16)> = None;
 
         while offset + 2 <= fetch_len {
             let desc_len = cfg_buf[offset] as usize;
@@ -344,6 +350,7 @@ pub unsafe fn enumerate_usb_devices<const WORDS: usize>(
                 let if_proto = cfg_buf[offset + 7];
                 if if_class == 3 {
                     is_hid_iface = true;
+                    is_msc_iface = false;
                     if if_proto == 1 {
                         detected_kind = UsbDeviceKind::Keyboard;
                     } else if if_proto == 2 {
@@ -351,20 +358,37 @@ pub unsafe fn enumerate_usb_devices<const WORDS: usize>(
                     } else {
                         detected_kind = UsbDeviceKind::Other(if_proto);
                     }
+                } else if if_class == 8 {
+                    is_msc_iface = true;
+                    is_hid_iface = false;
+                    detected_kind = UsbDeviceKind::MassStorage;
                 } else {
                     is_hid_iface = false;
+                    is_msc_iface = false;
                 }
-            } else if desc_type == 5 && desc_len >= 7 && is_hid_iface {
+            } else if desc_type == 5 && desc_len >= 7 {
                 // Endpoint Descriptor
                 let ep_addr = cfg_buf[offset + 2];
                 let ep_attr = cfg_buf[offset + 3];
                 let max_pkt = (cfg_buf[offset + 4] as u16) | ((cfg_buf[offset + 5] as u16) << 8);
                 let interval = cfg_buf[offset + 6];
 
-                // Check Interrupt IN: bit 7 = 1, transfer type = 3 (Interrupt)
-                if (ep_addr & 0x80) != 0 && (ep_attr & 0x3) == 3 {
-                    let ep_num = ep_addr & 0xF;
-                    found_ep = Some((cur_iface_num, ep_num, max_pkt, interval, detected_kind));
+                if is_hid_iface {
+                    // Check Interrupt IN: bit 7 = 1, transfer type = 3 (Interrupt)
+                    if (ep_addr & 0x80) != 0 && (ep_attr & 0x3) == 3 {
+                        let ep_num = ep_addr & 0xF;
+                        found_ep = Some((cur_iface_num, ep_num, max_pkt, interval, detected_kind));
+                    }
+                } else if is_msc_iface {
+                    // Check Bulk: transfer type = 2 (Bulk)
+                    if (ep_attr & 0x3) == 2 {
+                        let ep_num = ep_addr & 0xF;
+                        if (ep_addr & 0x80) != 0 {
+                            msc_in_ep = Some((ep_num, max_pkt));
+                        } else {
+                            msc_out_ep = Some((ep_num, max_pkt));
+                        }
+                    }
                 }
             }
             offset += desc_len;
@@ -455,6 +479,120 @@ pub unsafe fn enumerate_usb_devices<const WORDS: usize>(
                         product_id: pid,
                         kind,
                         intr_dci: dci,
+                    };
+                    ENUMERATED_USB_DEVICES[ENUMERATED_USB_COUNT] = Some(info);
+                    ENUMERATED_USB_COUNT += 1;
+                }
+            }
+        } else if let (Some((in_ep, in_max_pkt)), Some((out_ep, out_max_pkt))) = (msc_in_ep, msc_out_ep) {
+            // Configure Bulk IN & Bulk OUT endpoints for USB Mass Storage
+            let in_dci = (in_ep * 2) + 1;
+            let out_dci = out_ep * 2;
+
+            let in_ring_pa = match pmm.allocate_page() {
+                Some(pa) => pa,
+                None => continue,
+            };
+            let in_ring_va = hhdm_base + in_ring_pa;
+            ptr::write_bytes(in_ring_va as *mut u8, 0, 4096);
+            let in_link = Trb::link(in_ring_pa, true, true);
+            ptr::write_volatile((in_ring_va as *mut Trb).add(255), in_link);
+            clean_dcache_range(in_ring_va, 4096);
+
+            let out_ring_pa = match pmm.allocate_page() {
+                Some(pa) => pa,
+                None => continue,
+            };
+            let out_ring_va = hhdm_base + out_ring_pa;
+            ptr::write_bytes(out_ring_va as *mut u8, 0, 4096);
+            let out_link = Trb::link(out_ring_pa, true, true);
+            ptr::write_volatile((out_ring_va as *mut Trb).add(255), out_link);
+            clean_dcache_range(out_ring_va, 4096);
+
+            let cbw_pa = match pmm.allocate_page() {
+                Some(pa) => pa,
+                None => continue,
+            };
+            let cbw_va = hhdm_base + cbw_pa;
+            ptr::write_bytes(cbw_va as *mut u8, 0, 4096);
+            clean_dcache_range(cbw_va, 4096);
+
+            // Prepare Input Context for Configure Endpoint (enable Slot, in_dci, out_dci)
+            ptr::write_bytes(input_ctx_va as *mut u8, 0, 4096);
+            let add_flags = (1 << 0) | (1 << in_dci) | (1 << out_dci);
+            write_input_control_context(input_ctx_va, 0, add_flags);
+            let max_dci = in_dci.max(out_dci);
+            write_slot_context(input_ctx_va, xhci.ctx_size, true, 0, speed, max_dci, port);
+
+            // Bulk OUT (ep_type = 2)
+            write_endpoint_context(
+                input_ctx_va,
+                xhci.ctx_size,
+                true,
+                out_dci,
+                2, // Bulk OUT
+                out_max_pkt.max(64),
+                0,
+                0,
+                out_ring_pa,
+                true,
+                3,
+                0,
+            );
+
+            // Bulk IN (ep_type = 6)
+            write_endpoint_context(
+                input_ctx_va,
+                xhci.ctx_size,
+                true,
+                in_dci,
+                6, // Bulk IN
+                in_max_pkt.max(64),
+                0,
+                0,
+                in_ring_pa,
+                true,
+                3,
+                0,
+            );
+            clean_dcache_range(input_ctx_va, 4096);
+
+            if xhci.configure_endpoint(slot_id, input_ctx_pa).is_ok() {
+                if let Some(s) = xhci.slots[slot_id as usize].as_mut() {
+                    s.bulk_in_dci = in_dci;
+                    s.bulk_in_ring_pa = in_ring_pa;
+                    s.bulk_in_ring_va = in_ring_va;
+                    s.bulk_out_dci = out_dci;
+                    s.bulk_out_ring_pa = out_ring_pa;
+                    s.bulk_out_ring_va = out_ring_va;
+                }
+
+                let mut msc_dev = UsbMscDevice::empty();
+                msc_dev.slot_id = slot_id;
+                msc_dev.port_id = port;
+                msc_dev.speed = speed;
+                msc_dev.vendor_id = vid;
+                msc_dev.product_id = pid;
+                msc_dev.cbw_pa = cbw_pa;
+                msc_dev.cbw_va = cbw_va;
+
+                let scratch_pa = cbw_pa + 128;
+                let scratch_va = cbw_va + 128;
+                let _ = msc_dev.inquiry(xhci, scratch_pa, scratch_va);
+                let _ = msc_dev.test_unit_ready(xhci, scratch_pa, scratch_va);
+                let _ = msc_dev.read_capacity(xhci, scratch_pa, scratch_va);
+
+                register_global_usb_msc(msc_dev);
+
+                if ENUMERATED_USB_COUNT < 8 {
+                    let info = UsbDeviceInfo {
+                        slot_id,
+                        port_id: port,
+                        speed,
+                        vendor_id: vid,
+                        product_id: pid,
+                        kind: UsbDeviceKind::MassStorage,
+                        intr_dci: in_dci,
                     };
                     ENUMERATED_USB_DEVICES[ENUMERATED_USB_COUNT] = Some(info);
                     ENUMERATED_USB_COUNT += 1;

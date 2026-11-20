@@ -240,6 +240,20 @@ pub struct XhciSlot {
     pub intr_pcs: u8,
     pub report_buf_pa: u64,
     pub report_buf_va: u64,
+
+    // Bulk IN endpoint
+    pub bulk_in_dci: u8,
+    pub bulk_in_ring_pa: u64,
+    pub bulk_in_ring_va: u64,
+    pub bulk_in_enqueue_idx: usize,
+    pub bulk_in_pcs: u8,
+
+    // Bulk OUT endpoint
+    pub bulk_out_dci: u8,
+    pub bulk_out_ring_pa: u64,
+    pub bulk_out_ring_va: u64,
+    pub bulk_out_enqueue_idx: usize,
+    pub bulk_out_pcs: u8,
 }
 
 impl XhciSlot {
@@ -263,6 +277,16 @@ impl XhciSlot {
             intr_pcs: 1,
             report_buf_pa: 0,
             report_buf_va: 0,
+            bulk_in_dci: 0,
+            bulk_in_ring_pa: 0,
+            bulk_in_ring_va: 0,
+            bulk_in_enqueue_idx: 0,
+            bulk_in_pcs: 1,
+            bulk_out_dci: 0,
+            bulk_out_ring_pa: 0,
+            bulk_out_ring_va: 0,
+            bulk_out_enqueue_idx: 0,
+            bulk_out_pcs: 1,
         }
     }
 
@@ -301,6 +325,44 @@ impl XhciSlot {
 
             self.intr_enqueue_idx = 0;
             self.intr_pcs ^= 1;
+        }
+    }
+
+    pub unsafe fn enqueue_bulk_in_trb(&mut self, mut trb: Trb) {
+        let cycle_bit = (self.bulk_in_pcs == 1) as u32;
+        trb.control = (trb.control & !1) | cycle_bit;
+        let ptr = (self.bulk_in_ring_va as *mut Trb).add(self.bulk_in_enqueue_idx);
+        ptr::write_volatile(ptr, trb);
+        clean_dcache_range(ptr as u64, 16);
+
+        self.bulk_in_enqueue_idx += 1;
+        if self.bulk_in_enqueue_idx >= 255 {
+            let link = Trb::link(self.bulk_in_ring_pa, true, self.bulk_in_pcs == 1);
+            let link_ptr = (self.bulk_in_ring_va as *mut Trb).add(255);
+            ptr::write_volatile(link_ptr, link);
+            clean_dcache_range(link_ptr as u64, 16);
+
+            self.bulk_in_enqueue_idx = 0;
+            self.bulk_in_pcs ^= 1;
+        }
+    }
+
+    pub unsafe fn enqueue_bulk_out_trb(&mut self, mut trb: Trb) {
+        let cycle_bit = (self.bulk_out_pcs == 1) as u32;
+        trb.control = (trb.control & !1) | cycle_bit;
+        let ptr = (self.bulk_out_ring_va as *mut Trb).add(self.bulk_out_enqueue_idx);
+        ptr::write_volatile(ptr, trb);
+        clean_dcache_range(ptr as u64, 16);
+
+        self.bulk_out_enqueue_idx += 1;
+        if self.bulk_out_enqueue_idx >= 255 {
+            let link = Trb::link(self.bulk_out_ring_pa, true, self.bulk_out_pcs == 1);
+            let link_ptr = (self.bulk_out_ring_va as *mut Trb).add(255);
+            ptr::write_volatile(link_ptr, link);
+            clean_dcache_range(link_ptr as u64, 16);
+
+            self.bulk_out_enqueue_idx = 0;
+            self.bulk_out_pcs ^= 1;
         }
     }
 }
@@ -803,6 +865,97 @@ impl XhciDevice {
             }
         }
         Err("XHCI_CONTROL_XFER_TIMEOUT")
+    }
+
+    /// Perform a synchronous Bulk OUT transfer to endpoint on `slot_id`.
+    pub unsafe fn bulk_transfer_out(
+        &mut self,
+        slot_id: u8,
+        buf_pa: u64,
+        buf_va: u64,
+        len: usize,
+    ) -> Result<(), &'static str> {
+        let slot = self.slots[slot_id as usize].as_mut().ok_or("XHCI_SLOT_NOT_ALLOCATED")?;
+        let dci = slot.bulk_out_dci;
+        if dci == 0 {
+            return Err("XHCI_BULK_OUT_NOT_CONFIGURED");
+        }
+
+        clean_dcache_range(buf_va, len);
+
+        let trb = Trb {
+            param: buf_pa,
+            status: len as u32,
+            control: ((TRB_TYPE_NORMAL as u32) << 10) | (1 << 5) /* IOC */,
+        };
+        slot.enqueue_bulk_out_trb(trb);
+
+        // Ring Doorbell
+        let db_addr = (self.db_base + (slot_id as u64 * 4)) as *mut u32;
+        ptr::write_volatile(db_addr, dci as u32);
+
+        // Poll for Transfer Event
+        let mut spins = 1_000_000;
+        while let Some(evt) = self.poll_event(spins) {
+            if evt.trb_type() == TRB_TYPE_TRANSFER_EVENT && evt.slot_id() == slot_id {
+                let code = evt.completion_code();
+                if code == COMP_SUCCESS || code == COMP_SHORT_PACKET {
+                    return Ok(());
+                } else {
+                    return Err("XHCI_BULK_OUT_FAILED");
+                }
+            }
+            spins -= 1;
+            if spins == 0 {
+                break;
+            }
+        }
+        Err("XHCI_BULK_OUT_TIMEOUT")
+    }
+
+    /// Perform a synchronous Bulk IN transfer from endpoint on `slot_id`.
+    pub unsafe fn bulk_transfer_in(
+        &mut self,
+        slot_id: u8,
+        buf_pa: u64,
+        buf_va: u64,
+        len: usize,
+    ) -> Result<(), &'static str> {
+        let slot = self.slots[slot_id as usize].as_mut().ok_or("XHCI_SLOT_NOT_ALLOCATED")?;
+        let dci = slot.bulk_in_dci;
+        if dci == 0 {
+            return Err("XHCI_BULK_IN_NOT_CONFIGURED");
+        }
+
+        let trb = Trb {
+            param: buf_pa,
+            status: len as u32,
+            control: ((TRB_TYPE_NORMAL as u32) << 10) | (1 << 5) /* IOC */ | (1 << 2) /* ISP */,
+        };
+        slot.enqueue_bulk_in_trb(trb);
+
+        // Ring Doorbell
+        let db_addr = (self.db_base + (slot_id as u64 * 4)) as *mut u32;
+        ptr::write_volatile(db_addr, dci as u32);
+
+        // Poll for Transfer Event
+        let mut spins = 1_000_000;
+        while let Some(evt) = self.poll_event(spins) {
+            if evt.trb_type() == TRB_TYPE_TRANSFER_EVENT && evt.slot_id() == slot_id {
+                let code = evt.completion_code();
+                if code == COMP_SUCCESS || code == COMP_SHORT_PACKET {
+                    invalidate_dcache_range(buf_va, len);
+                    return Ok(());
+                } else {
+                    return Err("XHCI_BULK_IN_FAILED");
+                }
+            }
+            spins -= 1;
+            if spins == 0 {
+                break;
+            }
+        }
+        Err("XHCI_BULK_IN_TIMEOUT")
     }
 
     /// Read Root Hub Port Status & Control (PORTSC) for port (1..=max_ports)

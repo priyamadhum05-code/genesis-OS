@@ -974,7 +974,8 @@ impl DesktopCompositor {
         match cmd {
             "help" => {
                 self.append_term_line("Commands: help, ls, cat, write, info,");
-                self.append_term_line("  ramstat, bench, lspci, lsusb, clear, halt");
+                self.append_term_line("  ramstat, bench, lspci, lsusb, clear,");
+                self.append_term_line("  nvmeinfo, nvmeread, usbstorage, cpuinfo, gpuinfo, halt");
             }
             "clear" => {
                 self.term_line_count = 0;
@@ -1244,6 +1245,165 @@ impl DesktopCompositor {
                     }
                 } else {
                     self.append_term_line("Filesystem not mounted");
+                }
+            }
+            "nvmeinfo" => {
+                if let Some(nvme) = crate::drivers::nvme::get_global_nvme_ref() {
+                    self.append_term_line("=== PCIe NVMe SSD Controller ===");
+                    let mut b = [0u8; 96];
+                    let mut p = 0;
+                    let m_pre = b"Model: ";
+                    b[p..p + m_pre.len()].copy_from_slice(m_pre); p += m_pre.len();
+                    let m_str = nvme.model_str().as_bytes();
+                    let len = m_str.len().min(80);
+                    b[p..p + len].copy_from_slice(&m_str[..len]); p += len;
+                    if let Ok(s) = core::str::from_utf8(&b[..p]) { self.append_term_line(s); }
+
+                    let mut b2 = [0u8; 96];
+                    let mut p2 = 0;
+                    let cap_pre = b"Capacity: ";
+                    b2[p2..p2 + cap_pre.len()].copy_from_slice(cap_pre); p2 += cap_pre.len();
+                    let mib = (nvme.total_blocks * nvme.lba_bytes as u64) / 1024 / 1024;
+                    p2 += write_u64_to_buf(mib, &mut b2[p2..]);
+                    let cap_post = b" MiB (";
+                    b2[p2..p2 + cap_post.len()].copy_from_slice(cap_post); p2 += cap_post.len();
+                    p2 += write_u64_to_buf(nvme.total_blocks, &mut b2[p2..]);
+                    let cap_post2 = b" blocks)";
+                    b2[p2..p2 + cap_post2.len()].copy_from_slice(cap_post2); p2 += cap_post2.len();
+                    if let Ok(s) = core::str::from_utf8(&b2[..p2]) { self.append_term_line(s); }
+                } else {
+                    self.append_term_line("No NVMe PCIe SSD controller detected");
+                }
+            }
+            "nvmeread" => {
+                let lba: u64 = if arg.is_empty() {
+                    0
+                } else {
+                    let mut val = 0u64;
+                    for &b in arg.as_bytes() {
+                        if b >= b'0' && b <= b'9' { val = val * 10 + (b - b'0') as u64; }
+                    }
+                    val
+                };
+                if let Some(nvme) = crate::drivers::nvme::get_global_nvme() {
+                    if scratch_pa != 0 && scratch_va != 0 {
+                        match unsafe { nvme.read_lba(lba, 1, scratch_pa, scratch_va) } {
+                            Ok(()) => {
+                                self.append_term_line("NVMe Read LBA [OK]:");
+                                let ptr = scratch_va as *const u8;
+                                for row in 0..4 {
+                                    let offset = row * 16;
+                                    let mut line = [b' '; 48];
+                                    let mut lp = 0;
+                                    lp += write_u64_to_buf(offset as u64, &mut line[lp..]);
+                                    line[lp] = b':'; lp += 1;
+                                    line[lp] = b' '; lp += 1;
+                                    for col in 0..16 {
+                                        let byte = unsafe { core::ptr::read_volatile(ptr.add(offset + col)) };
+                                        const HEX: &[u8; 16] = b"0123456789abcdef";
+                                        line[lp] = HEX[(byte >> 4) as usize]; lp += 1;
+                                        line[lp] = HEX[(byte & 0xF) as usize]; lp += 1;
+                                        line[lp] = b' '; lp += 1;
+                                    }
+                                    if let Ok(s) = core::str::from_utf8(&line[..lp]) {
+                                        self.append_term_line(s);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.append_term_line(e);
+                            }
+                        }
+                    } else {
+                        self.append_term_line("NVMe read: scratch buffer unavailable");
+                    }
+                } else {
+                    self.append_term_line("No NVMe device available");
+                }
+            }
+            "usbstorage" => {
+                if let Some(msc) = crate::drivers::usb_msc::get_global_usb_msc_ref() {
+                    self.append_term_line("=== USB Mass Storage (SCSI / BOT) ===");
+                    let mut b = [0u8; 96];
+                    let mut p = 0;
+                    let v_pre = b"Device: ";
+                    b[p..p + v_pre.len()].copy_from_slice(v_pre); p += v_pre.len();
+                    let v_str = msc.vendor_str().as_bytes();
+                    b[p..p + v_str.len()].copy_from_slice(v_str); p += v_str.len();
+                    b[p] = b' '; p += 1;
+                    let p_str = msc.product_str().as_bytes();
+                    b[p..p + p_str.len()].copy_from_slice(p_str); p += p_str.len();
+                    if let Ok(s) = core::str::from_utf8(&b[..p]) { self.append_term_line(s); }
+
+                    let mut b2 = [0u8; 96];
+                    let mut p2 = 0;
+                    let cap_pre = b"Capacity: ";
+                    b2[p2..p2 + cap_pre.len()].copy_from_slice(cap_pre); p2 += cap_pre.len();
+                    let mib = (msc.total_blocks * msc.block_size as u64) / 1024 / 1024;
+                    p2 += write_u64_to_buf(mib, &mut b2[p2..]);
+                    let cap_post = b" MiB (Block: ";
+                    b2[p2..p2 + cap_post.len()].copy_from_slice(cap_post); p2 += cap_post.len();
+                    p2 += write_u64_to_buf(msc.block_size as u64, &mut b2[p2..]);
+                    b2[p2] = b')'; p2 += 1;
+                    if let Ok(s) = core::str::from_utf8(&b2[..p2]) { self.append_term_line(s); }
+                } else {
+                    self.append_term_line("No USB Mass Storage device detected");
+                }
+            }
+            "cpuinfo" => {
+                let t = crate::arch::cpu::query_cpu_telemetry();
+                let mut b = [0u8; 96];
+                let mut p = 0;
+                let m_pre = b"CPU: ";
+                b[p..p + m_pre.len()].copy_from_slice(m_pre); p += m_pre.len();
+                let model = crate::arch::cpu::part_num_to_str(t.part_num).as_bytes();
+                b[p..p + model.len()].copy_from_slice(model); p += model.len();
+                let imp = b" (";
+                b[p..p + imp.len()].copy_from_slice(imp); p += imp.len();
+                let imp_name = crate::arch::cpu::implementer_to_str(t.implementer).as_bytes();
+                b[p..p + imp_name.len()].copy_from_slice(imp_name); p += imp_name.len();
+                b[p] = b')'; p += 1;
+                if let Ok(s) = core::str::from_utf8(&b[..p]) { self.append_term_line(s); }
+
+                let mut b2 = [0u8; 96];
+                let mut p2 = 0;
+                let c_pre = b"SMP: ";
+                b2[p2..p2 + c_pre.len()].copy_from_slice(c_pre); p2 += c_pre.len();
+                p2 += write_u64_to_buf(t.online_cores, &mut b2[p2..]);
+                let c_post = b" Cores | NEON: ";
+                b2[p2..p2 + c_post.len()].copy_from_slice(c_post); p2 += c_post.len();
+                let neon_str: &[u8] = if t.has_neon { b"YES" } else { b"NO" };
+                b2[p2..p2 + neon_str.len()].copy_from_slice(neon_str); p2 += neon_str.len();
+                let lse_str = b" | LSE: ";
+                b2[p2..p2 + lse_str.len()].copy_from_slice(lse_str); p2 += lse_str.len();
+                let lse_val: &[u8] = if t.has_lse { b"YES" } else { b"NO" };
+                b2[p2..p2 + lse_val.len()].copy_from_slice(lse_val); p2 += lse_val.len();
+                if let Ok(s) = core::str::from_utf8(&b2[..p2]) { self.append_term_line(s); }
+            }
+            "gpuinfo" => {
+                if let Some(gpu_ptr) = crate::drivers::virtio_gpu::get_global_virtio_gpu() {
+                    let gpu = unsafe { &*gpu_ptr };
+                    let mut b = [0u8; 96];
+                    let mut p = 0;
+                    let g_pre = b"GPU Mode: ";
+                    b[p..p + g_pre.len()].copy_from_slice(g_pre); p += g_pre.len();
+                    let m_str: &[u8] = if gpu.is_virgl { b"3D (VirGL Accelerated)" } else { b"2D Native" };
+                    b[p..p + m_str.len()].copy_from_slice(m_str); p += m_str.len();
+                    if let Ok(s) = core::str::from_utf8(&b[..p]) { self.append_term_line(s); }
+
+                    let mut b2 = [0u8; 96];
+                    let mut p2 = 0;
+                    let r_pre = b"Res: ";
+                    b2[p2..p2 + r_pre.len()].copy_from_slice(r_pre); p2 += r_pre.len();
+                    p2 += write_u64_to_buf(gpu.width as u64, &mut b2[p2..]);
+                    b2[p2] = b'x'; p2 += 1;
+                    p2 += write_u64_to_buf(gpu.height as u64, &mut b2[p2..]);
+                    let f_pre = b" | Flushes: ";
+                    b2[p2..p2 + f_pre.len()].copy_from_slice(f_pre); p2 += f_pre.len();
+                    p2 += write_u64_to_buf(gpu.flush_count, &mut b2[p2..]);
+                    if let Ok(s) = core::str::from_utf8(&b2[..p2]) { self.append_term_line(s); }
+                } else {
+                    self.append_term_line("VirtIO-GPU not active (using Framebuffer console)");
                 }
             }
             "halt" | "poweroff" => {
@@ -1999,6 +2159,11 @@ mod tests {
             comp.execute_term_command("bench", None, None, 0, 0);
             comp.execute_term_command("lspci", None, None, 0, 0);
             comp.execute_term_command("lsusb", None, None, 0, 0);
+            comp.execute_term_command("nvmeinfo", None, None, 0, 0);
+            comp.execute_term_command("nvmeread 0", None, None, 0, 0);
+            comp.execute_term_command("usbstorage", None, None, 0, 0);
+            comp.execute_term_command("cpuinfo", None, None, 0, 0);
+            comp.execute_term_command("gpuinfo", None, None, 0, 0);
 
             comp.execute_term_command("clear", None, None, 0, 0);
             assert_eq!(comp.term_line_count, 0);

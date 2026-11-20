@@ -11,6 +11,24 @@ pub const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0104;
 pub const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 pub const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 pub const VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
+pub const VIRTIO_GPU_CMD_GET_CAPSET_INFO: u32 = 0x0108;
+pub const VIRTIO_GPU_CMD_GET_CAPSET: u32 = 0x0109;
+pub const VIRTIO_GPU_CMD_CTX_CREATE: u32 = 0x0200;
+pub const VIRTIO_GPU_CMD_CTX_DESTROY: u32 = 0x0201;
+pub const VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
+pub const VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE: u32 = 0x0203;
+pub const VIRTIO_GPU_CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
+pub const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D: u32 = 0x0205;
+pub const VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
+pub const VIRTIO_GPU_CMD_SUBMIT_3D: u32 = 0x0207;
+
+pub const VIRTIO_GPU_F_VIRGL: u64 = 1 << 0;
+
+pub const VIRGL_CCMD_CREATE_OBJECT: u32 = 1;
+pub const VIRGL_CCMD_SET_VIEWPORT_STATE: u32 = 3;
+pub const VIRGL_CCMD_SET_FRAMEBUFFER_STATE: u32 = 5;
+pub const VIRGL_CCMD_CLEAR: u32 = 8;
+pub const VIRGL_CCMD_RESOURCE_INLINE_WRITE: u32 = 11;
 
 pub const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
 pub const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
@@ -152,6 +170,134 @@ pub struct VirtioGpuRespDisplayInfo {
     pub pmodes: [VirtioGpuDisplayOne; 16],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VirtioGpuGetCapsetInfo {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub capset_index: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VirtioGpuRespCapsetInfo {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub capset_id: u32,
+    pub capset_max_version: u32,
+    pub capset_max_size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VirtioGpuGetCapset {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub capset_id: u32,
+    pub capset_version: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct VirtioGpuRespCapset {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub capset_data: [u8; 64],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtioGpuCtxCreate {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub nlen: u32,
+    pub padding: u32,
+    pub debug_name: [u8; 64],
+}
+
+impl Default for VirtioGpuCtxCreate {
+    fn default() -> Self {
+        Self {
+            hdr: VirtioGpuCtrlHdr::default(),
+            nlen: 0,
+            padding: 0,
+            debug_name: [0; 64],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VirtioGpuCtxDestroy {
+    pub hdr: VirtioGpuCtrlHdr,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VirtioGpuCtxAttachResource {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub resource_id: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VirtioGpuResourceCreate3d {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub resource_id: u32,
+    pub target: u32,
+    pub format: u32,
+    pub bind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub array_size: u32,
+    pub last_level: u32,
+    pub nr_samples: u32,
+    pub flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VirtioGpuSubmit3d {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub size: u32,
+    pub padding: u32,
+}
+
+/// Helper to build a VirGL clear command packet
+pub fn build_virgl_clear(
+    _ctx_id: u32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+    out_buf: &mut [u32],
+) -> usize {
+    if out_buf.len() < 8 {
+        return 0;
+    }
+    out_buf[0] = (7 << 16) | VIRGL_CCMD_CLEAR;
+    out_buf[1] = 0x04; // VIRGL_CLEAR_COLOR0
+    out_buf[2] = r.to_bits();
+    out_buf[3] = g.to_bits();
+    out_buf[4] = b.to_bits();
+    out_buf[5] = a.to_bits();
+    out_buf[6] = 0;
+    out_buf[7] = 0;
+    8 * 4
+}
+
+/// Pure helper for dirty-rectangle clamping
+pub fn clamp_rect(x: u32, y: u32, w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32, u32, u32) {
+    if max_w == 0 || max_h == 0 {
+        return (0, 0, 0, 0);
+    }
+    let cx = x.min(max_w.saturating_sub(1));
+    let cy = y.min(max_h.saturating_sub(1));
+    let cw = w.min(max_w - cx);
+    let ch = h.min(max_h - cy);
+    (cx, cy, cw, ch)
+}
+
 pub struct VirtIOGpuDevice {
     pub common_cfg_va: u64,
     pub notify_cfg_va: u64,
@@ -169,6 +315,10 @@ pub struct VirtIOGpuDevice {
     pub resource_id: u32,
     pub last_used_idx: u16,
     pub is_initialized: bool,
+    pub is_virgl: bool,
+    pub capset_count: u32,
+    pub flush_count: u64,
+    pub ctx_id: u32,
 }
 
 pub static mut GLOBAL_VIRTIO_GPU: Option<*mut VirtIOGpuDevice> = None;
@@ -202,6 +352,10 @@ impl VirtIOGpuDevice {
             resource_id: 1,
             last_used_idx: 0,
             is_initialized: false,
+            is_virgl: false,
+            capset_count: 0,
+            flush_count: 0,
+            ctx_id: 0,
         }
     }
 
@@ -243,6 +397,29 @@ impl VirtIOGpuDevice {
         );
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
+        // Feature negotiation: check VIRTIO_GPU_F_VIRGL (bit 0)
+        core::ptr::write_volatile(self.common_cfg_va as *mut u32, 0); // device_feature_select = 0
+        let dev_features = core::ptr::read_volatile((self.common_cfg_va + 0x04) as *const u32);
+        let mut driver_features = 0u32;
+        if (dev_features & (VIRTIO_GPU_F_VIRGL as u32)) != 0 {
+            self.is_virgl = true;
+            self.capset_count = 1;
+            driver_features |= VIRTIO_GPU_F_VIRGL as u32;
+        } else {
+            self.is_virgl = false;
+            self.capset_count = 0;
+        }
+
+        core::ptr::write_volatile((self.common_cfg_va + 0x08) as *mut u32, 0); // driver_feature_select = 0
+        core::ptr::write_volatile((self.common_cfg_va + 0x0C) as *mut u32, driver_features);
+
+        let status = core::ptr::read_volatile((self.common_cfg_va + 0x14) as *const u8);
+        core::ptr::write_volatile(
+            (self.common_cfg_va + 0x14) as *mut u8,
+            status | VIRTIO_STATUS_FEATURES_OK,
+        );
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
         // Select Queue 0 (controlq)
         core::ptr::write_volatile((self.common_cfg_va + 0x16) as *mut u16, 0);
         let q_size = core::ptr::read_volatile((self.common_cfg_va + 0x18) as *const u16);
@@ -281,7 +458,7 @@ impl VirtIOGpuDevice {
         let status = core::ptr::read_volatile((self.common_cfg_va + 0x14) as *const u8);
         core::ptr::write_volatile(
             (self.common_cfg_va + 0x14) as *mut u8,
-            status | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK,
+            status | VIRTIO_STATUS_DRIVER_OK,
         );
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
@@ -295,6 +472,7 @@ impl VirtIOGpuDevice {
         self.resp_buf_pa = buf_pa + 2048;
         self.resp_buf_va = buf_va + 2048;
         self.last_used_idx = 0;
+        self.flush_count = 0;
         self.is_initialized = true;
 
         Ok(())
@@ -376,7 +554,11 @@ impl VirtIOGpuDevice {
         }
 
         let resp_hdr = core::ptr::read_volatile(self.resp_buf_va as *const VirtioGpuCtrlHdr);
-        if resp_hdr.hdr_type != VIRTIO_GPU_RESP_OK_NODATA && resp_hdr.hdr_type != VIRTIO_GPU_RESP_OK_DISPLAY_INFO {
+        if resp_hdr.hdr_type != VIRTIO_GPU_RESP_OK_NODATA
+            && resp_hdr.hdr_type != VIRTIO_GPU_RESP_OK_DISPLAY_INFO
+            && resp_hdr.hdr_type != VIRTIO_GPU_RESP_OK_CAPSET_INFO
+            && resp_hdr.hdr_type != VIRTIO_GPU_RESP_OK_CAPSET
+        {
             return Err("VirtIO-GPU response error");
         }
 
@@ -533,10 +715,220 @@ impl VirtIOGpuDevice {
         Ok(())
     }
 
+    /// Transfer updated dirty bounding box to host and flush to display (with coordinate clamping)
+    pub unsafe fn transfer_and_flush_rect(&mut self, x: u32, y: u32, w: u32, h: u32) -> Result<(), &'static str> {
+        let (cx, cy, cw, ch) = clamp_rect(x, y, w, h, self.width, self.height);
+        if cw == 0 || ch == 0 {
+            return Ok(());
+        }
+        self.flush_count = self.flush_count.wrapping_add(1);
+        self.flush_rect(cx, cy, cw, ch)
+    }
+
     /// Flush full screen
     pub unsafe fn flush(&mut self) -> Result<(), &'static str> {
         let (w, h) = (self.width, self.height);
-        self.flush_rect(0, 0, w, h)
+        self.transfer_and_flush_rect(0, 0, w, h)
+    }
+
+    /// 3D: Query capset info by index
+    pub unsafe fn get_capset_info(&mut self, capset_idx: u32) -> Result<VirtioGpuRespCapsetInfo, &'static str> {
+        let cmd = self.cmd_buf_va as *mut VirtioGpuGetCapsetInfo;
+        core::ptr::write_volatile(
+            cmd,
+            VirtioGpuGetCapsetInfo {
+                hdr: VirtioGpuCtrlHdr {
+                    hdr_type: VIRTIO_GPU_CMD_GET_CAPSET_INFO,
+                    flags: 0,
+                    fence_id: 0,
+                    ctx_id: 0,
+                    padding: 0,
+                },
+                capset_index: capset_idx,
+                padding: 0,
+            },
+        );
+        self.send_ctrl_command(
+            core::mem::size_of::<VirtioGpuGetCapsetInfo>() as u32,
+            core::mem::size_of::<VirtioGpuRespCapsetInfo>() as u32,
+        )?;
+        let resp = core::ptr::read_volatile(self.resp_buf_va as *const VirtioGpuRespCapsetInfo);
+        Ok(resp)
+    }
+
+    /// 3D: Create 3D Context
+    pub unsafe fn ctx_create(&mut self, ctx_id: u32, name: &str) -> Result<(), &'static str> {
+        let cmd = self.cmd_buf_va as *mut VirtioGpuCtxCreate;
+        let mut debug_name = [0u8; 64];
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(63);
+        debug_name[..len].copy_from_slice(&bytes[..len]);
+
+        core::ptr::write_volatile(
+            cmd,
+            VirtioGpuCtxCreate {
+                hdr: VirtioGpuCtrlHdr {
+                    hdr_type: VIRTIO_GPU_CMD_CTX_CREATE,
+                    flags: 0,
+                    fence_id: 0,
+                    ctx_id,
+                    padding: 0,
+                },
+                nlen: len as u32,
+                padding: 0,
+                debug_name,
+            },
+        );
+        self.send_ctrl_command(
+            core::mem::size_of::<VirtioGpuCtxCreate>() as u32,
+            core::mem::size_of::<VirtioGpuCtrlHdr>() as u32,
+        )?;
+        self.ctx_id = ctx_id;
+        Ok(())
+    }
+
+    /// 3D: Destroy 3D Context
+    pub unsafe fn ctx_destroy(&mut self, ctx_id: u32) -> Result<(), &'static str> {
+        let cmd = self.cmd_buf_va as *mut VirtioGpuCtxDestroy;
+        core::ptr::write_volatile(
+            cmd,
+            VirtioGpuCtxDestroy {
+                hdr: VirtioGpuCtrlHdr {
+                    hdr_type: VIRTIO_GPU_CMD_CTX_DESTROY,
+                    flags: 0,
+                    fence_id: 0,
+                    ctx_id,
+                    padding: 0,
+                },
+            },
+        );
+        self.send_ctrl_command(
+            core::mem::size_of::<VirtioGpuCtxDestroy>() as u32,
+            core::mem::size_of::<VirtioGpuCtrlHdr>() as u32,
+        )
+    }
+
+    /// 3D: Attach Resource to Context
+    pub unsafe fn ctx_attach_resource(&mut self, ctx_id: u32, resource_id: u32) -> Result<(), &'static str> {
+        let cmd = self.cmd_buf_va as *mut VirtioGpuCtxAttachResource;
+        core::ptr::write_volatile(
+            cmd,
+            VirtioGpuCtxAttachResource {
+                hdr: VirtioGpuCtrlHdr {
+                    hdr_type: VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+                    flags: 0,
+                    fence_id: 0,
+                    ctx_id,
+                    padding: 0,
+                },
+                resource_id,
+                padding: 0,
+            },
+        );
+        self.send_ctrl_command(
+            core::mem::size_of::<VirtioGpuCtxAttachResource>() as u32,
+            core::mem::size_of::<VirtioGpuCtrlHdr>() as u32,
+        )
+    }
+
+    /// 3D: Detach Resource from Context
+    pub unsafe fn ctx_detach_resource(&mut self, ctx_id: u32, resource_id: u32) -> Result<(), &'static str> {
+        let cmd = self.cmd_buf_va as *mut VirtioGpuCtxAttachResource;
+        core::ptr::write_volatile(
+            cmd,
+            VirtioGpuCtxAttachResource {
+                hdr: VirtioGpuCtrlHdr {
+                    hdr_type: VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+                    flags: 0,
+                    fence_id: 0,
+                    ctx_id,
+                    padding: 0,
+                },
+                resource_id,
+                padding: 0,
+            },
+        );
+        self.send_ctrl_command(
+            core::mem::size_of::<VirtioGpuCtxAttachResource>() as u32,
+            core::mem::size_of::<VirtioGpuCtrlHdr>() as u32,
+        )
+    }
+
+    /// 3D: Create 3D Resource
+    pub unsafe fn resource_create_3d(
+        &mut self,
+        resource_id: u32,
+        target: u32,
+        format: u32,
+        bind: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+    ) -> Result<(), &'static str> {
+        let cmd = self.cmd_buf_va as *mut VirtioGpuResourceCreate3d;
+        core::ptr::write_volatile(
+            cmd,
+            VirtioGpuResourceCreate3d {
+                hdr: VirtioGpuCtrlHdr {
+                    hdr_type: VIRTIO_GPU_CMD_RESOURCE_CREATE_3D,
+                    flags: 0,
+                    fence_id: 0,
+                    ctx_id: 0,
+                    padding: 0,
+                },
+                resource_id,
+                target,
+                format,
+                bind,
+                width,
+                height,
+                depth,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: 0,
+                padding: 0,
+            },
+        );
+        self.send_ctrl_command(
+            core::mem::size_of::<VirtioGpuResourceCreate3d>() as u32,
+            core::mem::size_of::<VirtioGpuCtrlHdr>() as u32,
+        )
+    }
+
+    /// 3D: Submit VirGL 3D Command Stream
+    pub unsafe fn submit_3d(&mut self, ctx_id: u32, cmds: &[u32]) -> Result<(), &'static str> {
+        let cmd_hdr_size = core::mem::size_of::<VirtioGpuSubmit3d>();
+        let payload_bytes = cmds.len() * 4;
+        let total_size = cmd_hdr_size + payload_bytes;
+        if total_size > 2048 {
+            return Err("SUBMIT_3D_TOO_LARGE");
+        }
+
+        let cmd = self.cmd_buf_va as *mut VirtioGpuSubmit3d;
+        core::ptr::write_volatile(
+            cmd,
+            VirtioGpuSubmit3d {
+                hdr: VirtioGpuCtrlHdr {
+                    hdr_type: VIRTIO_GPU_CMD_SUBMIT_3D,
+                    flags: 0,
+                    fence_id: 0,
+                    ctx_id,
+                    padding: 0,
+                },
+                size: payload_bytes as u32,
+                padding: 0,
+            },
+        );
+        let payload_ptr = (self.cmd_buf_va + cmd_hdr_size as u64) as *mut u32;
+        for (i, &word) in cmds.iter().enumerate() {
+            core::ptr::write_volatile(payload_ptr.add(i), word);
+        }
+
+        self.send_ctrl_command(
+            total_size as u32,
+            core::mem::size_of::<VirtioGpuCtrlHdr>() as u32,
+        )
     }
 }
 
@@ -556,6 +948,17 @@ mod tests {
         assert_eq!(core::mem::size_of::<VirtioGpuResourceFlush>(), 48);
         assert_eq!(core::mem::size_of::<VirtioGpuDisplayOne>(), 24);
         assert_eq!(core::mem::size_of::<VirtioGpuRespDisplayInfo>(), 24 + 16 * 24);
+
+        // 3D structs
+        assert_eq!(core::mem::size_of::<VirtioGpuGetCapsetInfo>(), 32);
+        assert_eq!(core::mem::size_of::<VirtioGpuRespCapsetInfo>(), 40);
+        assert_eq!(core::mem::size_of::<VirtioGpuGetCapset>(), 32);
+        assert_eq!(core::mem::size_of::<VirtioGpuRespCapset>(), 24 + 64);
+        assert_eq!(core::mem::size_of::<VirtioGpuCtxCreate>(), 96);
+        assert_eq!(core::mem::size_of::<VirtioGpuCtxDestroy>(), 24);
+        assert_eq!(core::mem::size_of::<VirtioGpuCtxAttachResource>(), 32);
+        assert_eq!(core::mem::size_of::<VirtioGpuResourceCreate3d>(), 72);
+        assert_eq!(core::mem::size_of::<VirtioGpuSubmit3d>(), 32);
     }
 
     #[test]
@@ -568,5 +971,38 @@ mod tests {
         assert_eq!(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, 0x0106);
         assert_eq!(VIRTIO_GPU_RESP_OK_NODATA, 0x1100);
         assert_eq!(VIRTIO_GPU_RESP_OK_DISPLAY_INFO, 0x1101);
+        assert_eq!(VIRTIO_GPU_RESP_OK_CAPSET_INFO, 0x1102);
+        assert_eq!(VIRTIO_GPU_RESP_OK_CAPSET, 0x1103);
+    }
+
+    #[test]
+    fn dirty_rect_clamping_logic() {
+        // Normal bounds within frame
+        assert_eq!(clamp_rect(10, 20, 100, 200, 1024, 768), (10, 20, 100, 200));
+
+        // Clamping right and bottom edges
+        assert_eq!(clamp_rect(1000, 700, 100, 100, 1024, 768), (1000, 700, 24, 68));
+
+        // Coordinates beyond bounds
+        assert_eq!(clamp_rect(2000, 2000, 50, 50, 1024, 768), (1023, 767, 1, 1));
+
+        // Zero dimensions
+        assert_eq!(clamp_rect(0, 0, 100, 100, 0, 768), (0, 0, 0, 0));
+        assert_eq!(clamp_rect(0, 0, 100, 100, 1024, 0), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn virgl_clear_packet_construction() {
+        let mut buf = [0u32; 16];
+        let bytes = build_virgl_clear(1, 0.25, 0.5, 0.75, 1.0, &mut buf);
+        assert_eq!(bytes, 32);
+        assert_eq!(buf[0], (7 << 16) | VIRGL_CCMD_CLEAR);
+        assert_eq!(buf[1], 0x04); // VIRGL_CLEAR_COLOR0
+        assert_eq!(buf[2], 0.25f32.to_bits());
+        assert_eq!(buf[3], 0.5f32.to_bits());
+        assert_eq!(buf[4], 0.75f32.to_bits());
+        assert_eq!(buf[5], 1.0f32.to_bits());
+        assert_eq!(buf[6], 0);
+        assert_eq!(buf[7], 0);
     }
 }
