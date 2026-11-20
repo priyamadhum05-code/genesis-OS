@@ -128,9 +128,45 @@ pub struct NvmeDevice {
     pub iosq_tail: u16,
     pub iocq_head: u16,
     pub iocq_phase: u16,
+    pub prp_list_pa: u64,
+    pub prp_list_va: u64,
 
     pub next_cid: u16,
     pub is_initialized: bool,
+}
+
+/// Construct PRP1, PRP2, and optionally PRP List entries for NVMe data transfers.
+/// Returns (prp1, prp2, prp_list_entries_written).
+pub fn build_prp_entries(
+    buf_pa: u64,
+    total_bytes: usize,
+    prp_list_pa: u64,
+    prp_list_slice: &mut [u64],
+) -> (u64, u64, usize) {
+    let prp1 = buf_pa;
+    let offset_in_first_page = (buf_pa & 0xFFF) as usize;
+    let first_page_bytes = 4096 - offset_in_first_page;
+
+    if total_bytes <= first_page_bytes {
+        (prp1, 0, 0)
+    } else {
+        let rem = total_bytes - first_page_bytes;
+        let page2_pa = (buf_pa & !0xFFF) + 4096;
+        if rem <= 4096 {
+            (prp1, page2_pa, 0)
+        } else {
+            let mut cur_pa = page2_pa;
+            let mut bytes_left = rem;
+            let mut idx = 0;
+            while bytes_left > 0 && idx < prp_list_slice.len() {
+                prp_list_slice[idx] = cur_pa;
+                idx += 1;
+                bytes_left = bytes_left.saturating_sub(4096);
+                cur_pa += 4096;
+            }
+            (prp1, prp_list_pa, idx)
+        }
+    }
 }
 
 impl NvmeDevice {
@@ -157,6 +193,8 @@ impl NvmeDevice {
             iosq_tail: 0,
             iocq_head: 0,
             iocq_phase: 1,
+            prp_list_pa: 0,
+            prp_list_va: 0,
             next_cid: 1,
             is_initialized: false,
         }
@@ -313,6 +351,14 @@ impl NvmeDevice {
         create_sq_sqe.cdw11 = (1u32 << 16) | 1u32; // CQID=1, Physically Contiguous = 1
         self.submit_admin_cmd(create_sq_sqe)?;
 
+        // 9. Allocate dedicated PRP List Page (4096 bytes)
+        let prp_list_pa = pmm.allocate_page().ok_or("NVME_ALLOC_PRP_FAIL")?;
+        let prp_list_va = hhdm_base + prp_list_pa;
+        ptr::write_bytes(prp_list_va as *mut u8, 0, 4096);
+        clean_dcache_range(prp_list_va, 4096);
+        self.prp_list_pa = prp_list_pa;
+        self.prp_list_va = prp_list_va;
+
         self.is_initialized = true;
         Ok(())
     }
@@ -408,13 +454,21 @@ impl NvmeDevice {
             return Err("NVME_NOT_READY");
         }
         let total_bytes = (count as usize) * (self.lba_bytes as usize);
+        let prp_slice = if self.prp_list_va != 0 {
+            core::slice::from_raw_parts_mut(self.prp_list_va as *mut u64, 512)
+        } else {
+            &mut []
+        };
+        let (prp1, prp2, prp_count) = build_prp_entries(buf_pa, total_bytes, self.prp_list_pa, prp_slice);
+        if prp_count > 0 {
+            clean_dcache_range(self.prp_list_va, prp_count * 8);
+        }
+
         let mut sqe = NvmeSqe::default();
         sqe.cdw0 = (NVME_IO_OP_READ as u32) | ((self.alloc_cid() as u32) << 16);
         sqe.nsid = 1;
-        sqe.prp1 = buf_pa;
-        if total_bytes > 4096 {
-            sqe.prp2 = buf_pa + 4096;
-        }
+        sqe.prp1 = prp1;
+        sqe.prp2 = prp2;
         sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
         sqe.cdw11 = ((lba >> 32) & 0xFFFF_FFFF) as u32;
         sqe.cdw12 = (count - 1) as u32; // NLB is 0-based
@@ -432,13 +486,21 @@ impl NvmeDevice {
         let total_bytes = (count as usize) * (self.lba_bytes as usize);
         clean_dcache_range(buf_va, total_bytes);
 
+        let prp_slice = if self.prp_list_va != 0 {
+            core::slice::from_raw_parts_mut(self.prp_list_va as *mut u64, 512)
+        } else {
+            &mut []
+        };
+        let (prp1, prp2, prp_count) = build_prp_entries(buf_pa, total_bytes, self.prp_list_pa, prp_slice);
+        if prp_count > 0 {
+            clean_dcache_range(self.prp_list_va, prp_count * 8);
+        }
+
         let mut sqe = NvmeSqe::default();
         sqe.cdw0 = (NVME_IO_OP_WRITE as u32) | ((self.alloc_cid() as u32) << 16);
         sqe.nsid = 1;
-        sqe.prp1 = buf_pa;
-        if total_bytes > 4096 {
-            sqe.prp2 = buf_pa + 4096;
-        }
+        sqe.prp1 = prp1;
+        sqe.prp2 = prp2;
         sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
         sqe.cdw11 = ((lba >> 32) & 0xFFFF_FFFF) as u32;
         sqe.cdw12 = (count - 1) as u32; // NLB is 0-based
@@ -455,6 +517,28 @@ impl NvmeDevice {
     /// Cleanly formatted serial string
     pub fn serial_str(&self) -> &str {
         core::str::from_utf8(&self.serial).unwrap_or("Unknown Serial").trim()
+    }
+}
+
+impl crate::fs::BlockDevice for NvmeDevice {
+    unsafe fn read_blocks(&mut self, lba: u64, count: u16, buf_pa: u64, buf_va: u64) -> Result<(), &'static str> {
+        self.read_lba(lba, count, buf_pa, buf_va)
+    }
+
+    unsafe fn write_blocks(&mut self, lba: u64, count: u16, buf_pa: u64, buf_va: u64) -> Result<(), &'static str> {
+        self.write_lba(lba, count, buf_pa, buf_va)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.lba_bytes
+    }
+
+    fn total_blocks(&self) -> u64 {
+        self.total_blocks
+    }
+
+    fn name(&self) -> &str {
+        "nvme0"
     }
 }
 
@@ -532,5 +616,53 @@ pub mod tests {
         };
         assert_eq!(err_cqe.phase(), 0);
         assert_eq!(err_cqe.status_code(), 2);
+    }
+
+    #[test]
+    fn nvme_prp_entries_building_test() {
+        let mut prp_list = [0u64; 16];
+        let prp_list_pa = 0x5000_0000;
+
+        // 1. Single page transfer (within 1 page)
+        let (prp1, prp2, count) = build_prp_entries(0x4000_0100, 512, prp_list_pa, &mut prp_list);
+        assert_eq!(prp1, 0x4000_0100);
+        assert_eq!(prp2, 0);
+        assert_eq!(count, 0);
+
+        // 2. Exactly 1 page aligned
+        let (prp1, prp2, count) = build_prp_entries(0x4000_0000, 4096, prp_list_pa, &mut prp_list);
+        assert_eq!(prp1, 0x4000_0000);
+        assert_eq!(prp2, 0);
+        assert_eq!(count, 0);
+
+        // 3. Two-page transfer (aligned)
+        let (prp1, prp2, count) = build_prp_entries(0x4000_0000, 8192, prp_list_pa, &mut prp_list);
+        assert_eq!(prp1, 0x4000_0000);
+        assert_eq!(prp2, 0x4000_1000);
+        assert_eq!(count, 0);
+
+        // 4. Two-page transfer (unaligned spanning boundary, e.g. 1024 bytes starting at offset 3584)
+        let (prp1, prp2, count) = build_prp_entries(0x4000_0E00, 1024, prp_list_pa, &mut prp_list);
+        assert_eq!(prp1, 0x4000_0E00);
+        assert_eq!(prp2, 0x4000_1000);
+        assert_eq!(count, 0);
+
+        // 5. Multi-page (>2 pages) transfer requiring PRP list
+        let (prp1, prp2, count) = build_prp_entries(0x4000_0000, 16384, prp_list_pa, &mut prp_list);
+        assert_eq!(prp1, 0x4000_0000);
+        assert_eq!(prp2, prp_list_pa);
+        assert_eq!(count, 3); // pages 2, 3, 4
+        assert_eq!(prp_list[0], 0x4000_1000);
+        assert_eq!(prp_list[1], 0x4000_2000);
+        assert_eq!(prp_list[2], 0x4000_3000);
+
+        // 6. Multi-page transfer unaligned
+        let (prp1, prp2, count) = build_prp_entries(0x4000_0800, 12288, prp_list_pa, &mut prp_list);
+        assert_eq!(prp1, 0x4000_0800);
+        assert_eq!(prp2, prp_list_pa);
+        assert_eq!(count, 3);
+        assert_eq!(prp_list[0], 0x4000_1000);
+        assert_eq!(prp_list[1], 0x4000_2000);
+        assert_eq!(prp_list[2], 0x4000_3000);
     }
 }

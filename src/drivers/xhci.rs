@@ -101,6 +101,36 @@ impl UsbSetupPacket {
         }
     }
 
+    pub fn get_hub_descriptor(len: u16) -> Self {
+        Self {
+            request_type: 0xA0,
+            request: 6,
+            value: 0x2900,
+            index: 0,
+            length: len,
+        }
+    }
+
+    pub fn set_hub_port_feature(port: u8, feature: u16) -> Self {
+        Self {
+            request_type: 0x23,
+            request: 3,
+            value: feature,
+            index: port as u16,
+            length: 0,
+        }
+    }
+
+    pub fn get_hub_port_status(port: u8) -> Self {
+        Self {
+            request_type: 0xA3,
+            request: 0,
+            value: 0,
+            index: port as u16,
+            length: 4,
+        }
+    }
+
     pub fn as_u64(&self) -> u64 {
         (self.request_type as u64)
             | ((self.request as u64) << 8)
@@ -195,6 +225,10 @@ impl Trb {
 
     pub fn slot_id(&self) -> u8 {
         ((self.control >> 24) & 0xFF) as u8
+    }
+
+    pub fn endpoint_id(&self) -> u8 {
+        ((self.control >> 16) & 0x1F) as u8
     }
 }
 
@@ -402,6 +436,12 @@ pub struct XhciDevice {
     // Slots
     pub slots: [Option<XhciSlot>; 16],
 
+    // Pending events FIFO for other slots during targeted polling
+    pub pending_events: [Trb; 32],
+    pub pending_head: usize,
+    pub pending_tail: usize,
+    pub pending_count: usize,
+
     // Verification outcomes
     pub noop_success: bool,
     pub noop_completion_code: u8,
@@ -435,6 +475,10 @@ impl XhciDevice {
             evt_dequeue_idx: 0,
             evt_ccs: 1,
             slots: [None; 16],
+            pending_events: [Trb::empty(); 32],
+            pending_head: 0,
+            pending_tail: 0,
+            pending_count: 0,
             noop_success: false,
             noop_completion_code: 0,
         }
@@ -619,8 +663,49 @@ impl XhciDevice {
         }
     }
 
-    /// Poll the Event Ring for the next event, advancing ERDP and toggling CCS if wrapping.
-    pub unsafe fn poll_event(&mut self, max_spins: usize) -> Option<Trb> {
+    /// Enqueue an unmatched event into the pending FIFO buffer
+    pub fn enqueue_pending_event(&mut self, evt: Trb) {
+        if self.pending_count < 32 {
+            self.pending_events[self.pending_tail] = evt;
+            self.pending_tail = (self.pending_tail + 1) % 32;
+            self.pending_count += 1;
+        }
+    }
+
+    /// Dequeue the next pending event from the FIFO buffer
+    pub fn dequeue_pending_event(&mut self) -> Option<Trb> {
+        if self.pending_count > 0 {
+            let trb = self.pending_events[self.pending_head];
+            self.pending_head = (self.pending_head + 1) % 32;
+            self.pending_count -= 1;
+            Some(trb)
+        } else {
+            None
+        }
+    }
+
+    /// Dequeue a pending event matching a predicate, maintaining FIFO order for non-matching events
+    pub fn dequeue_matching_event<F: Fn(&Trb) -> bool>(&mut self, predicate: F) -> Option<Trb> {
+        let count = self.pending_count;
+        let mut matched: Option<Trb> = None;
+        for _ in 0..count {
+            let trb = self.pending_events[self.pending_head];
+            self.pending_head = (self.pending_head + 1) % 32;
+            self.pending_count -= 1;
+
+            if matched.is_none() && predicate(&trb) {
+                matched = Some(trb);
+            } else {
+                self.pending_events[self.pending_tail] = trb;
+                self.pending_tail = (self.pending_tail + 1) % 32;
+                self.pending_count += 1;
+            }
+        }
+        matched
+    }
+
+    /// Poll the hardware Event Ring directly without dequeuing from pending buffer
+    pub unsafe fn poll_raw_event(&mut self, max_spins: usize) -> Option<Trb> {
         let mut spins = max_spins;
         while spins > 0 {
             let evt_ptr = (self.evt_ring_va as *const Trb).add(self.evt_dequeue_idx);
@@ -641,6 +726,15 @@ impl XhciDevice {
             spins -= 1;
         }
         None
+    }
+
+    /// Poll the Event Ring for the next event, advancing ERDP and toggling CCS if wrapping.
+    /// Checks pending events FIFO first.
+    pub unsafe fn poll_event(&mut self, max_spins: usize) -> Option<Trb> {
+        if let Some(trb) = self.dequeue_pending_event() {
+            return Some(trb);
+        }
+        self.poll_raw_event(max_spins)
     }
 
     /// Submit a NOOP Command TRB on the Command Ring and wait for Command Completion Event.
@@ -896,8 +990,8 @@ impl XhciDevice {
 
         // Poll for Transfer Event
         let mut spins = 1_000_000;
-        while let Some(evt) = self.poll_event(spins) {
-            if evt.trb_type() == TRB_TYPE_TRANSFER_EVENT && evt.slot_id() == slot_id {
+        while spins > 0 {
+            if let Some(evt) = self.dequeue_matching_event(|e| e.trb_type() == TRB_TYPE_TRANSFER_EVENT && e.slot_id() == slot_id && e.endpoint_id() == dci) {
                 let code = evt.completion_code();
                 if code == COMP_SUCCESS || code == COMP_SHORT_PACKET {
                     return Ok(());
@@ -905,10 +999,19 @@ impl XhciDevice {
                     return Err("XHCI_BULK_OUT_FAILED");
                 }
             }
-            spins -= 1;
-            if spins == 0 {
-                break;
+            if let Some(evt) = self.poll_raw_event(1) {
+                if evt.trb_type() == TRB_TYPE_TRANSFER_EVENT && evt.slot_id() == slot_id && evt.endpoint_id() == dci {
+                    let code = evt.completion_code();
+                    if code == COMP_SUCCESS || code == COMP_SHORT_PACKET {
+                        return Ok(());
+                    } else {
+                        return Err("XHCI_BULK_OUT_FAILED");
+                    }
+                } else {
+                    self.enqueue_pending_event(evt);
+                }
             }
+            spins -= 1;
         }
         Err("XHCI_BULK_OUT_TIMEOUT")
     }
@@ -940,8 +1043,8 @@ impl XhciDevice {
 
         // Poll for Transfer Event
         let mut spins = 1_000_000;
-        while let Some(evt) = self.poll_event(spins) {
-            if evt.trb_type() == TRB_TYPE_TRANSFER_EVENT && evt.slot_id() == slot_id {
+        while spins > 0 {
+            if let Some(evt) = self.dequeue_matching_event(|e| e.trb_type() == TRB_TYPE_TRANSFER_EVENT && e.slot_id() == slot_id && e.endpoint_id() == dci) {
                 let code = evt.completion_code();
                 if code == COMP_SUCCESS || code == COMP_SHORT_PACKET {
                     invalidate_dcache_range(buf_va, len);
@@ -950,10 +1053,20 @@ impl XhciDevice {
                     return Err("XHCI_BULK_IN_FAILED");
                 }
             }
-            spins -= 1;
-            if spins == 0 {
-                break;
+            if let Some(evt) = self.poll_raw_event(1) {
+                if evt.trb_type() == TRB_TYPE_TRANSFER_EVENT && evt.slot_id() == slot_id && evt.endpoint_id() == dci {
+                    let code = evt.completion_code();
+                    if code == COMP_SUCCESS || code == COMP_SHORT_PACKET {
+                        invalidate_dcache_range(buf_va, len);
+                        return Ok(());
+                    } else {
+                        return Err("XHCI_BULK_IN_FAILED");
+                    }
+                } else {
+                    self.enqueue_pending_event(evt);
+                }
             }
+            spins -= 1;
         }
         Err("XHCI_BULK_IN_TIMEOUT")
     }
@@ -984,6 +1097,56 @@ pub unsafe fn write_input_control_context(ctx_va: u64, drop_flags: u32, add_flag
     }
 }
 
+/// Calculate xHCI 20-bit Route String for a downstream device attached to `hub_port` (1..=15)
+/// at `tier` (0 for Tier 1 directly attached to root hub, 1 for Tier 2, etc.).
+pub fn calculate_child_route_string(parent_route: u32, tier: usize, hub_port: u8) -> u32 {
+    let shift = tier * 4;
+    if shift >= 20 {
+        parent_route
+    } else {
+        parent_route | (((hub_port as u32) & 0xF) << shift)
+    }
+}
+
+pub unsafe fn write_slot_context_ext(
+    ctx_va: u64,
+    ctx_size: usize,
+    is_input: bool,
+    route_str: u32,
+    speed: u8,
+    entries: u8,
+    root_port: u8,
+    is_hub: bool,
+    num_ports: u8,
+    parent_slot_id: u8,
+    parent_port_num: u8,
+    mtt: bool,
+    ttt: u8,
+) {
+    let offset = if is_input { ctx_size } else { 0 };
+    let p = (ctx_va + offset as u64) as *mut u32;
+    let mut dw0 = (route_str & 0xF_FFFF) | (((speed as u32) & 0xF) << 20) | (((entries as u32) & 0x1F) << 27);
+    if is_hub {
+        dw0 |= 1 << 26; // Hub bit = 1
+    }
+    let dw1 = (((root_port as u32) & 0xFF) << 16) | (((num_ports as u32) & 0xFF) << 24);
+    let mut dw2 = (parent_slot_id as u32 & 0xFF) | (((parent_port_num as u32) & 0xFF) << 8) | (((ttt as u32) & 0x3) << 16);
+    if mtt {
+        dw2 |= 1 << 18;
+    }
+    ptr::write_volatile(p.add(0), dw0);
+    ptr::write_volatile(p.add(1), dw1);
+    ptr::write_volatile(p.add(2), dw2);
+    for i in 3..8 {
+        ptr::write_volatile(p.add(i), 0);
+    }
+    if ctx_size == 64 {
+        for i in 8..16 {
+            ptr::write_volatile(p.add(i), 0);
+        }
+    }
+}
+
 pub unsafe fn write_slot_context(
     ctx_va: u64,
     ctx_size: usize,
@@ -993,20 +1156,10 @@ pub unsafe fn write_slot_context(
     entries: u8,
     root_port: u8,
 ) {
-    let offset = if is_input { ctx_size } else { 0 };
-    let p = (ctx_va + offset as u64) as *mut u32;
-    let dw0 = (route_str & 0xF_FFFF) | (((speed as u32) & 0xF) << 20) | (((entries as u32) & 0x1F) << 27);
-    let dw1 = ((root_port as u32) & 0xFF) << 16;
-    ptr::write_volatile(p.add(0), dw0);
-    ptr::write_volatile(p.add(1), dw1);
-    for i in 2..8 {
-        ptr::write_volatile(p.add(i), 0);
-    }
-    if ctx_size == 64 {
-        for i in 8..16 {
-            ptr::write_volatile(p.add(i), 0);
-        }
-    }
+    write_slot_context_ext(
+        ctx_va, ctx_size, is_input, route_str, speed, entries, root_port,
+        false, 0, 0, 0, false, 0,
+    );
 }
 
 pub unsafe fn write_endpoint_context(
@@ -1347,5 +1500,53 @@ pub mod tests {
             assert_eq!(ep0_tr & !0xF, 0x5000_1000);
             assert_eq!(ep0_tr & 1, 1); // DCS bit
         }
+    }
+
+    #[test]
+    fn xhci_child_route_string_and_event_fifo_test() {
+        // 1. Route string testing
+        let r1 = calculate_child_route_string(0, 0, 3);
+        assert_eq!(r1, 0x00003);
+
+        let r2 = calculate_child_route_string(r1, 1, 5);
+        assert_eq!(r2, 0x00053);
+
+        let r3 = calculate_child_route_string(r2, 2, 12);
+        assert_eq!(r3, 0x00C53);
+
+        let r_clamped = calculate_child_route_string(r3, 5, 1);
+        assert_eq!(r_clamped, r3);
+
+        // 2. FIFO Event Ring buffer queueing test
+        let mut xhci = XhciDevice::empty();
+        assert_eq!(xhci.pending_count, 0);
+
+        let trb1 = Trb { param: 0x1000, status: 1, control: 32 << 10 };
+        let trb2 = Trb { param: 0x2000, status: 1, control: 32 << 10 };
+        let trb3 = Trb { param: 0x3000, status: 1, control: 32 << 10 };
+
+        xhci.enqueue_pending_event(trb1);
+        xhci.enqueue_pending_event(trb2);
+        xhci.enqueue_pending_event(trb3);
+
+        assert_eq!(xhci.pending_count, 3);
+
+        let pop1 = xhci.dequeue_pending_event();
+        assert!(pop1.is_some());
+        assert_eq!(pop1.unwrap().param, 0x1000);
+        assert_eq!(xhci.pending_count, 2);
+
+        let pop2 = xhci.dequeue_pending_event();
+        assert!(pop2.is_some());
+        assert_eq!(pop2.unwrap().param, 0x2000);
+        assert_eq!(xhci.pending_count, 1);
+
+        let pop3 = xhci.dequeue_pending_event();
+        assert!(pop3.is_some());
+        assert_eq!(pop3.unwrap().param, 0x3000);
+        assert_eq!(xhci.pending_count, 0);
+
+        let pop4 = xhci.dequeue_pending_event();
+        assert!(pop4.is_none());
     }
 }

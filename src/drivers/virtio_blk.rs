@@ -205,6 +205,18 @@ impl VirtIOBlockDevice {
         self.req_va = req_va;
     }
 
+    /// Read capacity in 512-byte sectors from device configuration space (offset 0x100)
+    pub fn capacity_sectors(&self) -> u64 {
+        if self.base_va == 0 {
+            return 0;
+        }
+        unsafe {
+            let low = self.read32(0x100) as u64;
+            let high = self.read32(0x104) as u64;
+            (high << 32) | low
+        }
+    }
+
     /// Synchronously reads `count` consecutive 512-byte sectors starting from `lba`
     /// into caller-provided buffer at `buf_pa` / `buf_va`.
     pub unsafe fn read_sectors(
@@ -524,6 +536,40 @@ impl VirtIOBlockDevice {
         let sig = ((b510 as u16) << 8) | (b511 as u16);
 
         Ok(sig)
+    }
+}
+
+pub static mut GLOBAL_VIRTIO_BLK: Option<*mut VirtIOBlockDevice> = None;
+
+pub fn register_global_virtio_blk(dev: *mut VirtIOBlockDevice) {
+    unsafe {
+        GLOBAL_VIRTIO_BLK = Some(dev);
+    }
+}
+
+pub fn get_global_virtio_blk() -> Option<*mut VirtIOBlockDevice> {
+    unsafe { GLOBAL_VIRTIO_BLK }
+}
+
+impl crate::fs::BlockDevice for VirtIOBlockDevice {
+    unsafe fn read_blocks(&mut self, lba: u64, count: u16, buf_pa: u64, buf_va: u64) -> Result<(), &'static str> {
+        self.read_sectors(lba, count, buf_pa, buf_va)
+    }
+
+    unsafe fn write_blocks(&mut self, lba: u64, count: u16, buf_pa: u64, buf_va: u64) -> Result<(), &'static str> {
+        self.write_sectors(lba, count, buf_pa, buf_va)
+    }
+
+    fn block_size(&self) -> u32 {
+        512
+    }
+
+    fn total_blocks(&self) -> u64 {
+        self.capacity_sectors()
+    }
+
+    fn name(&self) -> &str {
+        "blk0"
     }
 }
 

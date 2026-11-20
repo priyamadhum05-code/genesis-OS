@@ -11,7 +11,7 @@ use crate::{
         virtio_input::{poll_global_pointer, poll_global_virtio_input},
         VirtIOBlockDevice,
     },
-    fs::{FatDirEntry, FatVolume},
+    fs::{BlockDevice, FatDirEntry, FatVolume},
 };
 
 pub const WIN_TERMINAL: usize = 0;
@@ -129,6 +129,7 @@ pub struct DesktopCompositor {
     pub heap_total_bytes: usize,
     pub cpus_online: u64,
     pub frame_count: u64,
+    pub dirty_rect: Option<(u32, u32, u32, u32)>,
 }
 
 pub fn get_uptime_seconds() -> u64 {
@@ -159,6 +160,29 @@ pub fn write_u64_to_buf(mut val: u64, buf: &mut [u8]) -> usize {
     while val > 0 && len < temp.len() {
         temp[len] = b'0' + (val % 10) as u8;
         val /= 10;
+        len += 1;
+    }
+    let out_len = len.min(buf.len());
+    for i in 0..out_len {
+        buf[i] = temp[len - 1 - i];
+    }
+    out_len
+}
+
+pub fn write_hex_u64_to_buf(mut val: u64, buf: &mut [u8]) -> usize {
+    if val == 0 {
+        if !buf.is_empty() {
+            buf[0] = b'0';
+            return 1;
+        }
+        return 0;
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut temp = [0u8; 16];
+    let mut len = 0;
+    while val > 0 && len < temp.len() {
+        temp[len] = HEX[(val & 0xF) as usize];
+        val >>= 4;
         len += 1;
     }
     let out_len = len.min(buf.len());
@@ -215,6 +239,26 @@ pub fn format_smp(cpus: u64, buf: &mut [u8; 16]) -> &str {
     buf[p] = b'C';
     p += 1;
     core::str::from_utf8(&buf[..p]).unwrap_or("SMP: 1C")
+}
+
+pub(crate) unsafe fn resolve_ui_fs<'b>(
+    fallback_fat: Option<&'b FatVolume>,
+    fallback_dev: Option<&'b mut VirtIOBlockDevice>,
+) -> (Option<&'b FatVolume>, Option<crate::fs::AnyBlockDev<'b>>) {
+    let active_name = crate::fs::get_active_volume_name();
+    let active_fat = crate::fs::get_active_volume();
+    if active_name != "none" && active_fat.is_some() {
+        let f = active_fat.unwrap();
+        if active_name == "blk0" && fallback_dev.is_some() {
+            (Some(f), fallback_dev.map(crate::fs::AnyBlockDev::VirtIO))
+        } else if let Some(bd) = crate::fs::get_block_device_by_name(active_name) {
+            (Some(f), Some(bd))
+        } else {
+            (Some(f), fallback_dev.map(crate::fs::AnyBlockDev::VirtIO))
+        }
+    } else {
+        (fallback_fat, fallback_dev.map(crate::fs::AnyBlockDev::VirtIO))
+    }
 }
 
 impl DesktopCompositor {
@@ -334,6 +378,7 @@ impl DesktopCompositor {
             heap_total_bytes: 512 * 1024,
             cpus_online: 4,
             frame_count: 0,
+            dirty_rect: Some((0, 0, width, height)),
         };
 
         comp.append_term_line("Project Genesis OS (Stage 16)");
@@ -341,6 +386,30 @@ impl DesktopCompositor {
         comp.append_term_line("Type commands or click windows.");
 
         comp
+    }
+
+    pub fn mark_dirty(&mut self, x: i32, y: i32, w: u32, h: u32) {
+        if w == 0 || h == 0 { return; }
+        let x1 = x.max(0) as u32;
+        let y1 = y.max(0) as u32;
+        let x2 = ((x + w as i32).max(0) as u32).min(self.width);
+        let y2 = ((y + h as i32).max(0) as u32).min(self.height);
+        if x2 <= x1 || y2 <= y1 { return; }
+        let (nx, ny, nw, nh) = (x1, y1, x2 - x1, y2 - y1);
+        match self.dirty_rect {
+            None => self.dirty_rect = Some((nx, ny, nw, nh)),
+            Some((dx, dy, dw, dh)) => {
+                let min_x = dx.min(nx);
+                let min_y = dy.min(ny);
+                let max_x = (dx + dw).max(nx + nw);
+                let max_y = (dy + dh).max(ny + nh);
+                self.dirty_rect = Some((min_x, min_y, max_x - min_x, max_y - min_y));
+            }
+        }
+    }
+
+    pub fn mark_dirty_all(&mut self) {
+        self.dirty_rect = Some((0, 0, self.width, self.height));
     }
 
     pub fn current_dir_str(&self) -> &str {
@@ -419,7 +488,8 @@ impl DesktopCompositor {
             }
         };
 
-        if let (Some(fat_vol), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+        let (eff_fat, mut eff_dev) = resolve_ui_fs(fat, dev.as_deref_mut());
+        if let (Some(fat_vol), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
             match fat_vol.write_file(d, filename, &self.editor_buf[..self.editor_len], scratch_pa, scratch_va) {
                 Ok(()) => {
                     self.set_editor_status("File saved OK");
@@ -611,7 +681,7 @@ impl DesktopCompositor {
     pub unsafe fn refresh_explorer(
         &mut self,
         fat: &FatVolume,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl crate::fs::BlockDevice,
         scratch_pa: u64,
         scratch_va: u64,
     ) {
@@ -653,7 +723,7 @@ impl DesktopCompositor {
     pub unsafe fn update_file_preview(
         &mut self,
         fat: &FatVolume,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl crate::fs::BlockDevice,
         scratch_pa: u64,
         scratch_va: u64,
     ) {
@@ -826,6 +896,7 @@ impl DesktopCompositor {
                                 self.save_editor_file(fat, dev, scratch_pa, scratch_va);
                             }
                         } else if win_id == WIN_EXPLORER {
+                            let (eff_fat, mut eff_dev) = resolve_ui_fs(fat, dev.as_deref_mut());
                             // Check [OPEN IN EDITOR] button in right preview pane
                             let div_x = win.x + ((win.w as i32 * 38) / 100);
                             let preview_box_w = (win.w as i32).saturating_sub((div_x - win.x) + 24);
@@ -836,7 +907,7 @@ impl DesktopCompositor {
                                 if self.selected_file < self.file_count && !self.files[self.selected_file].is_dir {
                                     let entry = self.files[self.selected_file];
                                     let fname = entry.name_str();
-                                    if let (Some(f), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+                                    if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
                                         let mut scratch_buf = [0u8; 1024];
                                         if let Ok(bytes) = f.read_file(d, fname, scratch_pa, scratch_va, 1024, scratch_pa, scratch_va) {
                                             core::ptr::copy_nonoverlapping(scratch_va as *const u8, scratch_buf.as_mut_ptr(), bytes.min(1024));
@@ -856,7 +927,7 @@ impl DesktopCompositor {
                                     if entry.is_dir {
                                         if entry.name_str() == ".." {
                                             self.set_current_dir("/");
-                                            if let (Some(f), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+                                            if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
                                                 self.refresh_explorer(f, d, scratch_pa, scratch_va);
                                             }
                                         } else {
@@ -867,12 +938,12 @@ impl DesktopCompositor {
                                             new_dir[1..1 + n_len].copy_from_slice(&name.as_bytes()[..n_len]);
                                             if let Ok(nd_str) = core::str::from_utf8(&new_dir[..1 + n_len]) {
                                                 self.set_current_dir(nd_str);
-                                                if let (Some(f), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+                                                if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
                                                     self.refresh_explorer(f, d, scratch_pa, scratch_va);
                                                 }
                                             }
                                         }
-                                    } else if let (Some(f), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+                                    } else if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
                                         self.update_file_preview(f, d, scratch_pa, scratch_va);
                                     }
                                 }
@@ -967,18 +1038,210 @@ impl DesktopCompositor {
         scratch_pa: u64,
         scratch_va: u64,
     ) {
+        let (eff_fat, mut eff_dev) = resolve_ui_fs(fat, dev.as_deref_mut());
         let mut parts = cmd_str.splitn(2, ' ');
         let cmd = parts.next().unwrap_or("").trim();
         let arg = parts.next().unwrap_or("").trim();
 
         match cmd {
             "help" => {
-                self.append_term_line("Commands: help, ls, cat, write, info,");
-                self.append_term_line("  ramstat, bench, lspci, lsusb, clear,");
-                self.append_term_line("  nvmeinfo, nvmeread, usbstorage, cpuinfo, gpuinfo, halt");
+                self.append_term_line("Commands: help, ls, cat, write, mount, lsblk,");
+                self.append_term_line("  acpiinfo, lspci, lsusb, info, ramstat, bench,");
+                self.append_term_line("  nvmeinfo, nvmeread, usbstorage, cpuinfo, gpuinfo, clear, halt");
             }
             "clear" => {
                 self.term_line_count = 0;
+            }
+            "acpiinfo" => {
+                if let Some(acpi) = crate::arch::acpi::get_global_acpi_ref() {
+                    self.append_term_line("=== ACPI 2.0+ Hardware Configuration ===");
+                    let mut b = [0u8; 96];
+                    let mut p = 0;
+                    let r_pre = b"RSDP: 0x";
+                    b[p..p + r_pre.len()].copy_from_slice(r_pre); p += r_pre.len();
+                    p += write_hex_u64_to_buf(acpi.rsdp.rsdp_pa, &mut b[p..]);
+                    let r_mid = b" Rev: ";
+                    b[p..p + r_mid.len()].copy_from_slice(r_mid); p += r_mid.len();
+                    p += write_u64_to_buf(acpi.rsdp.revision as u64, &mut b[p..]);
+                    let r_oem = b" OEM: ";
+                    b[p..p + r_oem.len()].copy_from_slice(r_oem); p += r_oem.len();
+                    let oem_bytes = acpi.rsdp.oem_id_str().as_bytes();
+                    let olen = oem_bytes.len().min(96 - p);
+                    b[p..p + olen].copy_from_slice(&oem_bytes[..olen]); p += olen;
+                    if let Ok(s) = core::str::from_utf8(&b[..p]) { self.append_term_line(s); }
+
+                    let mut b2 = [0u8; 96];
+                    let mut p2 = 0;
+                    let x_pre = b"XSDT: 0x";
+                    b2[p2..p2 + x_pre.len()].copy_from_slice(x_pre); p2 += x_pre.len();
+                    p2 += write_hex_u64_to_buf(acpi.rsdp.xsdt_pa, &mut b2[p2..]);
+                    let x_mid = b" (";
+                    b2[p2..p2 + x_mid.len()].copy_from_slice(x_mid); p2 += x_mid.len();
+                    p2 += write_u64_to_buf(acpi.xsdt_entries_count as u64, &mut b2[p2..]);
+                    let x_post = b" entries)";
+                    b2[p2..p2 + x_post.len()].copy_from_slice(x_post); p2 += x_post.len();
+                    if let Ok(s) = core::str::from_utf8(&b2[..p2]) { self.append_term_line(s); }
+
+                    if let Some(ref madt) = acpi.madt {
+                        let mut b3 = [0u8; 96];
+                        let mut p3 = 0;
+                        let m_pre = b"MADT: ";
+                        b3[p3..p3 + m_pre.len()].copy_from_slice(m_pre); p3 += m_pre.len();
+                        p3 += write_u64_to_buf(madt.enabled_cpus as u64, &mut b3[p3..]);
+                        let m_mid = b" CPUs | GICD: 0x";
+                        b3[p3..p3 + m_mid.len()].copy_from_slice(m_mid); p3 += m_mid.len();
+                        p3 += write_hex_u64_to_buf(madt.gicd_base, &mut b3[p3..]);
+                        if let Ok(s) = core::str::from_utf8(&b3[..p3]) { self.append_term_line(s); }
+                    }
+
+                    if let Some(ref mcfg) = acpi.mcfg {
+                        let mut b4 = [0u8; 96];
+                        let mut p4 = 0;
+                        let mc_pre = b"MCFG: ECAM 0x";
+                        b4[p4..p4 + mc_pre.len()].copy_from_slice(mc_pre); p4 += mc_pre.len();
+                        p4 += write_hex_u64_to_buf(mcfg.ecam_base, &mut b4[p4..]);
+                        let mc_mid = b" (Buses ";
+                        b4[p4..p4 + mc_mid.len()].copy_from_slice(mc_mid); p4 += mc_mid.len();
+                        p4 += write_u64_to_buf(mcfg.start_bus as u64, &mut b4[p4..]);
+                        let mc_to = b"..";
+                        b4[p4..p4 + mc_to.len()].copy_from_slice(mc_to); p4 += mc_to.len();
+                        p4 += write_u64_to_buf(mcfg.end_bus as u64, &mut b4[p4..]);
+                        b4[p4] = b')'; p4 += 1;
+                        if let Ok(s) = core::str::from_utf8(&b4[..p4]) { self.append_term_line(s); }
+                    }
+
+                    if let Some(ref spcr) = acpi.spcr {
+                        let mut b5 = [0u8; 96];
+                        let mut p5 = 0;
+                        let sp_pre = b"SPCR: UART 0x";
+                        b5[p5..p5 + sp_pre.len()].copy_from_slice(sp_pre); p5 += sp_pre.len();
+                        p5 += write_hex_u64_to_buf(spcr.uart_base, &mut b5[p5..]);
+                        let sp_mid = b" GSIV ";
+                        b5[p5..p5 + sp_mid.len()].copy_from_slice(sp_mid); p5 += sp_mid.len();
+                        p5 += write_u64_to_buf(spcr.gsiv as u64, &mut b5[p5..]);
+                        if let Ok(s) = core::str::from_utf8(&b5[..p5]) { self.append_term_line(s); }
+                    }
+                } else {
+                    self.append_term_line("No ACPI tables detected");
+                }
+            }
+            "lsblk" => {
+                self.append_term_line("NAME   TYPE                  SIZE      SEC   MOUNT");
+                let active_name = crate::fs::get_active_volume_name();
+
+                if let Some(dev_ptr) = crate::drivers::virtio_blk::get_global_virtio_blk() {
+                    let d = unsafe { &*dev_ptr };
+                    let mib = (d.capacity_sectors() * 512) / (1024 * 1024);
+                    let mut b = [0u8; 64];
+                    let mut p = 0;
+                    let pre = b"blk0   VirtIO-Blk            ";
+                    b[p..p + pre.len()].copy_from_slice(pre); p += pre.len();
+                    p += write_u64_to_buf(mib, &mut b[p..]);
+                    let mid = b" MiB   512   ";
+                    b[p..p + mid.len()].copy_from_slice(mid); p += mid.len();
+                    if active_name == "blk0" {
+                        b[p] = b'/'; p += 1;
+                    } else {
+                        b[p] = b'-'; p += 1;
+                    }
+                    if let Ok(s) = core::str::from_utf8(&b[..p]) { self.append_term_line(s); }
+                }
+
+                if let Some(nvme) = crate::drivers::nvme::get_global_nvme_ref() {
+                    if nvme.is_initialized {
+                        let mib = (nvme.total_blocks * nvme.lba_bytes as u64) / (1024 * 1024);
+                        let mut b = [0u8; 64];
+                        let mut p = 0;
+                        let pre = b"nvme0  PCIe NVMe SSD         ";
+                        b[p..p + pre.len()].copy_from_slice(pre); p += pre.len();
+                        p += write_u64_to_buf(mib, &mut b[p..]);
+                        let mid = b" MiB   ";
+                        b[p..p + mid.len()].copy_from_slice(mid); p += mid.len();
+                        p += write_u64_to_buf(nvme.lba_bytes as u64, &mut b[p..]);
+                        let post = b"   ";
+                        b[p..p + post.len()].copy_from_slice(post); p += post.len();
+                        if active_name == "nvme0" {
+                            b[p] = b'/'; p += 1;
+                        } else {
+                            b[p] = b'-'; p += 1;
+                        }
+                        if let Ok(s) = core::str::from_utf8(&b[..p]) { self.append_term_line(s); }
+                    }
+                }
+
+                if let Some(usb) = crate::drivers::usb_msc::get_global_usb_msc_ref() {
+                    if usb.is_initialized {
+                        let mib = (usb.total_blocks * usb.block_size as u64) / (1024 * 1024);
+                        let mut b = [0u8; 64];
+                        let mut p = 0;
+                        let pre = b"usb0   USB Mass Storage      ";
+                        b[p..p + pre.len()].copy_from_slice(pre); p += pre.len();
+                        p += write_u64_to_buf(mib, &mut b[p..]);
+                        let mid = b" MiB   ";
+                        b[p..p + mid.len()].copy_from_slice(mid); p += mid.len();
+                        p += write_u64_to_buf(usb.block_size as u64, &mut b[p..]);
+                        let post = b"   ";
+                        b[p..p + post.len()].copy_from_slice(post); p += post.len();
+                        if active_name == "usb0" {
+                            b[p] = b'/'; p += 1;
+                        } else {
+                            b[p] = b'-'; p += 1;
+                        }
+                        if let Ok(s) = core::str::from_utf8(&b[..p]) { self.append_term_line(s); }
+                    }
+                }
+            }
+            "mount" => {
+                if arg.is_empty() {
+                    self.append_term_line("Usage: mount <dev> (e.g. blk0, nvme0, usb0)");
+                } else if let Some(mut bd) = unsafe { crate::fs::get_block_device_by_name(arg) } {
+                    if scratch_pa != 0 && scratch_va != 0 {
+                        match unsafe { bd.read_sectors(0, 1, scratch_pa, scratch_va) } {
+                            Ok(()) => {
+                                let sec0_slice = unsafe { core::slice::from_raw_parts(scratch_va as *const u8, 512) };
+                                if let Ok(sec0_arr) = sec0_slice.try_into() {
+                                    match crate::fs::locate_volume(sec0_arr) {
+                                        Ok(vol_lba) => {
+                                            match unsafe { bd.read_sectors(vol_lba, 1, scratch_pa, scratch_va) } {
+                                                Ok(()) => {
+                                                    let bpb_slice = unsafe { core::slice::from_raw_parts(scratch_va as *const u8, 512) };
+                                                    if let Ok(bpb_arr) = bpb_slice.try_into() {
+                                                        match crate::fs::FatVolume::parse_bpb(vol_lba, bpb_arr) {
+                                                            Ok(vol) => {
+                                                                crate::fs::set_active_volume(vol, arg);
+                                                                let mut b = [0u8; 64];
+                                                                let pre = b"Mounted ";
+                                                                b[..pre.len()].copy_from_slice(pre);
+                                                                let mut p = pre.len();
+                                                                let ab = arg.as_bytes();
+                                                                let alen = ab.len().min(16);
+                                                                b[p..p + alen].copy_from_slice(&ab[..alen]); p += alen;
+                                                                let post = b" as active FAT32 volume";
+                                                                b[p..p + post.len()].copy_from_slice(post); p += post.len();
+                                                                if let Ok(s) = core::str::from_utf8(&b[..p]) {
+                                                                    self.append_term_line(s);
+                                                                }
+                                                                self.refresh_explorer(&vol, &mut bd, scratch_pa, scratch_va);
+                                                            }
+                                                            Err(e) => { self.append_term_line(e); }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => { self.append_term_line(e); }
+                                            }
+                                        }
+                                        Err(e) => { self.append_term_line(e); }
+                                    }
+                                }
+                            }
+                            Err(e) => { self.append_term_line(e); }
+                        }
+                    } else {
+                        self.append_term_line("Scratch buffer unavailable");
+                    }
+                } else {
+                    self.append_term_line("Device not found or not initialized");
+                }
             }
             "lspci" => {
                 let dev_count = unsafe { crate::drivers::pci::PCI_DEVICE_COUNT };
@@ -1106,7 +1369,7 @@ impl DesktopCompositor {
                 self.append_term_line("Benchmark complete: 1842 ticks (~76 us)");
             }
             "ls" => {
-                if let (Some(fat_vol), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+                if let (Some(fat_vol), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
                     let mut path_buf = [0u8; 32];
                     let path = if arg.is_empty() {
                         let cd = self.current_dir_str();
@@ -1157,7 +1420,7 @@ impl DesktopCompositor {
             "cat" => {
                 if arg.is_empty() {
                     self.append_term_line("Usage: cat <filename>");
-                } else if let (Some(fat_vol), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+                } else if let (Some(fat_vol), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
                     let mut read_buf = [0u8; 256];
                     let read_va = read_buf.as_mut_ptr() as u64;
                     match fat_vol.read_file(d, arg, read_va, read_va, 256, scratch_pa, scratch_va) {
@@ -1211,7 +1474,7 @@ impl DesktopCompositor {
                 let text = write_parts.next().unwrap_or("").trim();
                 if filename.is_empty() {
                     self.append_term_line("Usage: write <file> <text>");
-                } else if let (Some(fat_vol), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+                } else if let (Some(fat_vol), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
                     match fat_vol.write_file(d, filename, text.as_bytes(), scratch_pa, scratch_va) {
                         Ok(()) => {
                             let written = text.len();
@@ -1229,7 +1492,7 @@ impl DesktopCompositor {
                                 self.append_term_line(s);
                             }
                             // Auto-refresh File Explorer after write
-                            self.refresh_explorer(fat_vol, d, scratch_pa, scratch_va);
+                            self.refresh_explorer(fat_vol, *d, scratch_pa, scratch_va);
                         }
                         Err(e) => {
                             let mut err_buf = [0u8; 64];
@@ -1891,7 +2154,8 @@ pub unsafe fn run_desktop_gui(
     comp.heap_total_bytes = crate::mm::HEAP_ALLOCATOR.total_bytes();
     comp.cpus_online = crate::arch::ONLINE_CPUS.load(core::sync::atomic::Ordering::Relaxed) as u64;
 
-    if let (Some(f), Some(ref mut d)) = (fat, dev.as_deref_mut()) {
+    let (init_fat, mut init_dev) = resolve_ui_fs(fat, dev.as_deref_mut());
+    if let (Some(f), Some(ref mut d)) = (init_fat, init_dev.as_mut()) {
         comp.refresh_explorer(f, d, scratch_pa, scratch_va);
     }
 
@@ -1903,7 +2167,9 @@ pub unsafe fn run_desktop_gui(
         left_button: false,
         right_button: false,
     };
+    let mut prev_pointer = pointer;
 
+    comp.mark_dirty_all();
     comp.render_frame(&pointer);
     comp.blit(fb);
     if let Some(gpu_ptr) = crate::drivers::virtio_gpu::get_global_virtio_gpu() {
@@ -1959,7 +2225,19 @@ pub unsafe fn run_desktop_gui(
         }
 
         comp.frame_count += 1;
+        if pointer.x != prev_pointer.x || pointer.y != prev_pointer.y {
+            comp.mark_dirty(prev_pointer.x - 2, prev_pointer.y - 2, 24, 24);
+            comp.mark_dirty(pointer.x - 2, pointer.y - 2, 24, 24);
+            prev_pointer = pointer;
+        }
+
         if need_render || (comp.frame_count % 30 == 0) {
+            if comp.frame_count % 30 == 0 {
+                comp.mark_dirty(0, 0, fb.width, 32);
+                let sys = comp.windows[WIN_SYSMON];
+                comp.mark_dirty(sys.x, sys.y, sys.w, sys.h);
+            }
+
             comp.heap_used_bytes = crate::mm::HEAP_ALLOCATOR.allocated_bytes();
             comp.heap_total_bytes = crate::mm::HEAP_ALLOCATOR.total_bytes();
             comp.cpus_online = crate::arch::ONLINE_CPUS.load(core::sync::atomic::Ordering::Relaxed) as u64;
@@ -1967,7 +2245,11 @@ pub unsafe fn run_desktop_gui(
             comp.render_frame(&pointer);
             comp.blit(fb);
             if let Some(gpu_ptr) = crate::drivers::virtio_gpu::get_global_virtio_gpu() {
-                let _ = (*gpu_ptr).flush();
+                if let Some((dx, dy, dw, dh)) = comp.dirty_rect.take() {
+                    let _ = (*gpu_ptr).transfer_and_flush_rect(dx, dy, dw, dh);
+                } else {
+                    let _ = (*gpu_ptr).flush();
+                }
             }
         }
 
@@ -2164,6 +2446,10 @@ mod tests {
             comp.execute_term_command("usbstorage", None, None, 0, 0);
             comp.execute_term_command("cpuinfo", None, None, 0, 0);
             comp.execute_term_command("gpuinfo", None, None, 0, 0);
+            comp.execute_term_command("acpiinfo", None, None, 0, 0);
+            comp.execute_term_command("lsblk", None, None, 0, 0);
+            comp.execute_term_command("mount", None, None, 0, 0);
+            comp.execute_term_command("mount invalid_dev", None, None, 0, 0);
 
             comp.execute_term_command("clear", None, None, 0, 0);
             assert_eq!(comp.term_line_count, 0);

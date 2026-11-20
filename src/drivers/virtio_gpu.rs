@@ -1,6 +1,7 @@
 //! Native VirtIO-GPU 2D Driver over VirtIO-PCI.
 
-use crate::drivers::pci::{PciDeviceInfo, VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_NOTIFY_CFG};
+use crate::drivers::pci::{PciDeviceInfo, VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_NOTIFY_CFG, VIRTIO_PCI_CAP_DEVICE_CFG};
+use crate::drivers::xhci::{clean_dcache_range, invalidate_dcache_range};
 use crate::pmm::PhysicalPageAllocator;
 
 pub const VIRTIO_GPU_CMD_GET_DISPLAY_INFO: u32 = 0x0100;
@@ -333,6 +334,12 @@ pub fn get_global_virtio_gpu() -> Option<*mut VirtIOGpuDevice> {
     unsafe { GLOBAL_VIRTIO_GPU }
 }
 
+/// Compute byte offset within backing buffer for a sub-rectangle
+#[inline]
+pub const fn calculate_flush_offset(x: u32, y: u32, width: u32) -> u64 {
+    (y as u64 * width as u64 + x as u64) * 4
+}
+
 impl VirtIOGpuDevice {
     pub const fn empty() -> Self {
         Self {
@@ -369,6 +376,7 @@ impl VirtIOGpuDevice {
     ) -> Result<(), &'static str> {
         let mut common_cap = None;
         let mut notify_cap = None;
+        let mut device_cap = None;
 
         for i in 0..dev.cap_count {
             let cap = dev.capabilities[i];
@@ -376,6 +384,8 @@ impl VirtIOGpuDevice {
                 common_cap = Some(cap);
             } else if cap.cfg_type == VIRTIO_PCI_CAP_NOTIFY_CFG {
                 notify_cap = Some(cap);
+            } else if cap.cfg_type == VIRTIO_PCI_CAP_DEVICE_CFG {
+                device_cap = Some(cap);
             }
         }
 
@@ -475,6 +485,28 @@ impl VirtIOGpuDevice {
         self.flush_count = 0;
         self.is_initialized = true;
 
+        if self.is_virgl {
+            let mut found_count = 0u32;
+            if let Some(dev_cap) = device_cap {
+                if dev_cap.bar == common.bar {
+                    let dev_cfg_va = bar_va + dev_cap.offset as u64;
+                    // struct virtio_gpu_config: offset 0x0C is num_capsets
+                    let n = core::ptr::read_volatile((dev_cfg_va + 0x0C) as *const u32);
+                    found_count = n;
+                }
+            }
+            if found_count == 0 {
+                if let Ok(info) = self.get_capset_info(0) {
+                    if info.capset_id > 0 || info.capset_max_version > 0 {
+                        found_count = 1;
+                    }
+                }
+            }
+            self.capset_count = found_count.max(1);
+        } else {
+            self.capset_count = 0;
+        }
+
         Ok(())
     }
 
@@ -525,6 +557,7 @@ impl VirtIOGpuDevice {
         core::ptr::write_volatile(&mut (*avail).idx, avail_idx.wrapping_add(1));
 
         // Flush request buffer to memory & notify
+        clean_dcache_range(self.cmd_buf_va, req_len as usize);
         #[cfg(target_arch = "aarch64")]
         {
             core::arch::asm!("dsb sy", options(nomem, nostack));
@@ -548,6 +581,7 @@ impl VirtIOGpuDevice {
         }
 
         // Invalidate response buffer
+        invalidate_dcache_range(self.resp_buf_va, resp_len as usize);
         #[cfg(target_arch = "aarch64")]
         {
             core::arch::asm!("dsb sy", options(nomem, nostack));
@@ -657,6 +691,8 @@ impl VirtIOGpuDevice {
 
     /// Transfer updated framebuffer rectangular region to host and flush to display
     pub unsafe fn flush_rect(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), &'static str> {
+        let byte_offset = calculate_flush_offset(x, y, self.width);
+
         // 1. TRANSFER_TO_HOST_2D
         let xfer_cmd = self.cmd_buf_va as *mut VirtioGpuTransferToHost2d;
         core::ptr::write_volatile(
@@ -675,7 +711,7 @@ impl VirtIOGpuDevice {
                     width,
                     height,
                 },
-                offset: 0,
+                offset: byte_offset,
                 resource_id: self.resource_id,
                 padding: 0,
             },
@@ -973,6 +1009,14 @@ mod tests {
         assert_eq!(VIRTIO_GPU_RESP_OK_DISPLAY_INFO, 0x1101);
         assert_eq!(VIRTIO_GPU_RESP_OK_CAPSET_INFO, 0x1102);
         assert_eq!(VIRTIO_GPU_RESP_OK_CAPSET, 0x1103);
+    }
+
+    #[test]
+    fn calculate_flush_offset_math() {
+        assert_eq!(calculate_flush_offset(0, 0, 1024), 0);
+        assert_eq!(calculate_flush_offset(10, 0, 1024), 40);
+        assert_eq!(calculate_flush_offset(0, 1, 1024), 1024 * 4);
+        assert_eq!(calculate_flush_offset(100, 50, 1920), (50 * 1920 + 100) * 4);
     }
 
     #[test]

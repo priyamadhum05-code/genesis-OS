@@ -3,7 +3,7 @@
 //! Parses MBR partition tables, FAT BPB (Boot Parameter Block),
 //! directory entries, and cluster chains to load arbitrary files into memory.
 
-use crate::drivers::VirtIOBlockDevice;
+use crate::fs::BlockDevice;
 
 /// Searches Sector 0 for a direct FAT BPB or an MBR partition table.
 /// Returns the starting LBA sector of the FAT volume.
@@ -158,7 +158,7 @@ impl FatVolume {
     /// Returns the number of bytes read.
     pub unsafe fn read_file(
         &self,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl BlockDevice,
         path: &str,
         dest_pa: u64,
         dest_va: u64,
@@ -294,7 +294,7 @@ impl FatVolume {
     /// Looks up the next cluster in the FAT for cluster `curr_clus`.
     unsafe fn get_next_cluster(
         &self,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl BlockDevice,
         curr_clus: u32,
         scratch_pa: u64,
         scratch_va: u64,
@@ -321,7 +321,7 @@ impl FatVolume {
     /// Returns `(first_cluster, file_size, is_dir)`.
     unsafe fn find_entry_in_dir(
         &self,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl BlockDevice,
         dir_clus: u32,
         target_8_3: &[u8; 11],
         scratch_pa: u64,
@@ -408,7 +408,7 @@ impl FatVolume {
     /// Enumerates directory entries in directory cluster `dir_clus` (or root if 0 on FAT16).
     pub unsafe fn list_dir_cluster<F: FnMut(&FatDirEntry)>(
         &self,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl BlockDevice,
         dir_clus: u32,
         scratch_pa: u64,
         scratch_va: u64,
@@ -446,7 +446,7 @@ impl FatVolume {
     /// Resolves `path` (or root if empty or "/") and enumerates all directory entries.
     pub unsafe fn list_dir<F: FnMut(&FatDirEntry)>(
         &self,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl BlockDevice,
         path: &str,
         scratch_pa: u64,
         scratch_va: u64,
@@ -565,7 +565,7 @@ impl FatVolume {
     /// Scans the FAT table for the first free cluster (entry == 0) starting at `start_clus`.
     pub unsafe fn find_free_cluster(
         &self,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl BlockDevice,
         start_clus: u32,
         scratch_pa: u64,
         scratch_va: u64,
@@ -606,7 +606,7 @@ impl FatVolume {
     /// Sets the FAT entry for cluster `clus` to `next_val` in all FAT copies.
     pub unsafe fn set_fat_entry(
         &self,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl BlockDevice,
         clus: u32,
         next_val: u32,
         scratch_pa: u64,
@@ -643,7 +643,7 @@ impl FatVolume {
     /// Frees an allocated cluster chain starting at `start_clus` by clearing all FAT entries to 0.
     pub unsafe fn free_cluster_chain(
         &self,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl BlockDevice,
         start_clus: u32,
         scratch_pa: u64,
         scratch_va: u64,
@@ -662,7 +662,7 @@ impl FatVolume {
     /// Returns `(sector_lba, slot_offset, existing_first_clus, is_new_entry)`.
     unsafe fn find_dir_slot_for_write(
         &self,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl BlockDevice,
         dir_clus: u32,
         target_8_3: &[u8; 11],
         scratch_pa: u64,
@@ -763,7 +763,7 @@ impl FatVolume {
     /// writes file data to sectors, and updates the directory entry with file size.
     pub unsafe fn write_file(
         &self,
-        dev: &mut VirtIOBlockDevice,
+        dev: &mut impl BlockDevice,
         path: &str,
         data: &[u8],
         scratch_pa: u64,
@@ -1026,6 +1026,7 @@ pub fn to_short_8_3(name: &str) -> Option<[u8; 11]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drivers::VirtIOBlockDevice;
 
     #[test]
     fn format_8_3_test() {

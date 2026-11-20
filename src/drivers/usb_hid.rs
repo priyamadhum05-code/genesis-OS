@@ -21,6 +21,7 @@ pub enum UsbDeviceKind {
     Keyboard,
     Mouse,
     MassStorage,
+    Hub,
     Other(u8),
 }
 
@@ -30,6 +31,7 @@ impl UsbDeviceKind {
             UsbDeviceKind::Keyboard => "HID Keyboard",
             UsbDeviceKind::Mouse => "HID Mouse",
             UsbDeviceKind::MassStorage => "USB Mass Storage",
+            UsbDeviceKind::Hub => "USB Hub",
             UsbDeviceKind::Other(_) => "USB HID Other",
             UsbDeviceKind::Unknown => "Unknown Device",
         }
@@ -307,6 +309,219 @@ pub unsafe fn enumerate_usb_devices<const WORDS: usize>(
         let dev_buf = core::slice::from_raw_parts(ctrl_va as *const u8, 18);
         let vid = (dev_buf[8] as u16) | ((dev_buf[9] as u16) << 8);
         let pid = (dev_buf[10] as u16) | ((dev_buf[11] as u16) << 8);
+
+        // Check for USB Hub device (bDeviceClass == 0x09)
+        if dev_buf[4] == 0x09 {
+            let get_hub = UsbSetupPacket::get_hub_descriptor(8);
+            if xhci.control_transfer(slot_id, get_hub, ctrl_pa, ctrl_va, 8, true).is_ok() {
+                let hub_slice = core::slice::from_raw_parts(ctrl_va as *const u8, 8);
+                let num_hub_ports = hub_slice[2];
+
+                write_input_control_context(input_ctx_va, 0, (1 << 0) | (1 << 1));
+                crate::drivers::xhci::write_slot_context_ext(
+                    input_ctx_va, xhci.ctx_size, true, 0, speed, 1, port,
+                    true, num_hub_ports, 0, 0, false, 0,
+                );
+                clean_dcache_range(input_ctx_va, 4096);
+                let _ = xhci.configure_endpoint(slot_id, input_ctx_pa);
+                let _ = xhci.control_transfer(slot_id, UsbSetupPacket::set_configuration(1), 0, 0, 0, false);
+
+                if ENUMERATED_USB_COUNT < 8 {
+                    let hub_dev_info = UsbDeviceInfo {
+                        slot_id,
+                        port_id: port,
+                        speed,
+                        vendor_id: vid,
+                        product_id: pid,
+                        kind: UsbDeviceKind::Hub,
+                        intr_dci: 0,
+                    };
+                    ENUMERATED_USB_DEVICES[ENUMERATED_USB_COUNT] = Some(hub_dev_info);
+                    ENUMERATED_USB_COUNT += 1;
+                }
+
+                // Power on downstream ports
+                for hp in 1..=num_hub_ports {
+                    let pwr = UsbSetupPacket::set_hub_port_feature(hp, 0x08); // PORT_POWER
+                    let _ = xhci.control_transfer(slot_id, pwr, 0, 0, 0, false);
+                }
+
+                for _ in 0..10_000 { core::hint::spin_loop(); }
+
+                for hp in 1..=num_hub_ports {
+                    let st_pkt = UsbSetupPacket::get_hub_port_status(hp);
+                    if xhci.control_transfer(slot_id, st_pkt, ctrl_pa, ctrl_va, 4, true).is_ok() {
+                        let st = core::slice::from_raw_parts(ctrl_va as *const u8, 4);
+                        if (st[0] & 1) != 0 {
+                            let rst = UsbSetupPacket::set_hub_port_feature(hp, 0x04); // PORT_RESET
+                            let _ = xhci.control_transfer(slot_id, rst, 0, 0, 0, false);
+                            for _ in 0..20_000 { core::hint::spin_loop(); }
+
+                            let child_speed = if xhci.control_transfer(slot_id, st_pkt, ctrl_pa, ctrl_va, 4, true).is_ok() {
+                                let st2 = core::slice::from_raw_parts(ctrl_va as *const u8, 4);
+                                let speed_bits = (st2[1] >> 1) & 0x3;
+                                if speed_bits == 1 { 2 } else if speed_bits == 2 { 3 } else { 1 }
+                            } else {
+                                1
+                            };
+
+                            let child_slot_id = match xhci.enable_slot() {
+                                Ok(id) if id != 0 && (id as usize) < xhci.slots.len() => id,
+                                _ => continue,
+                            };
+
+                            let child_out_pa = match pmm.allocate_page() { Some(pa) => pa, None => continue };
+                            let child_out_va = hhdm_base + child_out_pa;
+                            ptr::write_bytes(child_out_va as *mut u8, 0, 4096);
+                            clean_dcache_range(child_out_va, 4096);
+
+                            let child_in_pa = match pmm.allocate_page() { Some(pa) => pa, None => continue };
+                            let child_in_va = hhdm_base + child_in_pa;
+                            ptr::write_bytes(child_in_va as *mut u8, 0, 4096);
+
+                            let child_ep0_pa = match pmm.allocate_page() { Some(pa) => pa, None => continue };
+                            let child_ep0_va = hhdm_base + child_ep0_pa;
+                            ptr::write_bytes(child_ep0_va as *mut u8, 0, 4096);
+                            let link = Trb::link(child_ep0_pa, true, true);
+                            ptr::write_volatile((child_ep0_va as *mut Trb).add(255), link);
+                            clean_dcache_range(child_ep0_va, 4096);
+
+                            ptr::write_volatile((xhci.dcbaa_va as *mut u64).add(child_slot_id as usize), child_out_pa);
+                            clean_dcache_range(xhci.dcbaa_va + (child_slot_id as u64 * 8), 8);
+
+                            let child_max_pkt: u16 = match child_speed { 2 => 8, 1 => 64, 3 => 64, _ => 64 };
+                            let child_route = crate::drivers::xhci::calculate_child_route_string(0, 0, hp);
+
+                            write_input_control_context(child_in_va, 0, (1 << 0) | (1 << 1));
+                            crate::drivers::xhci::write_slot_context_ext(
+                                child_in_va, xhci.ctx_size, true, child_route, child_speed, 1, port,
+                                false, 0, slot_id, hp, false, 0,
+                            );
+                            write_endpoint_context(
+                                child_in_va, xhci.ctx_size, true, 1, 4, child_max_pkt, 0, 0, child_ep0_pa, true, 3, 8,
+                            );
+                            clean_dcache_range(child_in_va, 4096);
+
+                            let mut cslot = XhciSlot::empty();
+                            cslot.slot_id = child_slot_id;
+                            cslot.port_id = port;
+                            cslot.speed = child_speed;
+                            cslot.out_ctx_pa = child_out_pa;
+                            cslot.out_ctx_va = child_out_va;
+                            cslot.input_ctx_pa = child_in_pa;
+                            cslot.input_ctx_va = child_in_va;
+                            cslot.ep0_ring_pa = child_ep0_pa;
+                            cslot.ep0_ring_va = child_ep0_va;
+                            xhci.slots[child_slot_id as usize] = Some(cslot);
+
+                            if xhci.address_device(child_slot_id, child_in_pa).is_ok() {
+                                if xhci.control_transfer(child_slot_id, UsbSetupPacket::get_descriptor(1, 0, 18), ctrl_pa, ctrl_va, 18, true).is_ok() {
+                                    let cdev_buf = core::slice::from_raw_parts(ctrl_va as *const u8, 18);
+                                    let cvid = (cdev_buf[8] as u16) | ((cdev_buf[9] as u16) << 8);
+                                    let cpid = (cdev_buf[10] as u16) | ((cdev_buf[11] as u16) << 8);
+
+                                    if xhci.control_transfer(child_slot_id, UsbSetupPacket::get_descriptor(2, 0, 9), ctrl_pa, ctrl_va, 9, true).is_ok() {
+                                        let ccfg_hdr = core::slice::from_raw_parts(ctrl_va as *const u8, 9);
+                                        let ctot_len = ((ccfg_hdr[2] as u16) | ((ccfg_hdr[3] as u16) << 8)) as usize;
+                                        let cfetch_len = ctot_len.clamp(9, 512);
+                                        if xhci.control_transfer(child_slot_id, UsbSetupPacket::get_descriptor(2, 0, cfetch_len as u16), ctrl_pa, ctrl_va, cfetch_len, true).is_ok() {
+                                            let ccfg_buf = core::slice::from_raw_parts(ctrl_va as *const u8, cfetch_len);
+                                            let mut coff = 0;
+                                            let mut ciface = 0u8;
+                                            let mut ckind = UsbDeviceKind::Unknown;
+                                            let mut cep: Option<(u8, u8, u16, u8, UsbDeviceKind)> = None;
+                                            while coff + 2 <= cfetch_len {
+                                                let cdlen = ccfg_buf[coff] as usize;
+                                                if cdlen < 2 || coff + cdlen > cfetch_len { break; }
+                                                let cdtype = ccfg_buf[coff + 1];
+                                                if cdtype == 4 && cdlen >= 9 {
+                                                    ciface = ccfg_buf[coff + 2];
+                                                    let ciclass = ccfg_buf[coff + 5];
+                                                    let ciproto = ccfg_buf[coff + 7];
+                                                    if ciclass == 3 {
+                                                        if ciproto == 1 { ckind = UsbDeviceKind::Keyboard; }
+                                                        else if ciproto == 2 { ckind = UsbDeviceKind::Mouse; }
+                                                        else { ckind = UsbDeviceKind::Other(ciproto); }
+                                                    }
+                                                } else if cdtype == 5 && cdlen >= 7 {
+                                                    let cep_addr = ccfg_buf[coff + 2];
+                                                    let cep_attr = ccfg_buf[coff + 3];
+                                                    let cpkt = (ccfg_buf[coff + 4] as u16) | ((ccfg_buf[coff + 5] as u16) << 8);
+                                                    let cint = ccfg_buf[coff + 6];
+                                                    if (cep_addr & 0x80) != 0 && (cep_attr & 0x3) == 3 {
+                                                        cep = Some((ciface, cep_addr & 0xF, cpkt, cint, ckind));
+                                                    }
+                                                }
+                                                coff += cdlen;
+                                            }
+
+                                            let _ = xhci.control_transfer(child_slot_id, UsbSetupPacket::set_configuration(1), 0, 0, 0, false);
+                                            if let Some((ci_num, ep_num, max_pkt, interval, k)) = cep {
+                                                let _ = xhci.control_transfer(child_slot_id, UsbSetupPacket::set_protocol(ci_num as u16, 0), 0, 0, 0, false);
+                                                let _ = xhci.control_transfer(child_slot_id, UsbSetupPacket::set_idle(ci_num as u16, 0), 0, 0, 0, false);
+                                                let cdci = (ep_num * 2) + 1;
+                                                if let Some(cring_pa) = pmm.allocate_page() {
+                                                    let cring_va = hhdm_base + cring_pa;
+                                                    ptr::write_bytes(cring_va as *mut u8, 0, 4096);
+                                                    let clink = Trb::link(cring_pa, true, true);
+                                                    ptr::write_volatile((cring_va as *mut Trb).add(255), clink);
+                                                    clean_dcache_range(cring_va, 4096);
+
+                                                    if let Some(crep_pa) = pmm.allocate_page() {
+                                                        let crep_va = hhdm_base + crep_pa;
+                                                        ptr::write_bytes(crep_va as *mut u8, 0, 4096);
+                                                        clean_dcache_range(crep_va, 4096);
+
+                                                        write_input_control_context(child_in_va, 0, (1 << 0) | (1 << cdci));
+                                                        crate::drivers::xhci::write_slot_context_ext(
+                                                            child_in_va, xhci.ctx_size, true, child_route, child_speed, cdci, port,
+                                                            false, 0, slot_id, hp, false, 0,
+                                                        );
+                                                        write_endpoint_context(
+                                                            child_in_va, xhci.ctx_size, true, cdci, 7, max_pkt, 0, interval, cring_pa, true, 3, max_pkt,
+                                                        );
+                                                        clean_dcache_range(child_in_va, 4096);
+                                                        if xhci.configure_endpoint(child_slot_id, child_in_pa).is_ok() {
+                                                            if let Some(s) = xhci.slots[child_slot_id as usize].as_mut() {
+                                                                s.intr_dci = cdci;
+                                                                s.intr_ring_pa = cring_pa;
+                                                                s.intr_ring_va = cring_va;
+                                                                s.report_buf_pa = crep_pa;
+                                                                s.report_buf_va = crep_va;
+                                                                s.enqueue_intr_trb(Trb {
+                                                                    param: crep_pa,
+                                                                    status: max_pkt as u32,
+                                                                    control: ((TRB_TYPE_NORMAL as u32) << 10) | (1 << 5) | (1 << 2),
+                                                                });
+                                                            }
+                                                            let cdb_addr = (xhci.db_base + (child_slot_id as u64 * 4)) as *mut u32;
+                                                            ptr::write_volatile(cdb_addr, cdci as u32);
+                                                            if ENUMERATED_USB_COUNT < 8 {
+                                                                ENUMERATED_USB_DEVICES[ENUMERATED_USB_COUNT] = Some(UsbDeviceInfo {
+                                                                    slot_id: child_slot_id,
+                                                                    port_id: hp,
+                                                                    speed: child_speed,
+                                                                    vendor_id: cvid,
+                                                                    product_id: cpid,
+                                                                    kind: k,
+                                                                    intr_dci: cdci,
+                                                                });
+                                                                ENUMERATED_USB_COUNT += 1;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
 
         // Read Configuration Descriptor header (first 9 bytes to get wTotalLength)
         let get_cfg_header = UsbSetupPacket::get_descriptor(2, 0, 9);

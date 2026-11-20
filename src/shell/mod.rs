@@ -9,7 +9,7 @@ use crate::{
         psci_system_off, serial_decimal, serial_hex, serial_write, ONLINE_CPUS,
     },
     drivers::{Framebuffer, VirtIOBlockDevice, VirtIONetDevice},
-    fs::FatVolume,
+    fs::{BlockDevice, FatVolume},
     mm::HEAP_ALLOCATOR,
 };
 
@@ -51,7 +51,28 @@ pub struct Shell<'a> {
     pub httpget_fn: Option<unsafe fn(&mut VirtIONetDevice, &str, u16, &str, usize) -> Result<usize, &'static str>>,
 }
 
+unsafe fn resolve_fs<'b>(
+    fallback_fat: Option<&'b FatVolume>,
+    fallback_dev: Option<&'b mut VirtIOBlockDevice>,
+) -> (Option<&'b FatVolume>, Option<crate::fs::AnyBlockDev<'b>>) {
+    let active_name = crate::fs::get_active_volume_name();
+    let active_fat = crate::fs::get_active_volume();
+    if active_name != "none" && active_fat.is_some() {
+        let f = active_fat.unwrap();
+        if active_name == "blk0" && fallback_dev.is_some() {
+            (Some(f), fallback_dev.map(crate::fs::AnyBlockDev::VirtIO))
+        } else if let Some(bd) = crate::fs::get_block_device_by_name(active_name) {
+            (Some(f), Some(bd))
+        } else {
+            (Some(f), fallback_dev.map(crate::fs::AnyBlockDev::VirtIO))
+        }
+    } else {
+        (fallback_fat, fallback_dev.map(crate::fs::AnyBlockDev::VirtIO))
+    }
+}
+
 impl<'a> Shell<'a> {
+
     /// Executes a single command string.
     pub unsafe fn execute_command(&mut self, line: &str) -> ShellResult {
         let trimmed = line.trim();
@@ -65,7 +86,7 @@ impl<'a> Shell<'a> {
 
         match cmd {
             "help" => {
-                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 20)\r\n");
+                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 21)\r\n");
                 serial_write(self.uart_va, b"Available commands:\r\n");
                 serial_write(self.uart_va, b"  help              - List available commands\r\n");
                 serial_write(self.uart_va, b"  info              - Display system status, memory, registers, and framebuffer\r\n");
@@ -80,8 +101,11 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  write <file> <text> - Write text contents to a file\r\n");
                 serial_write(self.uart_va, b"  hexdump <file>    - Display hexadecimal dump of a file\r\n");
                 serial_write(self.uart_va, b"  desktop           - Launch double-buffered graphical desktop\r\n");
-                serial_write(self.uart_va, b"  lspci             - List all discovered PCIe devices on Bus 0\r\n");
+                serial_write(self.uart_va, b"  lspci             - List all discovered PCIe devices\r\n");
                 serial_write(self.uart_va, b"  lsusb             - Display USB 3.0 xHCI controller and port status\r\n");
+                serial_write(self.uart_va, b"  lsblk             - List block devices (blk0, nvme0, usb0) and mount status\r\n");
+                serial_write(self.uart_va, b"  mount <dev>       - Mount block device as active FAT32 volume\r\n");
+                serial_write(self.uart_va, b"  acpiinfo          - Display ACPI 2.0+ tables and system configuration\r\n");
                 serial_write(self.uart_va, b"  nvmeinfo          - Display PCIe NVMe SSD controller & capacity\r\n");
                 serial_write(self.uart_va, b"  nvmeread <lba>    - Read and hex-dump LBA sector from NVMe SSD\r\n");
                 serial_write(self.uart_va, b"  usbstorage        - Display USB Mass Storage (SCSI) information\r\n");
@@ -259,11 +283,13 @@ impl<'a> Shell<'a> {
                 }
             }
             "ls" => {
-                if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                let uart = self.uart_va;
+                let (fat, dev) = resolve_fs(self.fat, self.dev.as_deref_mut());
+                if let (Some(fat), Some(ref mut dev)) = (fat, dev) {
                     let p = if arg.is_empty() { "/" } else { arg };
-                    serial_write(self.uart_va, b"Directory listing for: ");
-                    serial_write(self.uart_va, p.as_bytes());
-                    serial_write(self.uart_va, b"\r\n");
+                    serial_write(uart, b"Directory listing for: ");
+                    serial_write(uart, p.as_bytes());
+                    serial_write(uart, b"\r\n");
                     let mut count = 0usize;
                     let res = fat.list_dir(
                         dev,
@@ -273,36 +299,37 @@ impl<'a> Shell<'a> {
                         |entry| {
                             count += 1;
                             if entry.is_dir {
-                                serial_write(self.uart_va, b"  [DIR]  ");
+                                serial_write(uart, b"  [DIR]  ");
                             } else {
-                                serial_write(self.uart_va, b"         ");
+                                serial_write(uart, b"         ");
                             }
-                            serial_write(self.uart_va, entry.name_str().as_bytes());
+                            serial_write(uart, entry.name_str().as_bytes());
                             if !entry.is_dir {
-                                serial_write(self.uart_va, b"  (");
-                                serial_decimal(self.uart_va, entry.size as u64);
-                                serial_write(self.uart_va, b" bytes)");
+                                serial_write(uart, b"  (");
+                                serial_decimal(uart, entry.size as u64);
+                                serial_write(uart, b" bytes)");
                             }
-                            serial_write(self.uart_va, b"\r\n");
+                            serial_write(uart, b"\r\n");
                         },
                     );
                     if let Err(e) = res {
-                        serial_write(self.uart_va, b"Error listing directory: ");
-                        serial_write(self.uart_va, e.as_bytes());
-                        serial_write(self.uart_va, b"\r\n");
+                        serial_write(uart, b"Error listing directory: ");
+                        serial_write(uart, e.as_bytes());
+                        serial_write(uart, b"\r\n");
                     } else {
-                        serial_write(self.uart_va, b"Total entries: ");
-                        serial_decimal(self.uart_va, count as u64);
-                        serial_write(self.uart_va, b"\r\n");
+                        serial_write(uart, b"Total entries: ");
+                        serial_decimal(uart, count as u64);
+                        serial_write(uart, b"\r\n");
                     }
                 } else {
-                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                    serial_write(uart, b"FAT32 filesystem not mounted\r\n");
                 }
             }
             "cat" => {
+                let (fat, dev) = resolve_fs(self.fat, self.dev.as_deref_mut());
                 if arg.is_empty() {
                     serial_write(self.uart_va, b"Usage: cat <file>\r\n");
-                } else if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                } else if let (Some(fat), Some(ref mut dev)) = (fat, dev) {
                     let res = fat.read_file(
                         dev,
                         arg,
@@ -331,9 +358,10 @@ impl<'a> Shell<'a> {
                 }
             }
             "write" => {
+                let (fat, dev) = resolve_fs(self.fat, self.dev.as_deref_mut());
                 if arg.is_empty() {
                     serial_write(self.uart_va, b"Usage: write <file> <text>\r\n");
-                } else if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                } else if let (Some(fat), Some(ref mut dev)) = (fat, dev) {
                     let rem = trimmed.strip_prefix(cmd).unwrap_or("").trim_start();
                     let text = rem.strip_prefix(arg).unwrap_or("").trim_start();
                     let res = fat.write_file(
@@ -364,9 +392,10 @@ impl<'a> Shell<'a> {
                 }
             }
             "hexdump" => {
+                let (fat, dev) = resolve_fs(self.fat, self.dev.as_deref_mut());
                 if arg.is_empty() {
                     serial_write(self.uart_va, b"Usage: hexdump <file>\r\n");
-                } else if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
+                } else if let (Some(fat), Some(ref mut dev)) = (fat, dev) {
                     let res = fat.read_file(
                         dev,
                         arg,
@@ -544,7 +573,7 @@ impl<'a> Shell<'a> {
                 if dev_count == 0 {
                     serial_write(self.uart_va, b"No PCIe devices discovered.\r\n");
                 } else {
-                    serial_write(self.uart_va, b"Discovered PCIe Devices (Bus 0):\r\n");
+                    serial_write(self.uart_va, b"Discovered PCIe Devices:\r\n");
                     for i in 0..dev_count {
                         let dev = unsafe { &crate::drivers::pci::PCI_DEVICES[i] };
                         let mut buf = [0u8; 128];
@@ -552,6 +581,192 @@ impl<'a> Shell<'a> {
                         serial_write(self.uart_va, s.as_bytes());
                         serial_write(self.uart_va, b"\r\n");
                     }
+                }
+            }
+            "lsblk" => {
+                serial_write(self.uart_va, b"NAME   TYPE                  SIZE      SEC   MOUNT\r\n");
+                let active_name = crate::fs::get_active_volume_name();
+
+                // 1. VirtIO-Blk
+                if let Some(dev_ptr) = crate::drivers::virtio_blk::get_global_virtio_blk() {
+                    let d = unsafe { &*dev_ptr };
+                    let blocks = d.capacity_sectors();
+                    let mib = (blocks * 512) / (1024 * 1024);
+                    serial_write(self.uart_va, b"blk0   VirtIO-Blk            ");
+                    serial_decimal(self.uart_va, mib);
+                    serial_write(self.uart_va, b" MiB   512   ");
+                    if active_name == "blk0" {
+                        serial_write(self.uart_va, b"/\r\n");
+                    } else {
+                        serial_write(self.uart_va, b"-\r\n");
+                    }
+                }
+
+                // 2. NVMe SSD
+                if let Some(nvme) = crate::drivers::nvme::get_global_nvme_ref() {
+                    if nvme.is_initialized {
+                        let blocks = nvme.total_blocks;
+                        let lba_b = nvme.lba_bytes as u64;
+                        let mib = (blocks * lba_b) / (1024 * 1024);
+                        serial_write(self.uart_va, b"nvme0  PCIe NVMe SSD         ");
+                        serial_decimal(self.uart_va, mib);
+                        serial_write(self.uart_va, b" MiB   ");
+                        serial_decimal(self.uart_va, lba_b);
+                        serial_write(self.uart_va, b"   ");
+                        if active_name == "nvme0" {
+                            serial_write(self.uart_va, b"/\r\n");
+                        } else {
+                            serial_write(self.uart_va, b"-\r\n");
+                        }
+                    }
+                }
+
+                // 3. USB Mass Storage
+                if let Some(usb) = crate::drivers::usb_msc::get_global_usb_msc_ref() {
+                    if usb.is_initialized {
+                        let blocks = usb.total_blocks;
+                        let blk_b = usb.block_size as u64;
+                        let mib = (blocks * blk_b) / (1024 * 1024);
+                        serial_write(self.uart_va, b"usb0   USB Mass Storage      ");
+                        serial_decimal(self.uart_va, mib);
+                        serial_write(self.uart_va, b" MiB   ");
+                        serial_decimal(self.uart_va, blk_b);
+                        serial_write(self.uart_va, b"   ");
+                        if active_name == "usb0" {
+                            serial_write(self.uart_va, b"/\r\n");
+                        } else {
+                            serial_write(self.uart_va, b"-\r\n");
+                        }
+                    }
+                }
+            }
+            "mount" => {
+                if arg.is_empty() {
+                    serial_write(self.uart_va, b"Usage: mount <dev> (e.g. blk0, nvme0, usb0)\r\n");
+                } else {
+                    let dev_opt = crate::fs::get_block_device_by_name(arg);
+                    if let Some(mut dev) = dev_opt {
+                        let scratch_pa = self.scratch_pa;
+                        let scratch_va = self.scratch_va;
+                        match dev.read_sectors(0, 1, scratch_pa, scratch_va) {
+                            Ok(()) => {
+                                let sec0_slice = core::slice::from_raw_parts(scratch_va as *const u8, 512);
+                                if let Ok(sec0_arr) = sec0_slice.try_into() {
+                                    match crate::fs::locate_volume(sec0_arr) {
+                                        Ok(vol_lba) => {
+                                            match dev.read_sectors(vol_lba, 1, scratch_pa, scratch_va) {
+                                                Ok(()) => {
+                                                    let bpb_slice = core::slice::from_raw_parts(scratch_va as *const u8, 512);
+                                                    if let Ok(bpb_arr) = bpb_slice.try_into() {
+                                                        match crate::fs::FatVolume::parse_bpb(vol_lba, bpb_arr) {
+                                                            Ok(vol) => {
+                                                                crate::fs::set_active_volume(vol, arg);
+                                                                serial_write(self.uart_va, b"Mounted ");
+                                                                serial_write(self.uart_va, arg.as_bytes());
+                                                                serial_write(self.uart_va, b" as active FAT32 volume\r\n");
+                                                            }
+                                                            Err(e) => {
+                                                                serial_write(self.uart_va, b"Error parsing BPB on ");
+                                                                serial_write(self.uart_va, arg.as_bytes());
+                                                                serial_write(self.uart_va, b": ");
+                                                                serial_write(self.uart_va, e.as_bytes());
+                                                                serial_write(self.uart_va, b"\r\n");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    serial_write(self.uart_va, b"Error reading BPB sector on ");
+                                                    serial_write(self.uart_va, arg.as_bytes());
+                                                    serial_write(self.uart_va, b": ");
+                                                    serial_write(self.uart_va, e.as_bytes());
+                                                    serial_write(self.uart_va, b"\r\n");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            serial_write(self.uart_va, b"Error locating volume on ");
+                                            serial_write(self.uart_va, arg.as_bytes());
+                                            serial_write(self.uart_va, b": ");
+                                            serial_write(self.uart_va, e.as_bytes());
+                                            serial_write(self.uart_va, b"\r\n");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                serial_write(self.uart_va, b"Error reading sector 0 from ");
+                                serial_write(self.uart_va, arg.as_bytes());
+                                serial_write(self.uart_va, b": ");
+                                serial_write(self.uart_va, e.as_bytes());
+                                serial_write(self.uart_va, b"\r\n");
+                            }
+                        }
+                    } else {
+                        serial_write(self.uart_va, b"Device not found or not initialized: ");
+                        serial_write(self.uart_va, arg.as_bytes());
+                        serial_write(self.uart_va, b"\r\n");
+                    }
+                }
+            }
+            "acpiinfo" => {
+                if let Some(acpi) = crate::arch::acpi::get_global_acpi_ref() {
+                    serial_write(self.uart_va, b"=== ACPI 2.0+ Hardware Configuration ===\r\n");
+                    serial_write(self.uart_va, b"RSDP Address:   ");
+                    serial_hex(self.uart_va, acpi.rsdp.rsdp_pa);
+                    serial_write(self.uart_va, b"\r\nRSDP Revision:  ");
+                    serial_decimal(self.uart_va, acpi.rsdp.revision as u64);
+                    serial_write(self.uart_va, b"\r\nRSDP OEM ID:    ");
+                    serial_write(self.uart_va, acpi.rsdp.oem_id_str().as_bytes());
+                    serial_write(self.uart_va, b"\r\nXSDT Address:   ");
+                    serial_hex(self.uart_va, acpi.rsdp.xsdt_pa);
+                    serial_write(self.uart_va, b" (entries: ");
+                    serial_decimal(self.uart_va, acpi.xsdt_entries_count as u64);
+                    serial_write(self.uart_va, b")\r\n");
+
+                    if let Some(ref madt) = acpi.madt {
+                        serial_write(self.uart_va, b"MADT CPUs:      ");
+                        serial_decimal(self.uart_va, madt.enabled_cpus as u64);
+                        serial_write(self.uart_va, b" enabled / ");
+                        serial_decimal(self.uart_va, madt.cpu_count as u64);
+                        serial_write(self.uart_va, b" total (GICD: ");
+                        serial_hex(self.uart_va, madt.gicd_base);
+                        serial_write(self.uart_va, b", GICR: ");
+                        serial_hex(self.uart_va, madt.gicr_base);
+                        serial_write(self.uart_va, b")\r\n");
+                    }
+
+                    if let Some(ref mcfg) = acpi.mcfg {
+                        serial_write(self.uart_va, b"MCFG ECAM Base: ");
+                        serial_hex(self.uart_va, mcfg.ecam_base);
+                        serial_write(self.uart_va, b" (buses ");
+                        serial_decimal(self.uart_va, mcfg.start_bus as u64);
+                        serial_write(self.uart_va, b"..");
+                        serial_decimal(self.uart_va, mcfg.end_bus as u64);
+                        serial_write(self.uart_va, b")\r\n");
+                    }
+
+                    if let Some(ref gtdt) = acpi.gtdt {
+                        serial_write(self.uart_va, b"GTDT Timers:    PhysEL1=GSIV ");
+                        serial_decimal(self.uart_va, gtdt.phys_el1_timer_gsiv as u64);
+                        serial_write(self.uart_va, b", VirtEL1=GSIV ");
+                        serial_decimal(self.uart_va, gtdt.virt_el1_timer_gsiv as u64);
+                        serial_write(self.uart_va, b", PhysEL2=GSIV ");
+                        serial_decimal(self.uart_va, gtdt.phys_el2_timer_gsiv as u64);
+                        serial_write(self.uart_va, b"\r\n");
+                    }
+
+                    if let Some(ref spcr) = acpi.spcr {
+                        serial_write(self.uart_va, b"SPCR UART:      ");
+                        serial_hex(self.uart_va, spcr.uart_base);
+                        serial_write(self.uart_va, b" (GSIV ");
+                        serial_decimal(self.uart_va, spcr.gsiv as u64);
+                        serial_write(self.uart_va, b", type=");
+                        serial_decimal(self.uart_va, spcr.interface_type as u64);
+                        serial_write(self.uart_va, b")\r\n");
+                    }
+                } else {
+                    serial_write(self.uart_va, b"No ACPI tables detected (booted via FDT or ACPI not available).\r\n");
                 }
             }
             "lsusb" => {

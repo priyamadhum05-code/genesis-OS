@@ -129,6 +129,14 @@ const GOP_GUID: Guid = Guid {
     data1: 0x9042a9de, data2: 0x23dc, data3: 0x4a38,
     data4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
 };
+const ACPI_2_0_GUID: Guid = Guid {
+    data1: 0x8868e871, data2: 0xe4f1, data3: 0x11d3,
+    data4: [0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81],
+};
+const ACPI_1_0_GUID: Guid = Guid {
+    data1: 0xeb9d2d30, data2: 0x2d88, data3: 0x11d3,
+    data4: [0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
+};
 const FDT_CAP: usize = 128 * 1024;
 const STACK_SIZE: usize = 32 * 1024;
 const HUGEPAGE_VA: u64 = 0xFFFF_FFFF_A000_0000;
@@ -186,6 +194,7 @@ struct Handoff {
     fb_height: u32,
     fb_stride: u32,
     fb_pixel_format: u32,
+    rsdp_pa: u64,
 }
 #[repr(C)] #[derive(Clone, Copy)] struct Node { parent_ac: u32, parent_sc: u32, child_ac: u32, child_sc: u32, uart: bool, disabled: bool, reg: usize, reg_size: usize }
 #[repr(C)] struct FdtClient { methods: [usize; 9] }
@@ -210,6 +219,7 @@ static mut HANDOFF: Handoff = Handoff {
     fb_height: 0,
     fb_stride: 0,
     fb_pixel_format: 0,
+    rsdp_pa: 0,
 };
 static mut KERNEL_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 static mut KERNEL_PMM: PhysicalPageAllocator<KERNEL_PMM_WORDS> = PhysicalPageAllocator::new();
@@ -223,9 +233,17 @@ pub extern "efiapi" fn efi_main(image: usize, system_table: *mut SystemTable) ->
     unsafe {
         let st = &*system_table;
         let mut fdt_src = ptr::null();
+        let mut rsdp_pa = 0u64;
         for i in 0..st.table_count {
             let entry = &*st.tables.add(i);
-            if entry.guid.data1 == FDT_GUID.data1 && entry.guid.data2 == FDT_GUID.data2 && entry.guid.data3 == FDT_GUID.data3 && entry.guid.data4 == FDT_GUID.data4 { fdt_src = entry.table; break; }
+            if entry.guid.data1 == FDT_GUID.data1 && entry.guid.data2 == FDT_GUID.data2 && entry.guid.data3 == FDT_GUID.data3 && entry.guid.data4 == FDT_GUID.data4 { fdt_src = entry.table; }
+            if entry.guid.data1 == ACPI_2_0_GUID.data1 && entry.guid.data2 == ACPI_2_0_GUID.data2 && entry.guid.data3 == ACPI_2_0_GUID.data3 && entry.guid.data4 == ACPI_2_0_GUID.data4 { rsdp_pa = entry.table as u64; }
+        }
+        if rsdp_pa == 0 {
+            for i in 0..st.table_count {
+                let entry = &*st.tables.add(i);
+                if entry.guid.data1 == ACPI_1_0_GUID.data1 && entry.guid.data2 == ACPI_1_0_GUID.data2 && entry.guid.data3 == ACPI_1_0_GUID.data3 && entry.guid.data4 == ACPI_1_0_GUID.data4 { rsdp_pa = entry.table as u64; break; }
+            }
         }
         let fdt;
         let fdt_len;
@@ -362,6 +380,7 @@ pub extern "efiapi" fn efi_main(image: usize, system_table: *mut SystemTable) ->
             fb_height,
             fb_stride,
             fb_pixel_format,
+            rsdp_pa,
         };
         let stack_top = (ptr::addr_of_mut!(KERNEL_STACK) as usize + STACK_SIZE) & !15usize;
         asm!("mov sp, {stack}", "mov x0, {handoff}", "bl {kernel}", stack=in(reg) stack_top, handoff=in(reg) ptr::addr_of!(HANDOFF), kernel=sym kernel_entry, options(noreturn));
@@ -939,6 +958,14 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         let mut mapper = DynamicMapper::new(ttbr1_root, max_pa, pmm, HHDM_BASE);
         serial_write(uart, b"GENESIS: stage4 dynamic mapper initialized\r\n");
 
+        // Stage 21: Extend HHDM to cover the full 512 MiB physical DRAM (0x5000_0000..0x6000_0000)
+        let mut dram_ext = 0x5000_0000u64;
+        while dram_ext < 0x6000_0000u64 {
+            let va = HHDM_BASE + dram_ext;
+            let _ = mapper.map_l2_block(va, dram_ext, PagePermissions::kernel_data());
+            dram_ext += 2 * 1024 * 1024;
+        }
+
         // --------------------------------------------------------------------
         // Phase 4B: Install Stage 4 Vector Table & TrapFrame
         // --------------------------------------------------------------------
@@ -1436,6 +1463,28 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         let req_pa = mapper.pmm_mut().allocate_page().unwrap();
         let req_va = HHDM_BASE + req_pa;
 
+        // Stage 21: ACPI Discovery & Parsing
+        let acpi_summary = if handoff.rsdp_pa != 0 {
+            genesis_stage1::arch::acpi::parse_acpi_system(handoff.rsdp_pa, HHDM_BASE)
+        } else {
+            None
+        };
+
+        if let Some(ref acpi) = acpi_summary {
+            let cpus = acpi.madt.as_ref().map(|m| m.enabled_cpus).unwrap_or(0);
+            let mcfg_ecam = acpi.mcfg.as_ref().map(|m| m.ecam_base).unwrap_or(0);
+            let spcr_uart = acpi.spcr.as_ref().map(|s| s.uart_base).unwrap_or(0);
+            serial_write(uart, b"GENESIS: stage21 acpi ok (madt_cpus=");
+            serial_decimal(uart, cpus as u64);
+            serial_write(uart, b" mcfg_ecam=");
+            serial_hex(uart, mcfg_ecam);
+            serial_write(uart, b" spcr_uart=");
+            serial_hex(uart, spcr_uart);
+            serial_write(uart, b")\r\n");
+        } else {
+            serial_write(uart, b"GENESIS: stage21 acpi skipped (no rsdp)\r\n");
+        }
+
         // Stage 17A: PCIe ECAM Bus Enumeration
         let fdt_pci = if !fdt_ptr.is_null() {
             parse_fdt_pci(fdt_ptr, fdt_size)
@@ -1444,13 +1493,30 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         };
         let pci_ecam_pa = match fdt_pci {
             Some(p) => p.ecam_base,
-            None => PCI_ECAM_DEFAULT_BASE,
+            None => {
+                if let Some(ref acpi) = acpi_summary {
+                    if let Some(ref m) = acpi.mcfg {
+                        m.ecam_base
+                    } else {
+                        PCI_ECAM_DEFAULT_BASE
+                    }
+                } else {
+                    PCI_ECAM_DEFAULT_BASE
+                }
+            }
         };
 
-        if let Err(e) = mapper.map_mmio_range(PCI_ECAM_VA_BASE, pci_ecam_pa, 256) {
-            serial_write(uart, b"STAGE17_MAP_PCI_ECAM_FAIL: ");
-            serial_hex(uart, e.code());
-            serial_write(uart, b"\r\n");
+        if let Err(_e) = mapper.map_mmio_range(PCI_ECAM_VA_BASE, pci_ecam_pa, 4096) {
+            if let Err(e2) = mapper.map_mmio_range(PCI_ECAM_VA_BASE, pci_ecam_pa, 256) {
+                serial_write(uart, b"STAGE17_MAP_PCI_ECAM_FAIL: ");
+                serial_hex(uart, e2.code());
+                serial_write(uart, b"\r\n");
+            } else {
+                let pci_dev_count = scan_bus_0(PCI_ECAM_VA_BASE);
+                serial_write(uart, b"GENESIS: pcie bus 0 scanned (devices=");
+                serial_decimal(uart, pci_dev_count as u64);
+                serial_write(uart, b")\r\n");
+            }
         } else {
             let pci_dev_count = scan_bus_0(PCI_ECAM_VA_BASE);
             serial_write(uart, b"GENESIS: pcie bus 0 scanned (devices=");
@@ -1632,6 +1698,9 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
                 halt();
             }
         };
+
+        genesis_stage1::drivers::virtio_blk::register_global_virtio_blk(&mut blk_dev as *mut _);
+        genesis_stage1::fs::set_active_volume(volume, "blk0");
 
         // 2. Read WEIGHTS.BIN into HUGEPAGE_VA
         let file_bytes = match volume.read_file(
@@ -2057,6 +2126,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         }
 
         serial_write(uart, b"GENESIS: stage20 milestone complete\r\n");
+        serial_write(uart, b"GENESIS: stage21 milestone complete\r\n");
 
         // Auto-Boot to Desktop in GUI Mode:
         // When GOP framebuffer is active (e.g. ./tools/run-qemu-gui.sh), launch GUI.
@@ -2075,7 +2145,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         }
 
         // 14. Interactive Prompt Loop
-        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 20)\r\n");
+        serial_write(uart, b"\r\nProject Genesis Kernel Shell (Stage 21)\r\n");
         serial_write(uart, b"Type 'help' for available commands or 'halt' to power off.\r\n\r\n");
         let mut line_buf = [0u8; 128];
         loop {

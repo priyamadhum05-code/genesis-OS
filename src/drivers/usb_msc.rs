@@ -238,6 +238,34 @@ impl UsbMscDevice {
         self.exec_scsi_cmd(xhci, &cdb, true, buf_pa, buf_va, total_bytes)
     }
 
+    /// Issue SCSI WRITE (10) (0x2A) command to write `count` blocks starting at `lba`.
+    pub unsafe fn write_sectors(
+        &mut self,
+        xhci: &mut XhciDevice,
+        lba: u32,
+        count: u16,
+        buf_pa: u64,
+        buf_va: u64,
+    ) -> Result<(), &'static str> {
+        if !self.is_initialized || count == 0 {
+            return Err("USB_MSC_NOT_READY");
+        }
+        let total_bytes = (count as usize) * (self.block_size as usize);
+        let cdb = [
+            SCSI_CMD_WRITE_10,
+            0,
+            (lba >> 24) as u8,
+            (lba >> 16) as u8,
+            (lba >> 8) as u8,
+            lba as u8,
+            0,
+            (count >> 8) as u8,
+            count as u8,
+            0,
+        ];
+        self.exec_scsi_cmd(xhci, &cdb, false, buf_pa, buf_va, total_bytes)
+    }
+
     pub fn vendor_str(&self) -> &str {
         core::str::from_utf8(&self.vendor_name).unwrap_or("Unknown").trim()
     }
@@ -248,6 +276,30 @@ impl UsbMscDevice {
 
     pub fn revision_str(&self) -> &str {
         core::str::from_utf8(&self.revision).unwrap_or("").trim()
+    }
+}
+
+impl crate::fs::BlockDevice for UsbMscDevice {
+    unsafe fn read_blocks(&mut self, lba: u64, count: u16, buf_pa: u64, buf_va: u64) -> Result<(), &'static str> {
+        let xhci = crate::drivers::xhci::get_global_xhci().ok_or("XHCI_NOT_AVAILABLE")?;
+        self.read_sectors(xhci, lba as u32, count, buf_pa, buf_va)
+    }
+
+    unsafe fn write_blocks(&mut self, lba: u64, count: u16, buf_pa: u64, buf_va: u64) -> Result<(), &'static str> {
+        let xhci = crate::drivers::xhci::get_global_xhci().ok_or("XHCI_NOT_AVAILABLE")?;
+        self.write_sectors(xhci, lba as u32, count, buf_pa, buf_va)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    fn total_blocks(&self) -> u64 {
+        self.total_blocks
+    }
+
+    fn name(&self) -> &str {
+        "usb0"
     }
 }
 

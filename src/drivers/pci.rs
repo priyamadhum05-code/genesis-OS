@@ -43,6 +43,13 @@ pub struct PciDeviceInfo {
     pub bar_is_64: [bool; 6],
     pub capabilities: [PciCapability; 8],
     pub cap_count: usize,
+    pub has_msi: bool,
+    pub msi_64bit: bool,
+    pub has_msix: bool,
+    pub msix_table_size: u16,
+    pub msix_table_bar: u8,
+    pub msix_table_offset: u32,
+    pub msix_pba_bar: u8,
 }
 
 impl Default for PciDeviceInfo {
@@ -64,11 +71,18 @@ impl Default for PciDeviceInfo {
             bar_is_64: [false; 6],
             capabilities: [PciCapability::default(); 8],
             cap_count: 0,
+            has_msi: false,
+            msi_64bit: false,
+            has_msix: false,
+            msix_table_size: 0,
+            msix_table_bar: 0,
+            msix_table_offset: 0,
+            msix_pba_bar: 0,
         }
     }
 }
 
-pub static mut PCI_DEVICES: [PciDeviceInfo; 32] = [PciDeviceInfo {
+pub static mut PCI_DEVICES: [PciDeviceInfo; 64] = [PciDeviceInfo {
     bus: 0,
     dev: 0,
     func: 0,
@@ -94,7 +108,14 @@ pub static mut PCI_DEVICES: [PciDeviceInfo; 32] = [PciDeviceInfo {
         notify_off_multiplier: 0,
     }; 8],
     cap_count: 0,
-}; 32];
+    has_msi: false,
+    msi_64bit: false,
+    has_msix: false,
+    msix_table_size: 0,
+    msix_table_bar: 0,
+    msix_table_offset: 0,
+    msix_pba_bar: 0,
+}; 64];
 pub static mut PCI_DEVICE_COUNT: usize = 0;
 
 /// Returns ECAM byte offset for bus, dev, func, reg
@@ -132,10 +153,11 @@ pub unsafe fn pci_write_u32(ecam_va: u64, bus: u8, dev: u8, func: u8, reg: u16, 
     core::ptr::write_volatile(addr, val);
 }
 
-/// Enumerate all devices on PCIe Bus 0
-pub unsafe fn scan_bus_0(ecam_va: u64) -> usize {
-    PCI_DEVICE_COUNT = 0;
-    let bus = 0u8;
+/// Recursively scan a PCI bus and downstream buses via bridges
+pub unsafe fn scan_pci_bus(ecam_va: u64, bus: u8, max_bus: u8) {
+    if bus > max_bus {
+        return;
+    }
 
     for dev in 0..32u8 {
         let mut max_func = 1u8;
@@ -154,9 +176,10 @@ pub unsafe fn scan_bus_0(ecam_va: u64) -> usize {
             let prog_if = pci_read_u8(ecam_va, bus, dev, func, 0x09);
             let subclass = pci_read_u8(ecam_va, bus, dev, func, 0x0A);
             let class_code = pci_read_u8(ecam_va, bus, dev, func, 0x0B);
-            let header_type = pci_read_u8(ecam_va, bus, dev, func, 0x0E);
+            let header_type_raw = pci_read_u8(ecam_va, bus, dev, func, 0x0E);
+            let header_type = header_type_raw & 0x7F;
 
-            if func == 0 && (header_type & 0x80) != 0 {
+            if func == 0 && (header_type_raw & 0x80) != 0 {
                 max_func = 8;
             }
 
@@ -170,135 +193,180 @@ pub unsafe fn scan_bus_0(ecam_va: u64) -> usize {
                 subclass,
                 prog_if,
                 revision,
-                header_type: header_type & 0x7F,
+                header_type,
                 bars: [0; 6],
                 bar_sizes: [0; 6],
                 bar_is_io: [false; 6],
                 bar_is_64: [false; 6],
                 capabilities: [PciCapability::default(); 8],
                 cap_count: 0,
+                has_msi: false,
+                msi_64bit: false,
+                has_msix: false,
+                msix_table_size: 0,
+                msix_table_bar: 0,
+                msix_table_offset: 0,
+                msix_pba_bar: 0,
             };
 
-            // Read BARs for standard Type 0 header
-            if (header_type & 0x7F) == 0 {
-                let mut b = 0usize;
-                while b < 6 {
-                    let reg_off = (0x10 + b * 4) as u16;
-                    let bar_val = pci_read_u32(ecam_va, bus, dev, func, reg_off);
-                    let is_io = (bar_val & 1) != 0;
-                    info.bar_is_io[b] = is_io;
+            // Read BARs: Type 0 has 6 BARs, Type 1 (bridge) has 2 BARs
+            let num_bars = if header_type == 1 { 2 } else { 6 };
+            let mut b = 0usize;
+            while b < num_bars {
+                let reg_off = (0x10 + b * 4) as u16;
+                let bar_val = pci_read_u32(ecam_va, bus, dev, func, reg_off);
+                let is_io = (bar_val & 1) != 0;
+                info.bar_is_io[b] = is_io;
 
-                    if is_io {
-                        info.bars[b] = (bar_val & !0x3) as u64;
-                        b += 1;
-                        continue;
-                    }
+                if is_io {
+                    info.bars[b] = (bar_val & !0x3) as u64;
+                    b += 1;
+                    continue;
+                }
 
-                    let is_64 = ((bar_val >> 1) & 0x3) == 0x2;
-                    info.bar_is_64[b] = is_64;
+                let is_64 = ((bar_val >> 1) & 0x3) == 0x2;
+                info.bar_is_64[b] = is_64;
 
-                    // Probe BAR size by writing all 1s
-                    pci_write_u32(ecam_va, bus, dev, func, reg_off, 0xFFFF_FFFF);
-                    let mask = pci_read_u32(ecam_va, bus, dev, func, reg_off);
-                    pci_write_u32(ecam_va, bus, dev, func, reg_off, bar_val);
+                // Probe BAR size by writing all 1s
+                pci_write_u32(ecam_va, bus, dev, func, reg_off, 0xFFFF_FFFF);
+                let mask = pci_read_u32(ecam_va, bus, dev, func, reg_off);
+                pci_write_u32(ecam_va, bus, dev, func, reg_off, bar_val);
 
-                    let size_low = if mask != 0 && mask != 0xFFFF_FFFF {
-                        (!(mask & !0xF)).wrapping_add(1) as u64
+                let size_low = if mask != 0 && mask != 0xFFFF_FFFF {
+                    (!(mask & !0xF)).wrapping_add(1) as u64
+                } else {
+                    0
+                };
+
+                if is_64 && b + 1 < num_bars {
+                    let high_reg_off = (0x10 + (b + 1) * 4) as u16;
+                    let bar_high = pci_read_u32(ecam_va, bus, dev, func, high_reg_off);
+
+                    pci_write_u32(ecam_va, bus, dev, func, high_reg_off, 0xFFFF_FFFF);
+                    let mask_high = pci_read_u32(ecam_va, bus, dev, func, high_reg_off);
+                    pci_write_u32(ecam_va, bus, dev, func, high_reg_off, bar_high);
+
+                    let mut addr = ((bar_high as u64) << 32) | ((bar_val & !0xF) as u64);
+                    let total_size = if mask_high != 0 || size_low != 0 {
+                        let combined_mask = ((mask_high as u64) << 32) | ((mask & !0xF) as u64);
+                        (!combined_mask).wrapping_add(1)
                     } else {
                         0
                     };
 
-                    if is_64 && b + 1 < 6 {
-                        let high_reg_off = (0x10 + (b + 1) * 4) as u16;
-                        let bar_high = pci_read_u32(ecam_va, bus, dev, func, high_reg_off);
-
-                        pci_write_u32(ecam_va, bus, dev, func, high_reg_off, 0xFFFF_FFFF);
-                        let mask_high = pci_read_u32(ecam_va, bus, dev, func, high_reg_off);
-                        pci_write_u32(ecam_va, bus, dev, func, high_reg_off, bar_high);
-
-                        let mut addr = ((bar_high as u64) << 32) | ((bar_val & !0xF) as u64);
-                        let total_size = if mask_high != 0 || size_low != 0 {
-                            let combined_mask = ((mask_high as u64) << 32) | ((mask & !0xF) as u64);
-                            (!combined_mask).wrapping_add(1)
-                        } else {
-                            0
-                        };
-
-                        // If unmapped by firmware, assign address from 32-bit MMIO pool
-                        if addr == 0 && total_size > 0 {
-                            let assigned = PCI_MMIO_32_BASE + (dev as u64 * 0x0100_0000) + (b as u64 * 0x0020_0000);
-                            pci_write_u32(ecam_va, bus, dev, func, reg_off, assigned as u32);
-                            pci_write_u32(ecam_va, bus, dev, func, high_reg_off, 0);
-                            addr = assigned;
-                        }
-
-                        info.bars[b] = addr;
-                        info.bar_sizes[b] = total_size;
-                        b += 2;
-                    } else {
-                        let mut addr = (bar_val & !0xF) as u64;
-                        if addr == 0 && size_low > 0 {
-                            let assigned = PCI_MMIO_32_BASE + (dev as u64 * 0x0100_0000) + (b as u64 * 0x0020_0000);
-                            pci_write_u32(ecam_va, bus, dev, func, reg_off, assigned as u32);
-                            addr = assigned;
-                        }
-                        info.bars[b] = addr;
-                        info.bar_sizes[b] = size_low;
-                        b += 1;
+                    // If unmapped by firmware, assign address from 32-bit MMIO pool
+                    if addr == 0 && total_size > 0 {
+                        let assigned = PCI_MMIO_32_BASE + (dev as u64 * 0x0100_0000) + (b as u64 * 0x0020_0000);
+                        pci_write_u32(ecam_va, bus, dev, func, reg_off, assigned as u32);
+                        pci_write_u32(ecam_va, bus, dev, func, high_reg_off, 0);
+                        addr = assigned;
                     }
-                }
 
-                // Enable Memory Space (bit 1) and Bus Master (bit 2)
-                let cmd = pci_read_u16(ecam_va, bus, dev, func, 0x04);
-                pci_write_u16(ecam_va, bus, dev, func, 0x04, cmd | 0x0006);
-
-                // Scan capabilities list (offset 0x34) if status bit 4 is set
-                let status = pci_read_u16(ecam_va, bus, dev, func, 0x06);
-                if (status & (1 << 4)) != 0 {
-                    let mut cap_ptr = pci_read_u8(ecam_va, bus, dev, func, 0x34);
-                    let mut cap_count = 0;
-                    while cap_ptr != 0 && cap_count < 8 {
-                        let cap_id = pci_read_u8(ecam_va, bus, dev, func, cap_ptr as u16);
-                        let cap_next = pci_read_u8(ecam_va, bus, dev, func, (cap_ptr + 1) as u16);
-                        let cap_len = pci_read_u8(ecam_va, bus, dev, func, (cap_ptr + 2) as u16);
-
-                        let mut cap = PciCapability {
-                            cap_id,
-                            cap_offset: cap_ptr,
-                            cap_len,
-                            cfg_type: 0,
-                            bar: 0,
-                            offset: 0,
-                            length: 0,
-                            notify_off_multiplier: 0,
-                        };
-
-                        if cap_id == PCI_CAP_ID_VNDR && cap_len >= 16 {
-                            cap.cfg_type = pci_read_u8(ecam_va, bus, dev, func, (cap_ptr + 3) as u16);
-                            cap.bar = pci_read_u8(ecam_va, bus, dev, func, (cap_ptr + 4) as u16);
-                            cap.offset = pci_read_u32(ecam_va, bus, dev, func, (cap_ptr + 8) as u16);
-                            cap.length = pci_read_u32(ecam_va, bus, dev, func, (cap_ptr + 12) as u16);
-                            if cap.cfg_type == VIRTIO_PCI_CAP_NOTIFY_CFG && cap_len >= 20 {
-                                cap.notify_off_multiplier = pci_read_u32(ecam_va, bus, dev, func, (cap_ptr + 16) as u16);
-                            }
-                        }
-
-                        info.capabilities[cap_count] = cap;
-                        cap_count += 1;
-                        cap_ptr = cap_next;
+                    info.bars[b] = addr;
+                    info.bar_sizes[b] = total_size;
+                    b += 2;
+                } else {
+                    let mut addr = (bar_val & !0xF) as u64;
+                    if addr == 0 && size_low > 0 {
+                        let assigned = PCI_MMIO_32_BASE + (dev as u64 * 0x0100_0000) + (b as u64 * 0x0020_0000);
+                        pci_write_u32(ecam_va, bus, dev, func, reg_off, assigned as u32);
+                        addr = assigned;
                     }
-                    info.cap_count = cap_count;
+                    info.bars[b] = addr;
+                    info.bar_sizes[b] = size_low;
+                    b += 1;
                 }
             }
 
-            if PCI_DEVICE_COUNT < 32 {
+            // Enable Memory Space (bit 1) and Bus Master (bit 2)
+            let cmd = pci_read_u16(ecam_va, bus, dev, func, 0x04);
+            pci_write_u16(ecam_va, bus, dev, func, 0x04, cmd | 0x0006);
+
+            // Scan capabilities list (offset 0x34) if status bit 4 is set
+            let status = pci_read_u16(ecam_va, bus, dev, func, 0x06);
+            if (status & (1 << 4)) != 0 {
+                let mut cap_ptr = pci_read_u8(ecam_va, bus, dev, func, 0x34);
+                let mut cap_count = 0;
+                while cap_ptr != 0 && cap_count < 8 {
+                    let cap_id = pci_read_u8(ecam_va, bus, dev, func, cap_ptr as u16);
+                    let cap_next = pci_read_u8(ecam_va, bus, dev, func, (cap_ptr + 1) as u16);
+                    let cap_len = pci_read_u8(ecam_va, bus, dev, func, (cap_ptr + 2) as u16);
+
+                    let mut cap = PciCapability {
+                        cap_id,
+                        cap_offset: cap_ptr,
+                        cap_len,
+                        cfg_type: 0,
+                        bar: 0,
+                        offset: 0,
+                        length: 0,
+                        notify_off_multiplier: 0,
+                    };
+
+                    if cap_id == PCI_CAP_ID_VNDR && cap_len >= 16 {
+                        cap.cfg_type = pci_read_u8(ecam_va, bus, dev, func, (cap_ptr + 3) as u16);
+                        cap.bar = pci_read_u8(ecam_va, bus, dev, func, (cap_ptr + 4) as u16);
+                        cap.offset = pci_read_u32(ecam_va, bus, dev, func, (cap_ptr + 8) as u16);
+                        cap.length = pci_read_u32(ecam_va, bus, dev, func, (cap_ptr + 12) as u16);
+                        if cap.cfg_type == VIRTIO_PCI_CAP_NOTIFY_CFG && cap_len >= 20 {
+                            cap.notify_off_multiplier = pci_read_u32(ecam_va, bus, dev, func, (cap_ptr + 16) as u16);
+                        }
+                    } else if cap_id == 0x05 {
+                        let msg_ctrl = pci_read_u16(ecam_va, bus, dev, func, (cap_ptr + 2) as u16);
+                        info.has_msi = true;
+                        info.msi_64bit = (msg_ctrl & (1 << 7)) != 0;
+                    } else if cap_id == 0x11 {
+                        let msg_ctrl = pci_read_u16(ecam_va, bus, dev, func, (cap_ptr + 2) as u16);
+                        let tbl = pci_read_u32(ecam_va, bus, dev, func, (cap_ptr + 4) as u16);
+                        let pba = pci_read_u32(ecam_va, bus, dev, func, (cap_ptr + 8) as u16);
+                        info.has_msix = true;
+                        info.msix_table_size = (msg_ctrl & 0x7FF) + 1;
+                        info.msix_table_bar = (tbl & 0x7) as u8;
+                        info.msix_table_offset = tbl & !0x7;
+                        info.msix_pba_bar = (pba & 0x7) as u8;
+                    }
+
+                    info.capabilities[cap_count] = cap;
+                    cap_count += 1;
+                    cap_ptr = cap_next;
+                }
+                info.cap_count = cap_count;
+            }
+
+            if PCI_DEVICE_COUNT < 64 {
                 PCI_DEVICES[PCI_DEVICE_COUNT] = info;
                 PCI_DEVICE_COUNT += 1;
             }
+
+            // If PCI-to-PCI bridge, enable it and scan downstream buses
+            if header_type == 1 {
+                let sec_bus = pci_read_u8(ecam_va, bus, dev, func, 0x19);
+                let sub_bus = pci_read_u8(ecam_va, bus, dev, func, 0x1A);
+                // Also enable I/O, Memory, Bus Master on bridge
+                let br_cmd = pci_read_u16(ecam_va, bus, dev, func, 0x04);
+                pci_write_u16(ecam_va, bus, dev, func, 0x04, br_cmd | 0x0007);
+
+                if sec_bus > bus && sec_bus <= max_bus && sub_bus >= sec_bus {
+                    let end_bus = sub_bus.min(max_bus);
+                    for downstream in sec_bus..=end_bus {
+                        scan_pci_bus(ecam_va, downstream, max_bus);
+                    }
+                }
+            }
         }
     }
+}
 
+/// Enumerate all devices across PCIe buses up to `max_bus`
+pub unsafe fn scan_pci_buses(ecam_va: u64, max_bus: u8) -> usize {
+    PCI_DEVICE_COUNT = 0;
+    scan_pci_bus(ecam_va, 0, max_bus);
     PCI_DEVICE_COUNT
+}
+
+/// Enumerate all devices on PCIe Bus 0 (and downstream bridge buses up to 15)
+pub unsafe fn scan_bus_0(ecam_va: u64) -> usize {
+    scan_pci_buses(ecam_va, 15)
 }
 
 /// Find a device by Vendor ID and Device ID
@@ -387,8 +455,9 @@ pub fn format_pci_device<'a>(dev: &PciDeviceInfo, buf: &'a mut [u8]) -> &'a str 
 
     let mut p = 0;
     // Prefix: [00:02.0]
-    let pre = b"[00:";
-    buf[p..p + pre.len()].copy_from_slice(pre); p += pre.len();
+    buf[p] = b'['; p += 1;
+    hex2(dev.bus, &mut buf[p..p + 2]); p += 2;
+    buf[p] = b':'; p += 1;
     hex2(dev.dev, &mut buf[p..p + 2]); p += 2;
     buf[p] = b'.'; p += 1;
     buf[p] = b'0' + (dev.func & 0x7); p += 1;
@@ -435,11 +504,26 @@ pub fn format_pci_device<'a>(dev: &PciDeviceInfo, buf: &'a mut [u8]) -> &'a str 
         }
     }
 
+    // MSI / MSI-X Capability tags
+    if dev.has_msix {
+        let tag = b" [MSI-X]";
+        let tlen = tag.len().min(buf.len() - p);
+        buf[p..p + tlen].copy_from_slice(&tag[..tlen]);
+        p += tlen;
+    } else if dev.has_msi {
+        let tag = b" [MSI]";
+        let tlen = tag.len().min(buf.len() - p);
+        buf[p..p + tlen].copy_from_slice(&tag[..tlen]);
+        p += tlen;
+    }
+
     core::str::from_utf8(&buf[..p]).unwrap_or("[PCI Device]")
 }
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+    use alloc::vec;
     use super::*;
 
     #[test]
@@ -489,12 +573,61 @@ mod tests {
             bar_is_64: [false; 6],
             capabilities: [PciCapability::default(); 8],
             cap_count: 0,
+            has_msi: true,
+            msi_64bit: true,
+            has_msix: false,
+            msix_table_size: 0,
+            msix_table_bar: 0,
+            msix_table_offset: 0,
+            msix_pba_bar: 0,
         };
 
         let mut buf = [0u8; 128];
         let str_rep = format_pci_device(&dev, &mut buf);
+        assert!(str_rep.contains("[00:02.0]"));
         assert!(str_rep.contains("1af4:1050"));
         assert!(str_rep.contains("Class 0300"));
         assert!(str_rep.contains("BAR0=0x10000000"));
+        assert!(str_rep.contains("[MSI]"));
+    }
+
+    #[test]
+    fn pci_bridge_secondary_bus_scanning_test() {
+        // Allocate 2 MiB mock ECAM region (Bus 0 and Bus 1)
+        let mut mock_ecam = vec![0u8; 2 * 1024 * 1024];
+        let mock_va = mock_ecam.as_mut_ptr() as u64;
+
+        // 1. Bus 0 Dev 1 Func 0: PCI-to-PCI Bridge (Type 1)
+        let b0_d1_off = (0 << 20) | (1 << 15) | (0 << 12);
+        mock_ecam[b0_d1_off..b0_d1_off + 2].copy_from_slice(&0x1B36u16.to_le_bytes()); // Vendor ID 0x1B36
+        mock_ecam[b0_d1_off + 2..b0_d1_off + 4].copy_from_slice(&0x000Cu16.to_le_bytes()); // Device ID 0x000C
+        mock_ecam[b0_d1_off + 8..b0_d1_off + 12].copy_from_slice(&[1, 0, 0x04, 0x06]); // Rev 1, Class 0604
+        mock_ecam[b0_d1_off + 0x0E] = 1; // Header Type 1 (Bridge)
+        mock_ecam[b0_d1_off + 0x18] = 0; // Primary bus 0
+        mock_ecam[b0_d1_off + 0x19] = 1; // Secondary bus 1
+        mock_ecam[b0_d1_off + 0x1A] = 1; // Subordinate bus 1
+
+        // 2. Bus 1 Dev 0 Func 0: VirtIO-GPU device (Type 0)
+        let b1_d0_off = (1 << 20) | (0 << 15) | (0 << 12);
+        mock_ecam[b1_d0_off..b1_d0_off + 2].copy_from_slice(&0x1AF4u16.to_le_bytes()); // Vendor ID 0x1AF4
+        mock_ecam[b1_d0_off + 2..b1_d0_off + 4].copy_from_slice(&0x1050u16.to_le_bytes()); // Device ID 0x1050
+        mock_ecam[b1_d0_off + 8..b1_d0_off + 12].copy_from_slice(&[1, 0, 0x00, 0x03]); // Rev 1, Class 0300
+        mock_ecam[b1_d0_off + 0x0E] = 0; // Header Type 0 (Endpoint)
+
+        unsafe {
+            let count = scan_pci_buses(mock_va, 1);
+            assert_eq!(count, 2);
+            assert_eq!(PCI_DEVICES[0].bus, 0);
+            assert_eq!(PCI_DEVICES[0].dev, 1);
+            assert_eq!(PCI_DEVICES[0].vendor_id, 0x1B36);
+            assert_eq!(PCI_DEVICES[0].device_id, 0x000C);
+            assert_eq!(PCI_DEVICES[0].header_type & 0x7F, 1);
+
+            assert_eq!(PCI_DEVICES[1].bus, 1);
+            assert_eq!(PCI_DEVICES[1].dev, 0);
+            assert_eq!(PCI_DEVICES[1].vendor_id, 0x1AF4);
+            assert_eq!(PCI_DEVICES[1].device_id, 0x1050);
+            assert_eq!(PCI_DEVICES[1].header_type & 0x7F, 0);
+        }
     }
 }

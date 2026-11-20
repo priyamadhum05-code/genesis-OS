@@ -1,5 +1,6 @@
 //! Architecture-specific primitives, exception handling, and drivers for Project Genesis (AArch64).
 
+pub mod acpi;
 pub mod cpu;
 pub mod exceptions;
 pub mod fdt;
