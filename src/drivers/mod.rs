@@ -24,7 +24,10 @@ pub use pci::{
 pub use virtio_blk::{VirtIOBlockDevice, VIRTIO_DEV_BLOCK, VIRTIO_MAGIC, VIRTIO_MMIO_BASE};
 pub use virtio_gpu::{get_global_virtio_gpu, register_global_virtio_gpu, VirtIOGpuDevice};
 pub use virtio_input::{VirtIOInputDevice, VirtioInputEvent, VIRTIO_DEV_INPUT};
-pub use virtio_net::{VirtIONetDevice, VIRTIO_DEV_NET};
+pub use virtio_net::{
+    get_global_virtio_net, get_global_virtio_net_ref, register_global_virtio_net,
+    VirtIONetDevice, VIRTIO_DEV_NET,
+};
 pub use xhci::{
     format_port_status, format_xhci_info, get_global_xhci, get_global_xhci_ref,
     port_speed_str, register_global_xhci, ErstEntry, Trb, UsbPortInfo, XhciDevice,

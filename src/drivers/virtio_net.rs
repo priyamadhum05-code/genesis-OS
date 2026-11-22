@@ -98,6 +98,8 @@ pub struct VirtIONetDevice {
     pub rx_last_used_idx: u16,
     pub tx_avail_idx: u16,
     pub tx_last_used_idx: u16,
+    pub packets_tx: u64,
+    pub packets_rx: u64,
 }
 
 #[inline]
@@ -195,6 +197,8 @@ impl VirtIONetDevice {
             rx_last_used_idx: 0,
             tx_avail_idx: 0,
             tx_last_used_idx: 0,
+            packets_tx: 0,
+            packets_rx: 0,
         };
 
         let version = dev.read32(VIRTIO_REG_VERSION);
@@ -370,6 +374,7 @@ impl VirtIONetDevice {
             core::hint::spin_loop();
         }
 
+        self.packets_tx += 1;
         Ok(())
     }
 
@@ -422,10 +427,17 @@ impl VirtIONetDevice {
         self.write32(VIRTIO_REG_QUEUE_NOTIFY, 0);
 
         if copy_len > 0 {
+            self.packets_rx += 1;
             Some(copy_len)
         } else {
             None
         }
+    }
+
+    /// Receives a packet (alias for poll_packet matching NetDevice trait).
+    #[inline]
+    pub unsafe fn recv_packet(&mut self, out: &mut [u8]) -> Option<usize> {
+        self.poll_packet(out)
     }
 
     /// Prints MAC address in formatted `xx:xx:xx:xx:xx:xx` form.
@@ -441,6 +453,25 @@ impl VirtIONetDevice {
                 crate::arch::serial_write(uart, b":");
             }
         }
+    }
+}
+
+pub static mut GLOBAL_VIRTIO_NET: Option<*mut VirtIONetDevice> = None;
+
+pub fn register_global_virtio_net(dev: *mut VirtIONetDevice) {
+    unsafe {
+        *core::ptr::addr_of_mut!(GLOBAL_VIRTIO_NET) = Some(dev);
+    }
+}
+
+pub fn get_global_virtio_net() -> Option<*mut VirtIONetDevice> {
+    unsafe { *core::ptr::addr_of!(GLOBAL_VIRTIO_NET) }
+}
+
+pub fn get_global_virtio_net_ref() -> Option<&'static VirtIONetDevice> {
+    unsafe {
+        let ptr = *core::ptr::addr_of!(GLOBAL_VIRTIO_NET);
+        ptr.map(|p| &*p)
     }
 }
 

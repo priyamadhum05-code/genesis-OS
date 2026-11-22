@@ -35,3 +35,23 @@ pub fn get_active_volume_name() -> &'static str {
         }
     }
 }
+
+pub unsafe fn resolve_active_fs<'b>(
+    fallback_fat: Option<&'b FatVolume>,
+    fallback_dev: Option<&'b mut crate::drivers::VirtIOBlockDevice>,
+) -> (Option<&'b FatVolume>, Option<AnyBlockDev<'b>>) {
+    let active_name = get_active_volume_name();
+    let active_fat = get_active_volume();
+    if active_name != "none" && active_fat.is_some() {
+        let f = active_fat.unwrap();
+        if active_name == "blk0" && fallback_dev.is_some() {
+            (Some(f), fallback_dev.map(AnyBlockDev::VirtIO))
+        } else if let Some(bd) = get_block_device_by_name(active_name) {
+            (Some(f), Some(bd))
+        } else {
+            (fallback_fat, fallback_dev.map(AnyBlockDev::VirtIO))
+        }
+    } else {
+        (fallback_fat, fallback_dev.map(AnyBlockDev::VirtIO))
+    }
+}

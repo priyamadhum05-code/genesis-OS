@@ -1199,7 +1199,7 @@ impl DesktopCompositor {
 
         match cmd {
             "help" => {
-                self.append_term_line("Commands: help, ls, cat, write, mount, lsblk,");
+                self.append_term_line("Commands: help, ls, cat, write, exec, route, mount, lsblk,");
                 self.append_term_line("  acpiinfo, lspci, lsusb, nicinfo, info, ramstat, bench,");
                 self.append_term_line("  nvmeinfo, nvmeread, usbstorage, cpuinfo, gpuinfo, clear, halt");
             }
@@ -1823,29 +1823,102 @@ impl DesktopCompositor {
                     self.append_term_line("VirtIO-GPU not active (using Framebuffer console)");
                 }
             }
+            "exec" | "run" => {
+                if arg.is_empty() {
+                    self.append_term_line("Usage: exec <filename.elf>");
+                } else {
+                    let (eff_fat, mut eff_dev) = resolve_ui_fs(fat, dev.as_deref_mut());
+                    if let (Some(fat_vol), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
+                        let mut read_buf = [0u8; 1024];
+                        let read_va = read_buf.as_mut_ptr() as u64;
+                        match fat_vol.read_file(d, arg, read_va, read_va, 1024, scratch_pa, scratch_va) {
+                            Ok(bytes_read) => {
+                                let elf_slice = &read_buf[..bytes_read.min(1024)];
+                                match crate::proc::Elf64Header::parse(elf_slice) {
+                                    Ok(_hdr) => {
+                                        if let Some(run_fn) = crate::proc::get_global_run_elf() {
+                                            match unsafe { run_fn(elf_slice, 0) } {
+                                                Ok(status) => {
+                                                    let mut out = [0u8; 64];
+                                                    let pre = b"EL0 process exited with status ";
+                                                    out[..pre.len()].copy_from_slice(pre);
+                                                    let mut p = pre.len();
+                                                    p += write_u64_to_buf(status as u64, &mut out[p..]);
+                                                    if let Ok(s) = core::str::from_utf8(&out[..p]) {
+                                                        self.append_term_line(s);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    self.append_term_line(e);
+                                                }
+                                            }
+                                        } else {
+                                            self.append_term_line("ELF runner not configured");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.append_term_line(e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.append_term_line(e);
+                            }
+                        }
+                    } else {
+                        self.append_term_line("Filesystem not mounted");
+                    }
+                }
+            }
+            "route" => {
+                if arg == "virtio" || arg == "virtio-net" {
+                    crate::net::set_active_nic(crate::net::ActiveNic::VirtIoNet);
+                    self.append_term_line("Active route: VirtIO-Net (MMIO)");
+                } else if arg == "e1000e" {
+                    crate::net::set_active_nic(crate::net::ActiveNic::E1000e);
+                    self.append_term_line("Active route: Intel e1000e (PCIe)");
+                } else {
+                    self.append_term_line("Usage: route <virtio|e1000e>");
+                }
+            }
             "nicinfo" => {
                 self.append_term_line("=== Network Interface Controllers ===");
                 let mut nic_cnt = 0;
-                if let Some(_net) = crate::net::get_active_mac(Some([0x52, 0x54, 0x00, 0x12, 0x34, 0x56])) {
-                    let mut b = [0u8; 64];
+                if let Some(net) = crate::drivers::virtio_net::get_global_virtio_net_ref() {
+                    let mut b = [0u8; 96];
                     let mut p = 0;
-                    let pre = b"[NIC 0] VirtIO-Net: 10.0.2.15 [UP]";
+                    let pre = b"[NIC 0] VirtIO-Net: 10.0.2.15 | TX=";
                     b[..pre.len()].copy_from_slice(pre); p += pre.len();
+                    p += write_u64_to_buf(net.packets_tx, &mut b[p..]);
+                    let mid = b" RX=";
+                    b[p..p + mid.len()].copy_from_slice(mid); p += mid.len();
+                    p += write_u64_to_buf(net.packets_rx, &mut b[p..]);
                     if let Ok(s) = core::str::from_utf8(&b[..p]) { self.append_term_line(s); }
                     nic_cnt += 1;
                 }
                 if let Some(e1000) = crate::drivers::e1000e::get_global_e1000e_ref() {
-                    let mut b = [0u8; 64];
+                    let mut b = [0u8; 96];
                     let mut p = 0;
-                    let pre = b"[NIC 1] e1000e (PCIe): ";
+                    let pre = b"[NIC 1] e1000e: ";
                     b[..pre.len()].copy_from_slice(pre); p += pre.len();
-                    let st: &[u8] = if unsafe { e1000.is_link_up() } { b"[LINK UP]" } else { b"[LINK DOWN]" };
+                    let st: &[u8] = if unsafe { e1000.is_link_up() } { b"[LINK UP] TX=" } else { b"[LINK DOWN] TX=" };
                     b[p..p + st.len()].copy_from_slice(st); p += st.len();
+                    p += write_u64_to_buf(e1000.packets_tx, &mut b[p..]);
+                    let mid = b" RX=";
+                    b[p..p + mid.len()].copy_from_slice(mid); p += mid.len();
+                    p += write_u64_to_buf(e1000.packets_rx, &mut b[p..]);
                     if let Ok(s) = core::str::from_utf8(&b[..p]) { self.append_term_line(s); }
                     nic_cnt += 1;
                 }
                 if nic_cnt == 0 {
                     self.append_term_line("No network interfaces detected");
+                } else {
+                    let active = match crate::net::get_active_nic() {
+                        crate::net::ActiveNic::E1000e => "Default Route: e1000e (PCIe)",
+                        crate::net::ActiveNic::VirtIoNet => "Default Route: VirtIO-Net (MMIO)",
+                        crate::net::ActiveNic::None => "Default Route: none",
+                    };
+                    self.append_term_line(active);
                 }
             }
             "halt" | "poweroff" => {

@@ -9,6 +9,19 @@ pub use elf::{
 };
 pub use ipc::{IpcMailbox, IPC_MAILBOX, SYS_IPC_RECV, SYS_IPC_SEND};
 
+pub type RunElfFn = unsafe fn(&[u8], usize) -> Result<i32, &'static str>;
+pub static mut GLOBAL_RUN_ELF_FN: Option<RunElfFn> = None;
+
+pub fn register_global_run_elf(f: RunElfFn) {
+    unsafe {
+        *core::ptr::addr_of_mut!(GLOBAL_RUN_ELF_FN) = Some(f);
+    }
+}
+
+pub fn get_global_run_elf() -> Option<RunElfFn> {
+    unsafe { *core::ptr::addr_of!(GLOBAL_RUN_ELF_FN) }
+}
+
 #[cfg(target_os = "uefi")]
 core::arch::global_asm!(
     r#"

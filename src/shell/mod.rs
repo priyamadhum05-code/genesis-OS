@@ -46,9 +46,9 @@ pub struct Shell<'a> {
     pub multitask_fn: Option<unsafe fn(&[u8], &[u8], usize) -> Result<(), &'static str>>,
     pub generate_fn: Option<unsafe fn(&[u8], &str, usize) -> Result<(), &'static str>>,
     pub llama_fn: Option<unsafe fn(&[u8], Option<&[u8]>, &str, usize) -> Result<(), &'static str>>,
-    pub ping_fn: Option<unsafe fn(&mut VirtIONetDevice, usize) -> Result<u64, &'static str>>,
-    pub dns_fn: Option<unsafe fn(&mut VirtIONetDevice, &str, usize) -> Result<[u8; 4], &'static str>>,
-    pub httpget_fn: Option<unsafe fn(&mut VirtIONetDevice, &str, u16, &str, usize) -> Result<usize, &'static str>>,
+    pub ping_fn: Option<unsafe fn(&mut crate::net::AnyNetDev, usize) -> Result<u64, &'static str>>,
+    pub dns_fn: Option<unsafe fn(&mut crate::net::AnyNetDev, &str, usize) -> Result<[u8; 4], &'static str>>,
+    pub httpget_fn: Option<unsafe fn(&mut crate::net::AnyNetDev, &str, u16, &str, usize) -> Result<usize, &'static str>>,
 }
 
 unsafe fn resolve_fs<'b>(
@@ -72,7 +72,6 @@ unsafe fn resolve_fs<'b>(
 }
 
 impl<'a> Shell<'a> {
-
     /// Executes a single command string.
     pub unsafe fn execute_command(&mut self, line: &str) -> ShellResult {
         let trimmed = line.trim();
@@ -86,13 +85,14 @@ impl<'a> Shell<'a> {
 
         match cmd {
             "help" => {
-                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 21)\r\n");
+                serial_write(self.uart_va, b"Project Genesis Kernel Shell (Stage 23)\r\n");
                 serial_write(self.uart_va, b"Available commands:\r\n");
                 serial_write(self.uart_va, b"  help              - List available commands\r\n");
                 serial_write(self.uart_va, b"  info              - Display system status, memory, registers, and framebuffer\r\n");
                 serial_write(self.uart_va, b"  ramstat           - Display kernel memory profile and physical RAM breakdown\r\n");
                 serial_write(self.uart_va, b"  netinfo           - Display VirtIO-Net MAC, IP, gateway, and status\r\n");
                 serial_write(self.uart_va, b"  nicinfo           - Display all network controllers (VirtIO-Net, e1000e) & active NIC\r\n");
+                serial_write(self.uart_va, b"  route <nic>       - Select active network controller (virtio | e1000e)\r\n");
                 serial_write(self.uart_va, b"  ping [ip]         - Send ICMP echo request over VirtIO-Net\r\n");
                 serial_write(self.uart_va, b"  dns <hostname>    - Resolve hostname to IPv4 address via DNS\r\n");
                 serial_write(self.uart_va, b"  httpget <host> [port] [path] - Send HTTP/1.0 GET request via TCP\r\n");
@@ -114,7 +114,8 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  gpuinfo           - Display VirtIO-GPU 2D/3D VirGL acceleration status\r\n");
                 serial_write(self.uart_va, b"  bench             - Run 4-core SMP NEON 64x64 MatMul benchmark\r\n");
                 serial_write(self.uart_va, b"  draw              - Redraw UEFI GOP framebuffer dashboard\r\n");
-                serial_write(self.uart_va, b"  run <file>        - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
+                serial_write(self.uart_va, b"  exec <file>       - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
+                serial_write(self.uart_va, b"  run <file>        - Alias for exec\r\n");
                 serial_write(self.uart_va, b"  infer [file]      - Run 4-core SMP INT8 NEON neural network inference\r\n");
                 serial_write(self.uart_va, b"  llm [file]        - Run 4-core SMP INT8 NEON transformer block\r\n");
                 serial_write(self.uart_va, b"  multitask         - Run preemptive multi-process EL0 scheduling & IPC\r\n");
@@ -449,49 +450,65 @@ impl<'a> Shell<'a> {
                     serial_write(self.uart_va, b"Benchmark function not configured\r\n");
                 }
             }
-            "run" => {
+            "exec" | "run" => {
                 if arg.is_empty() {
-                    serial_write(self.uart_va, b"Usage: run <file.elf>\r\n");
-                } else if let (Some(fat), Some(dev)) = (self.fat, self.dev.as_deref_mut()) {
-                    let res = fat.read_file(
-                        dev,
-                        arg,
-                        self.file_buf_pa,
-                        self.file_buf_va,
-                        self.file_buf_cap,
-                        self.scratch_pa,
-                        self.scratch_va,
-                    );
-                    match res {
-                        Ok(bytes) => {
-                            if let Some(run_fn) = self.run_elf_fn {
-                                let elf_slice = core::slice::from_raw_parts(self.file_buf_va as *const u8, bytes);
-                                match run_fn(elf_slice, self.uart_va) {
-                                    Ok(status) => {
-                                        serial_write(self.uart_va, b"\r\nProcess exited with status ");
-                                        serial_decimal(self.uart_va, status as u64);
-                                        serial_write(self.uart_va, b"\r\n");
+                    serial_write(self.uart_va, b"Usage: exec <file.elf>\r\n");
+                } else {
+                    let (eff_fat, mut eff_dev) = unsafe { resolve_fs(self.fat, self.dev.as_deref_mut()) };
+                    if let (Some(fat), Some(ref mut dev)) = (eff_fat, eff_dev.as_mut()) {
+                        let res = unsafe {
+                            fat.read_file(
+                                dev,
+                                arg,
+                                self.file_buf_pa,
+                                self.file_buf_va,
+                                self.file_buf_cap,
+                                self.scratch_pa,
+                                self.scratch_va,
+                            )
+                        };
+                        match res {
+                            Ok(bytes) => {
+                                let elf_slice = unsafe { core::slice::from_raw_parts(self.file_buf_va as *const u8, bytes) };
+                                match crate::proc::Elf64Header::parse(elf_slice) {
+                                    Ok(_hdr) => {
+                                        if let Some(run_fn) = self.run_elf_fn {
+                                            match unsafe { run_fn(elf_slice, self.uart_va) } {
+                                                Ok(status) => {
+                                                    serial_write(self.uart_va, b"EL0 process exited with status ");
+                                                    serial_decimal(self.uart_va, status as u64);
+                                                    serial_write(self.uart_va, b"\r\n");
+                                                }
+                                                Err(e) => {
+                                                    serial_write(self.uart_va, b"ELF execution failed: ");
+                                                    serial_write(self.uart_va, e.as_bytes());
+                                                    serial_write(self.uart_va, b"\r\n");
+                                                }
+                                            }
+                                        } else {
+                                            serial_write(self.uart_va, b"ELF runner not configured\r\n");
+                                        }
                                     }
                                     Err(e) => {
-                                        serial_write(self.uart_va, b"ELF execution failed: ");
+                                        serial_write(self.uart_va, b"Invalid ELF header in '");
+                                        serial_write(self.uart_va, arg.as_bytes());
+                                        serial_write(self.uart_va, b"': ");
                                         serial_write(self.uart_va, e.as_bytes());
                                         serial_write(self.uart_va, b"\r\n");
                                     }
                                 }
-                            } else {
-                                serial_write(self.uart_va, b"ELF runner not configured\r\n");
+                            }
+                            Err(e) => {
+                                serial_write(self.uart_va, b"Error reading file '");
+                                serial_write(self.uart_va, arg.as_bytes());
+                                serial_write(self.uart_va, b"': ");
+                                serial_write(self.uart_va, e.as_bytes());
+                                serial_write(self.uart_va, b"\r\n");
                             }
                         }
-                        Err(e) => {
-                            serial_write(self.uart_va, b"Error reading file '");
-                            serial_write(self.uart_va, arg.as_bytes());
-                            serial_write(self.uart_va, b"': ");
-                            serial_write(self.uart_va, e.as_bytes());
-                            serial_write(self.uart_va, b"\r\n");
-                        }
+                    } else {
+                        serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
                     }
-                } else {
-                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
                 }
             }
             "infer" => {
@@ -1252,13 +1269,36 @@ impl<'a> Shell<'a> {
                     serial_write(self.uart_va, b"VirtIO Network Device not detected\r\n");
                 }
             }
+            "route" => {
+                if arg == "virtio" || arg == "virtio-net" {
+                    crate::net::set_active_nic(crate::net::ActiveNic::VirtIoNet);
+                    serial_write(self.uart_va, b"Default network route set to VirtIO-Net (MMIO)\r\n");
+                } else if arg == "e1000e" {
+                    crate::net::set_active_nic(crate::net::ActiveNic::E1000e);
+                    serial_write(self.uart_va, b"Default network route set to Intel 82574L e1000e (PCIe)\r\n");
+                } else {
+                    serial_write(self.uart_va, b"Usage: route <virtio|e1000e>\r\n");
+                    let active = match crate::net::get_active_nic() {
+                        crate::net::ActiveNic::E1000e => "e1000e (PCIe)",
+                        crate::net::ActiveNic::VirtIoNet => "virtio-net (MMIO)",
+                        crate::net::ActiveNic::None => "none",
+                    };
+                    serial_write(self.uart_va, b"Current active route: ");
+                    serial_write(self.uart_va, active.as_bytes());
+                    serial_write(self.uart_va, b"\r\n");
+                }
+            }
             "nicinfo" => {
                 serial_write(self.uart_va, b"=== Network Interface Controllers (NICs) ===\r\n");
                 let mut nic_count = 0;
                 if let Some(ref net) = self.net_dev {
                     serial_write(self.uart_va, b"[NIC 0] VirtIO-Net (MMIO): MAC=");
                     net.print_mac(self.uart_va);
-                    serial_write(self.uart_va, b" | Link: UP | IP=10.0.2.15\r\n");
+                    serial_write(self.uart_va, b" | Link: UP | IP=10.0.2.15 | TX=");
+                    serial_decimal(self.uart_va, net.packets_tx);
+                    serial_write(self.uart_va, b" RX=");
+                    serial_decimal(self.uart_va, net.packets_rx);
+                    serial_write(self.uart_va, b"\r\n");
                     nic_count += 1;
                 }
                 if let Some(e1000) = crate::drivers::e1000e::get_global_e1000e_ref() {
@@ -1290,43 +1330,47 @@ impl<'a> Shell<'a> {
             }
             "dns" => {
                 let target = if arg.is_empty() { "gateway.local" } else { arg };
-                if let Some(net) = self.net_dev.as_deref_mut() {
-                    serial_write(self.uart_va, b"Resolving '");
-                    serial_write(self.uart_va, target.as_bytes());
-                    serial_write(self.uart_va, b"' via DNS (10.0.2.3:53)...\r\n");
-                    if let Some(dns_fn) = self.dns_fn {
-                        match dns_fn(net, target, self.uart_va) {
+                let uart = self.uart_va;
+                let dns_fn = self.dns_fn;
+                if let Some(mut net) = crate::net::get_active_net_dev() {
+                    serial_write(uart, b"Resolving '");
+                    serial_write(uart, target.as_bytes());
+                    serial_write(uart, b"' via DNS (10.0.2.3:53)...\r\n");
+                    if let Some(dfn) = dns_fn {
+                        match dfn(&mut net, target, uart) {
                             Ok(ip) => {
-                                serial_write(self.uart_va, target.as_bytes());
-                                serial_write(self.uart_va, b" resolved to ");
-                                serial_decimal(self.uart_va, ip[0] as u64);
-                                serial_write(self.uart_va, b".");
-                                serial_decimal(self.uart_va, ip[1] as u64);
-                                serial_write(self.uart_va, b".");
-                                serial_decimal(self.uart_va, ip[2] as u64);
-                                serial_write(self.uart_va, b".");
-                                serial_decimal(self.uart_va, ip[3] as u64);
-                                serial_write(self.uart_va, b"\r\n");
-                                serial_write(self.uart_va, b"GENESIS: stage13 dns ok\r\n");
+                                serial_write(uart, target.as_bytes());
+                                serial_write(uart, b" resolved to ");
+                                serial_decimal(uart, ip[0] as u64);
+                                serial_write(uart, b".");
+                                serial_decimal(uart, ip[1] as u64);
+                                serial_write(uart, b".");
+                                serial_decimal(uart, ip[2] as u64);
+                                serial_write(uart, b".");
+                                serial_decimal(uart, ip[3] as u64);
+                                serial_write(uart, b"\r\n");
+                                serial_write(uart, b"GENESIS: stage13 dns ok\r\n");
                             }
                             Err(e) => {
-                                serial_write(self.uart_va, b"DNS resolution failed: ");
-                                serial_write(self.uart_va, e.as_bytes());
-                                serial_write(self.uart_va, b"\r\n");
+                                serial_write(uart, b"DNS resolution failed: ");
+                                serial_write(uart, e.as_bytes());
+                                serial_write(uart, b"\r\n");
                             }
                         }
                     } else {
-                        serial_write(self.uart_va, b"DNS resolver function not configured\r\n");
+                        serial_write(uart, b"DNS resolver function not configured\r\n");
                     }
                 } else {
-                    serial_write(self.uart_va, b"VirtIO Network Device not detected\r\n");
+                    serial_write(uart, b"No network interface controller available\r\n");
                 }
             }
             "httpget" => {
                 let target = if arg.is_empty() { "10.0.2.2" } else { arg };
                 let port_str = parts.next().unwrap_or("80");
                 let path = parts.next().unwrap_or("/");
-                if let Some(net) = self.net_dev.as_deref_mut() {
+                let uart = self.uart_va;
+                let httpget_fn = self.httpget_fn;
+                if let Some(mut net) = crate::net::get_active_net_dev() {
                     let mut port: u16 = 0;
                     for &b in port_str.as_bytes() {
                         if b >= b'0' && b <= b'9' {
@@ -1335,49 +1379,51 @@ impl<'a> Shell<'a> {
                     }
                     if port == 0 { port = 80; }
 
-                    serial_write(self.uart_va, b"HTTP GET http://");
-                    serial_write(self.uart_va, target.as_bytes());
-                    serial_write(self.uart_va, b":");
-                    serial_decimal(self.uart_va, port as u64);
-                    serial_write(self.uart_va, path.as_bytes());
-                    serial_write(self.uart_va, b"...\r\n");
+                    serial_write(uart, b"HTTP GET http://");
+                    serial_write(uart, target.as_bytes());
+                    serial_write(uart, b":");
+                    serial_decimal(uart, port as u64);
+                    serial_write(uart, path.as_bytes());
+                    serial_write(uart, b"...\r\n");
 
-                    if let Some(http_fn) = self.httpget_fn {
-                        match http_fn(net, target, port, path, self.uart_va) {
+                    if let Some(hfn) = httpget_fn {
+                        match hfn(&mut net, target, port, path, uart) {
                             Ok(bytes) => {
-                                serial_write(self.uart_va, b"HTTP GET response complete (");
-                                serial_decimal(self.uart_va, bytes as u64);
-                                serial_write(self.uart_va, b" bytes received)\r\n");
-                                serial_write(self.uart_va, b"GENESIS: stage13 httpget ok\r\n");
+                                serial_write(uart, b"HTTP GET response complete (");
+                                serial_decimal(uart, bytes as u64);
+                                serial_write(uart, b" bytes received)\r\n");
+                                serial_write(uart, b"GENESIS: stage13 httpget ok\r\n");
                             }
                             Err(e) => {
-                                serial_write(self.uart_va, b"HTTP GET failed: ");
-                                serial_write(self.uart_va, e.as_bytes());
-                                serial_write(self.uart_va, b"\r\n");
+                                serial_write(uart, b"HTTP GET failed: ");
+                                serial_write(uart, e.as_bytes());
+                                serial_write(uart, b"\r\n");
                             }
                         }
                     } else {
-                        serial_write(self.uart_va, b"HTTP client function not configured\r\n");
+                        serial_write(uart, b"HTTP client function not configured\r\n");
                     }
                 } else {
-                    serial_write(self.uart_va, b"VirtIO Network Device not detected\r\n");
+                    serial_write(uart, b"No network interface controller available\r\n");
                 }
             }
             "ping" => {
                 let target_str = if arg.is_empty() { "10.0.2.2" } else { arg };
-                if let Some(net) = self.net_dev.as_deref_mut() {
-                    serial_write(self.uart_va, b"PING ");
-                    serial_write(self.uart_va, target_str.as_bytes());
-                    serial_write(self.uart_va, b" (32 bytes of data)...\r\n");
-                    if let Some(ping_fn) = self.ping_fn {
-                        match ping_fn(net, self.uart_va) {
+                let uart = self.uart_va;
+                let ping_fn = self.ping_fn;
+                if let Some(mut net) = crate::net::get_active_net_dev() {
+                    serial_write(uart, b"PING ");
+                    serial_write(uart, target_str.as_bytes());
+                    serial_write(uart, b" (32 bytes of data)...\r\n");
+                    if let Some(pfn) = ping_fn {
+                        match pfn(&mut net, uart) {
                             Ok(us) => {
-                                serial_write(self.uart_va, b"32 bytes from ");
-                                serial_write(self.uart_va, target_str.as_bytes());
-                                serial_write(self.uart_va, b": icmp_seq=1 time=");
-                                serial_decimal(self.uart_va, us);
-                                serial_write(self.uart_va, b" us\r\n");
-                                serial_write(self.uart_va, b"GENESIS: stage12 virtio-net ping 10.0.2.2 ok\r\n");
+                                serial_write(uart, b"32 bytes from ");
+                                serial_write(uart, target_str.as_bytes());
+                                serial_write(uart, b": icmp_seq=1 time=");
+                                serial_decimal(uart, us);
+                                serial_write(uart, b" us\r\n");
+                                serial_write(uart, b"GENESIS: stage12 virtio-net ping 10.0.2.2 ok\r\n");
                                 crate::drivers::fb::update_workspace_telemetry(
                                     None,
                                     None,
@@ -1393,16 +1439,16 @@ impl<'a> Shell<'a> {
                                 );
                             }
                             Err(e) => {
-                                serial_write(self.uart_va, b"Ping failed: ");
-                                serial_write(self.uart_va, e.as_bytes());
-                                serial_write(self.uart_va, b"\r\n");
+                                serial_write(uart, b"Ping failed: ");
+                                serial_write(uart, e.as_bytes());
+                                serial_write(uart, b"\r\n");
                             }
                         }
                     } else {
-                        serial_write(self.uart_va, b"Ping function not configured\r\n");
+                        serial_write(uart, b"Ping function not configured\r\n");
                     }
                 } else {
-                    serial_write(self.uart_va, b"VirtIO Network Device not detected\r\n");
+                    serial_write(uart, b"No network interface controller available\r\n");
                 }
             }
             "halt" | "poweroff" => {

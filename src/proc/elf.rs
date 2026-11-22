@@ -370,6 +370,19 @@ mod tests {
         assert_eq!(hdr.e_phentsize, 56);
         assert_eq!(hdr.e_phnum, 1);
 
+        // Truncated ELF buffer test
+        assert_eq!(Elf64Header::parse(&buf[..32]), Err("ELF buffer smaller than 64-byte header"));
+
+        // Non-64-bit class test (32-bit = 1)
+        let mut class32_buf = buf;
+        class32_buf[4] = 1;
+        assert_eq!(Elf64Header::parse(&class32_buf), Err("ELF is not 64-bit"));
+
+        // Big-endian test (MSB = 2)
+        let mut be_buf = buf;
+        be_buf[5] = 2;
+        assert_eq!(Elf64Header::parse(&be_buf), Err("ELF is not little-endian"));
+
         // Invalid magic test
         let mut bad_buf = buf;
         bad_buf[0] = 0;
@@ -379,6 +392,28 @@ mod tests {
         let mut x86_buf = buf;
         x86_buf[18..20].copy_from_slice(&62u16.to_le_bytes());
         assert_eq!(Elf64Header::parse(&x86_buf), Err("ELF machine is not AArch64 (183)"));
+    }
+
+    #[test]
+    fn elf_load_rejects_missing_program_headers() {
+        let mut mem = Box::new([0u8; 16 * 4096]);
+        let base_ptr = mem.as_mut_ptr() as u64;
+        let mut pmm = PhysicalPageAllocator::<2>::new();
+        let map = make_test_map(0, 16);
+        unsafe {
+            pmm.init_from_memory_map(map.as_ptr(), map.len(), 40, &[]).unwrap();
+        }
+
+        let mut buf = [0u8; 64];
+        buf[0..4].copy_from_slice(&ELF_MAGIC);
+        buf[4] = ELF_CLASS_64;
+        buf[5] = ELF_DATA_2LSB;
+        buf[6] = 1;
+        buf[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        buf[32..40].copy_from_slice(&0u64.to_le_bytes()); // e_phoff = 0
+        buf[56..58].copy_from_slice(&0u16.to_le_bytes()); // e_phnum = 0
+
+        assert_eq!(load_elf64(&buf, &mut pmm, base_ptr, 16 * 4096).map(|_| ()), Err("ELF has no program headers"));
     }
 
     #[test]

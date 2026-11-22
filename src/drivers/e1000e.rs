@@ -191,7 +191,7 @@ impl E1000eDevice {
             ((rah >> 8) & 0xFF) as u8,
         ];
 
-        if (rah & (1 << 31)) == 0 && mac == [0; 6] {
+        if (rah & (1 << 31)) == 0 || mac == [0; 6] {
             // Read from EEPROM via EERD
             for word in 0..3 {
                 self.write_reg(REG_EERD, 1 | ((word as u32) << 8));
@@ -473,5 +473,42 @@ mod tests {
         assert_eq!(REG_TDBAL, 0x03800);
         assert_eq!(REG_RAL0, 0x05400);
         assert_eq!(REG_RAH0, 0x05404);
+    }
+
+    #[test]
+    fn e1000e_mac_rah0_av_fallback_and_decoding() {
+        // Valid MAC with Address Valid (AV = bit 31 set)
+        let ral = 0x12345678u32;
+        let rah = 0x8000_9abcu32;
+        let mac = [
+            (ral & 0xFF) as u8,
+            ((ral >> 8) & 0xFF) as u8,
+            ((ral >> 16) & 0xFF) as u8,
+            ((ral >> 24) & 0xFF) as u8,
+            (rah & 0xFF) as u8,
+            ((rah >> 8) & 0xFF) as u8,
+        ];
+        assert_eq!(mac, [0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a]);
+        let needs_fallback = (rah & (1 << 31)) == 0 || mac == [0; 6];
+        assert!(!needs_fallback, "Valid RAH0 with AV=1 and non-zero MAC must not trigger fallback");
+
+        // Invalid MAC because AV = 0 (uninitialized RAH0)
+        let rah_no_av = 0x0000_9abcu32;
+        let needs_fallback_no_av = (rah_no_av & (1 << 31)) == 0 || mac == [0; 6];
+        assert!(needs_fallback_no_av, "RAH0 with AV=0 must trigger fallback even if bytes are non-zero");
+
+        // Zero MAC with AV = 1
+        let ral_zero = 0u32;
+        let rah_zero = 0x8000_0000u32;
+        let mac_zero = [
+            (ral_zero & 0xFF) as u8,
+            ((ral_zero >> 8) & 0xFF) as u8,
+            ((ral_zero >> 16) & 0xFF) as u8,
+            ((ral_zero >> 24) & 0xFF) as u8,
+            (rah_zero & 0xFF) as u8,
+            ((rah_zero >> 8) & 0xFF) as u8,
+        ];
+        let needs_fallback_zero = (rah_zero & (1 << 31)) == 0 || mac_zero == [0; 6];
+        assert!(needs_fallback_zero, "Zero MAC must trigger fallback even if AV=1");
     }
 }

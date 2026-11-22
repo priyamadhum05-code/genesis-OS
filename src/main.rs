@@ -1460,6 +1460,11 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             }
         };
 
+        if let Some(ref mut dev) = net_dev_opt {
+            genesis_stage1::drivers::register_global_virtio_net(dev as *mut VirtIONetDevice);
+            net::set_active_nic(net::ActiveNic::VirtIoNet);
+        }
+
         // Allocate 1 page for Sector 0 request buffers
         let req_pa = mapper.pmm_mut().allocate_page().unwrap();
         let req_va = HHDM_BASE + req_pa;
@@ -1868,6 +1873,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         let backbuf_pa = mapper.pmm_mut().allocate_contiguous_pages(backbuf_pages).unwrap_or(0);
         let backbuf_va = if backbuf_pa != 0 { HHDM_BASE + backbuf_pa } else { 0 };
         genesis_stage1::ui::register_global_backbuffer(backbuf_va);
+        genesis_stage1::proc::register_global_run_elf(kernel_run_elf);
 
         // 2. Dedicated Buffers for Shell File and Tokenizer Reading
         let shell_file_pa = mapper.pmm_mut().allocate_contiguous_pages(128).unwrap();
@@ -2226,7 +2232,11 @@ unsafe fn kernel_run_elf(elf_data: &[u8], _uart: usize) -> Result<i32, &'static 
     let pmm = &mut *(pmm_va as *mut PhysicalPageAllocator<KERNEL_PMM_WORDS>);
     let max_pa = 1u64 << 48;
 
-    let proc = load_elf64(elf_data, pmm, HHDM_BASE, max_pa)?;
+    let mut proc = load_elf64(elf_data, pmm, HHDM_BASE, max_pa)?;
+    static NEXT_ASID: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
+    let asid = NEXT_ASID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 254 + 1;
+    proc.ttbr0_root = ((asid as u64) << 48) | (proc.ttbr0_root & 0x0000_FFFF_FFFF_FFFF);
+
     let status = run_user_process(proc.entry_va, proc.user_sp, proc.ttbr0_root);
     destroy_user_process(&proc, pmm, HHDM_BASE);
     Ok(status)
@@ -2480,373 +2490,26 @@ unsafe fn kernel_run_generate(
     Ok(())
 }
 
-unsafe fn kernel_ping_target(net: &mut VirtIONetDevice, _uart: usize) -> Result<u64, &'static str> {
-    // 1. Resolve ARP for Gateway 10.0.2.2
-    let mut arp_frame = [0u8; 42];
-    net::build_ethernet_header(&mut arp_frame[0..14], net::BROADCAST_MAC, net.mac, net::ETHERTYPE_ARP);
-    net::build_arp_packet(
-        &mut arp_frame[14..42],
-        net::ARP_OP_REQUEST,
-        net.mac,
-        net::GUEST_IP,
-        [0u8; 6],
-        net::GATEWAY_IP,
-    );
-
-    net.send_packet(&arp_frame)?;
-
-    // Poll for ARP Reply
-    let mut gw_mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]; // standard QEMU SLIRP gateway MAC default
-    let mut rx_buf = [0u8; 1536];
-    let mut spins = 0usize;
-
-    while spins < 1_000_000 {
-        if let Some(len) = net.poll_packet(&mut rx_buf) {
-            if len >= 42 {
-                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
-                if ethertype == net::ETHERTYPE_ARP {
-                    if let Some((op, sender_mac, sender_ip, target_ip)) = net::parse_arp(&rx_buf[14..len]) {
-                        if op == net::ARP_OP_REPLY && sender_ip == net::GATEWAY_IP && target_ip == net::GUEST_IP {
-                            gw_mac = sender_mac;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        spins += 1;
-        core::hint::spin_loop();
-    }
-
-    // 2. Build and send ICMP Echo Request
-    let mut icmp_frame = [0u8; 74];
-    net::build_ethernet_header(&mut icmp_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
-    let payload = b"Genesis ICMP Ping Stage 12 Test!";
-    let icmp_len = net::build_icmp_echo(
-        &mut icmp_frame[34..74],
-        net::ICMP_TYPE_ECHO_REQUEST,
-        0x1234,
-        1,
-        payload,
-    );
-    net::build_ipv4_header(
-        &mut icmp_frame[14..34],
-        icmp_len as u16,
-        net::IP_PROTO_ICMP,
-        net::GUEST_IP,
-        net::GATEWAY_IP,
-        0x5678,
-    );
-
-    let t0: u64;
-    let cntfrq: u64;
-    #[cfg(target_os = "uefi")]
-    {
-        asm!("mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
-        asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
-    }
-    #[cfg(not(target_os = "uefi"))]
-    {
-        t0 = 0;
-        cntfrq = 1_000_000;
-    }
-
-    net.send_packet(&icmp_frame)?;
-
-    // Poll for ICMP Echo Reply
-    spins = 0;
-    let mut ping_ok = false;
-    let mut t1: u64 = t0;
-
-    while spins < 2_000_000 {
-        if let Some(len) = net.poll_packet(&mut rx_buf) {
-            if len >= 34 {
-                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
-                if ethertype == net::ETHERTYPE_IPV4 {
-                    if let Some((src, dst, icmp_type, _code, ident, _seq, _)) = net::parse_icmp_reply(&rx_buf[14..len]) {
-                        if src == net::GATEWAY_IP && dst == net::GUEST_IP && icmp_type == net::ICMP_TYPE_ECHO_REPLY && ident == 0x1234 {
-                            #[cfg(target_os = "uefi")]
-                            asm!("mrs {}, cntvct_el0", out(reg) t1, options(nomem, nostack));
-                            #[cfg(not(target_os = "uefi"))]
-                            { t1 = 500; }
-                            ping_ok = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        spins += 1;
-        core::hint::spin_loop();
-    }
-
-    if !ping_ok {
-        return Err("ICMP ping response timed out");
-    }
-
-    let ticks = t1.saturating_sub(t0);
-    let us = if cntfrq > 0 { (ticks * 1_000_000) / cntfrq } else { 0 };
-    Ok(us)
+unsafe fn kernel_ping_target(net: &mut net::AnyNetDev, uart: usize) -> Result<u64, &'static str> {
+    net::ping_target(net, uart)
 }
 
 unsafe fn kernel_resolve_dns(
-    net: &mut VirtIONetDevice,
+    net: &mut net::AnyNetDev,
     hostname: &str,
-    _uart: usize,
+    uart: usize,
 ) -> Result<[u8; 4], &'static str> {
-    if let Some(ip) = net::parse_ipv4_addr(hostname) {
-        return Ok(ip);
-    }
-
-    // 1. Resolve Gateway MAC via ARP
-    let mut arp_frame = [0u8; 42];
-    net::build_ethernet_header(&mut arp_frame[0..14], net::BROADCAST_MAC, net.mac, net::ETHERTYPE_ARP);
-    net::build_arp_packet(
-        &mut arp_frame[14..42],
-        net::ARP_OP_REQUEST,
-        net.mac,
-        net::GUEST_IP,
-        [0u8; 6],
-        net::GATEWAY_IP,
-    );
-    net.send_packet(&arp_frame)?;
-
-    let mut gw_mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
-    let mut rx_buf = [0u8; 1536];
-    let mut spins = 0usize;
-    while spins < 1_000_000 {
-        if let Some(len) = net.poll_packet(&mut rx_buf) {
-            if len >= 42 {
-                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
-                if ethertype == net::ETHERTYPE_ARP {
-                    if let Some((op, sender_mac, sender_ip, target_ip)) = net::parse_arp(&rx_buf[14..len]) {
-                        if op == net::ARP_OP_REPLY && sender_ip == net::GATEWAY_IP && target_ip == net::GUEST_IP {
-                            gw_mac = sender_mac;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        spins += 1;
-        core::hint::spin_loop();
-    }
-
-    // 2. Build DNS Query
-    let mut dns_buf = [0u8; 256];
-    let query_id = 0x1337;
-    let query_len = net::build_dns_query(&mut dns_buf, query_id, hostname);
-
-    let mut udp_frame = [0u8; 512];
-    let udp_len = net::build_udp_packet(
-        &mut udp_frame[34..],
-        net::GUEST_IP,
-        net::DNS_SERVER_IP,
-        49152,
-        net::DNS_PORT,
-        &dns_buf[..query_len],
-    );
-    net::build_ipv4_header(
-        &mut udp_frame[14..34],
-        udp_len as u16,
-        net::IP_PROTO_UDP,
-        net::GUEST_IP,
-        net::DNS_SERVER_IP,
-        0x1234,
-    );
-    net::build_ethernet_header(&mut udp_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
-
-    net.send_packet(&udp_frame[..14 + 20 + udp_len])?;
-
-    // 3. Poll for DNS response
-    spins = 0;
-    while spins < 2_000_000 {
-        if let Some(len) = net.poll_packet(&mut rx_buf) {
-            if len >= 42 {
-                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
-                if ethertype == net::ETHERTYPE_IPV4 {
-                    if let Some((src_ip, _dst_ip, _src_p, _dst_p, payload)) = net::parse_udp_packet(&rx_buf[14..len]) {
-                        if src_ip == net::DNS_SERVER_IP {
-                            if let Some(resolved) = net::parse_dns_response(payload, query_id) {
-                                return Ok(resolved);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        spins += 1;
-        core::hint::spin_loop();
-    }
-
-    Err("DNS query timed out")
+    net::resolve_dns(net, hostname, uart)
 }
 
 unsafe fn kernel_http_get(
-    net: &mut VirtIONetDevice,
+    net: &mut net::AnyNetDev,
     host_or_ip: &str,
     port: u16,
     path: &str,
     uart: usize,
 ) -> Result<usize, &'static str> {
-    let remote_ip = match net::parse_ipv4_addr(host_or_ip) {
-        Some(ip) => ip,
-        None => kernel_resolve_dns(net, host_or_ip, uart)?,
-    };
-
-    let gw_mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
-    let local_port = 49153;
-    let initial_seq = 1000;
-    let mut client = net::tcp::TcpClient::new(net::GUEST_IP, local_port, remote_ip, port, initial_seq);
-
-    // 1. Send SYN
-    let mut syn_frame = [0u8; 74];
-    net::build_ethernet_header(&mut syn_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
-    let tcp_len = net::tcp::build_tcp_packet(
-        &mut syn_frame[34..74],
-        net::GUEST_IP,
-        remote_ip,
-        local_port,
-        port,
-        client.local_seq,
-        0,
-        net::tcp::TCP_FLAG_SYN,
-        64240,
-        &[],
-    );
-    net::build_ipv4_header(&mut syn_frame[14..34], tcp_len as u16, net::IP_PROTO_TCP, net::GUEST_IP, remote_ip, 0x3344);
-    net.send_packet(&syn_frame[..14 + 20 + tcp_len])?;
-    client.state = net::tcp::TcpState::SynSent;
-
-    // 2. Poll for SYN-ACK
-    let mut rx_buf = [0u8; 1536];
-    let mut spins = 0usize;
-    let mut connected = false;
-
-    while spins < 2_000_000 {
-        if let Some(len) = net.poll_packet(&mut rx_buf) {
-            if len >= 54 {
-                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
-                if ethertype == net::ETHERTYPE_IPV4 {
-                    if let Some((src, dst, sp, dp, seq, ack, flags, _win, _)) = net::tcp::parse_tcp_packet(&rx_buf[14..len]) {
-                        if src == remote_ip && dst == net::GUEST_IP && sp == port && dp == local_port {
-                            if (flags & (net::tcp::TCP_FLAG_SYN | net::tcp::TCP_FLAG_ACK)) == (net::tcp::TCP_FLAG_SYN | net::tcp::TCP_FLAG_ACK) {
-                                client.remote_seq = seq.wrapping_add(1);
-                                client.local_seq = ack;
-                                client.state = net::tcp::TcpState::Established;
-                                connected = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        spins += 1;
-        core::hint::spin_loop();
-    }
-
-    if !connected {
-        return Err("TCP handshake timed out");
-    }
-
-    // 3. Send ACK + HTTP Request (PSH | ACK)
-    let mut req_buf = [0u8; 256];
-    let mut req_len = 0;
-    let mut append = |s: &[u8]| {
-        for &b in s {
-            if req_len < 256 {
-                req_buf[req_len] = b;
-                req_len += 1;
-            }
-        }
-    };
-    append(b"GET ");
-    append(path.as_bytes());
-    append(b" HTTP/1.0\r\nHost: ");
-    append(host_or_ip.as_bytes());
-    append(b"\r\nConnection: close\r\n\r\n");
-
-    let mut http_frame = [0u8; 350];
-    net::build_ethernet_header(&mut http_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
-    let tcp_len = net::tcp::build_tcp_packet(
-        &mut http_frame[34..],
-        net::GUEST_IP,
-        remote_ip,
-        local_port,
-        port,
-        client.local_seq,
-        client.remote_seq,
-        net::tcp::TCP_FLAG_PSH | net::tcp::TCP_FLAG_ACK,
-        64240,
-        &req_buf[..req_len],
-    );
-    net::build_ipv4_header(&mut http_frame[14..34], tcp_len as u16, net::IP_PROTO_TCP, net::GUEST_IP, remote_ip, 0x3345);
-    net.send_packet(&http_frame[..14 + 20 + tcp_len])?;
-    client.local_seq = client.local_seq.wrapping_add(req_len as u32);
-
-    // 4. Poll for Response Data
-    spins = 0;
-    let mut total_received = 0usize;
-    while spins < 3_000_000 {
-        if let Some(len) = net.poll_packet(&mut rx_buf) {
-            if len >= 54 {
-                let ethertype = u16::from_be_bytes([rx_buf[12], rx_buf[13]]);
-                if ethertype == net::ETHERTYPE_IPV4 {
-                    if let Some((src, dst, sp, dp, seq, _ack, flags, _win, payload)) = net::tcp::parse_tcp_packet(&rx_buf[14..len]) {
-                        if src == remote_ip && dst == net::GUEST_IP && sp == port && dp == local_port {
-                            if !payload.is_empty() {
-                                total_received += payload.len();
-                                serial_write(uart, payload);
-                                client.remote_seq = seq.wrapping_add(payload.len() as u32);
-                                let mut ack_frame = [0u8; 74];
-                                net::build_ethernet_header(&mut ack_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
-                                let ack_tcp_len = net::tcp::build_tcp_packet(
-                                    &mut ack_frame[34..74],
-                                    net::GUEST_IP,
-                                    remote_ip,
-                                    local_port,
-                                    port,
-                                    client.local_seq,
-                                    client.remote_seq,
-                                    net::tcp::TCP_FLAG_ACK,
-                                    64240,
-                                    &[],
-                                );
-                                net::build_ipv4_header(&mut ack_frame[14..34], ack_tcp_len as u16, net::IP_PROTO_TCP, net::GUEST_IP, remote_ip, 0x3346);
-                                let _ = net.send_packet(&ack_frame[..14 + 20 + ack_tcp_len]);
-                            }
-
-                            if (flags & net::tcp::TCP_FLAG_FIN) != 0 {
-                                client.remote_seq = seq.wrapping_add(payload.len() as u32).wrapping_add(1);
-                                let mut finack_frame = [0u8; 74];
-                                net::build_ethernet_header(&mut finack_frame[0..14], gw_mac, net.mac, net::ETHERTYPE_IPV4);
-                                let finack_len = net::tcp::build_tcp_packet(
-                                    &mut finack_frame[34..74],
-                                    net::GUEST_IP,
-                                    remote_ip,
-                                    local_port,
-                                    port,
-                                    client.local_seq,
-                                    client.remote_seq,
-                                    net::tcp::TCP_FLAG_FIN | net::tcp::TCP_FLAG_ACK,
-                                    64240,
-                                    &[],
-                                );
-                                net::build_ipv4_header(&mut finack_frame[14..34], finack_len as u16, net::IP_PROTO_TCP, net::GUEST_IP, remote_ip, 0x3347);
-                                let _ = net.send_packet(&finack_frame[..14 + 20 + finack_len]);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        spins += 1;
-        core::hint::spin_loop();
-    }
-
-    Ok(total_received)
+    net::http_get(net, host_or_ip, port, path, uart)
 }
 
 unsafe fn kernel_run_llama(

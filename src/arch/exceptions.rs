@@ -159,7 +159,11 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
                 124 => {
                     // SYS_YIELD
                     frame.x[0] = 0;
-                    return crate::sched::scheduler_tick(frame as *mut TrapFrame);
+                    if crate::sched::is_current_task_multitask() {
+                        return crate::sched::scheduler_tick(frame as *mut TrapFrame);
+                    } else {
+                        return frame as *mut TrapFrame;
+                    }
                 }
                 172 => {
                     // SYS_GETPID
@@ -202,6 +206,23 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
                     } else {
                         frame.x[0] = (-14i64) as u64; // -EFAULT
                     }
+                    return frame as *mut TrapFrame;
+                }
+                202 => {
+                    // SYS_UPTIME_MS: return system uptime in milliseconds
+                    let t0: u64;
+                    let cntfrq: u64;
+                    #[cfg(target_os = "uefi")]
+                    unsafe {
+                        core::arch::asm!("mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
+                        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
+                    }
+                    #[cfg(not(target_os = "uefi"))]
+                    {
+                        t0 = 0;
+                        cntfrq = 1_000_000;
+                    }
+                    frame.x[0] = if cntfrq > 0 { (t0 * 1000) / cntfrq } else { 0 };
                     return frame as *mut TrapFrame;
                 }
                 _ => {
