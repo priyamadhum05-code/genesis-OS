@@ -529,8 +529,11 @@ pub fn format_pci_device<'a>(dev: &PciDeviceInfo, buf: &'a mut [u8]) -> &'a str 
 #[cfg(test)]
 mod tests {
     extern crate alloc;
+    extern crate std;
     use alloc::vec;
     use super::*;
+
+    static PCI_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn pci_ecam_address_math_test() {
@@ -599,6 +602,7 @@ mod tests {
 
     #[test]
     fn pci_bridge_secondary_bus_scanning_test() {
+        let _lock = PCI_TEST_LOCK.lock().unwrap();
         // Allocate 2 MiB mock ECAM region (Bus 0 and Bus 1)
         let mut mock_ecam = vec![0u8; 2 * 1024 * 1024];
         let mock_va = mock_ecam.as_mut_ptr() as u64;
@@ -639,6 +643,7 @@ mod tests {
 
     #[test]
     fn pci_multi_bus_visited_guard_prevents_duplicate_scans() {
+        let _lock = PCI_TEST_LOCK.lock().unwrap();
         // Allocate 2 MiB mock ECAM region (Bus 0 and Bus 1)
         let mut mock_ecam = vec![0u8; 2 * 1024 * 1024];
         let mock_va = mock_ecam.as_mut_ptr() as u64;

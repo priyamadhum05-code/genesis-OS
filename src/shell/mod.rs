@@ -455,10 +455,11 @@ impl<'a> Shell<'a> {
                 }
             }
             "exec" | "run" => {
-                if arg.is_empty() {
+                let rem = trimmed.strip_prefix(cmd).unwrap_or("").trim_start();
+                if rem.is_empty() {
                     serial_write(self.uart_va, b"Usage: exec <file.elf> [args...]\r\n");
                 } else {
-                    let mut parts = arg.splitn(2, ' ');
+                    let mut parts = rem.splitn(2, ' ');
                     let file_name = parts.next().unwrap_or("").trim();
                     let extra_args = parts.next().unwrap_or("").trim();
                     let (eff_fat, mut eff_dev) = unsafe { resolve_fs(self.fat, self.dev.as_deref_mut()) };

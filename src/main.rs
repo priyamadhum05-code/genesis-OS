@@ -1088,6 +1088,14 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             serial_write(uart, b"\r\n");
             halt();
         }
+        #[cfg(target_os = "uefi")]
+        asm!(
+            "dsb sy",
+            "tlbi vmalle1is",
+            "dsb sy",
+            "isb",
+            options(nostack, preserves_flags)
+        );
         serial_write(uart, b"GENESIS: stage4 gic mmio mapped dynamically in ttbr1\r\n");
 
         // Initialize GICv3

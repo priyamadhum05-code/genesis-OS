@@ -545,4 +545,42 @@ mod tests {
         assert_eq!(empty_argc, 0);
         assert_eq!(empty_argv, 0);
     }
+
+    #[test]
+    fn test_sh_elf_validation() {
+        if !std::path::Path::new("build/esp/SH.ELF").exists() {
+            let status = std::process::Command::new("python3")
+                .arg("tools/gen-stage25-assets.py")
+                .status()
+                .expect("Failed to run python3 tools/gen-stage25-assets.py");
+            assert!(status.success(), "gen-stage25-assets.py failed");
+        }
+
+        let elf_bytes = std::fs::read("build/esp/SH.ELF").expect("Failed to read build/esp/SH.ELF");
+        let hdr = Elf64Header::parse(&elf_bytes).expect("SH.ELF must parse as valid ELF64");
+        assert_eq!(hdr.ident[0..4], ELF_MAGIC);
+        assert_eq!(hdr.ident[4], ELF_CLASS_64);
+        assert_eq!(hdr.ident[5], ELF_DATA_2LSB);
+        assert_eq!(hdr.e_machine, EM_AARCH64);
+        assert_eq!(hdr.e_type, 2); // ET_EXEC
+        assert_eq!(hdr.e_entry, 0x0040_0080);
+        assert!(hdr.e_phnum >= 1);
+
+        let mut prev_end = 0u64;
+        let mut load_count = 0;
+        for i in 0..(hdr.e_phnum as usize) {
+            let off = (hdr.e_phoff as usize) + i * (hdr.e_phentsize as usize);
+            let ph = Elf64Phdr::parse(&elf_bytes, off).expect("Phdr must parse");
+            if ph.p_type == PT_LOAD {
+                load_count += 1;
+                assert!(ph.p_vaddr >= 0x0040_0000);
+                assert!(ph.p_vaddr < 0x0000_8000_0000_0000);
+                assert!(ph.p_filesz > 0);
+                assert!(ph.p_memsz >= ph.p_filesz);
+                assert!(ph.p_vaddr >= prev_end, "PT_LOAD segments must be non-overlapping");
+                prev_end = ph.p_vaddr + ph.p_memsz;
+            }
+        }
+        assert!(load_count >= 1);
+    }
 }

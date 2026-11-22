@@ -486,6 +486,8 @@ impl VirtIOSoundDevice {
     }
 
     /// Plays a synthesized tone at `freq_hz` for `duration_ms` over VirtIO-Sound Queue 2 (txq).
+    /// Handles durations up to 1000 ms cleanly by chunking audio frames into <= 250 ms transfers
+    /// so the 64 KiB tx_buf DMA buffer is never overflowed.
     pub unsafe fn play_beep(&mut self, freq_hz: u32, duration_ms: u32) -> Result<(), &'static str> {
         if !self.is_active || self.tx_queue_size == 0 {
             return Err("VirtIO-Sound device is not active");
@@ -493,88 +495,116 @@ impl VirtIOSoundDevice {
 
         let clamped_dur = duration_ms.max(10).min(1000);
         let clamped_freq = freq_hz.max(20).min(20000);
-
-        // Samples for 48,000 Hz: (48000 * duration_ms) / 1000
-        let total_samples = (48_000u64 * (clamped_dur as u64)) / 1000;
         let period_samples = (48_000 / clamped_freq).max(2);
 
-        let pcm_bytes = (total_samples as usize) * 4; // 16-bit stereo = 4 bytes per sample frame
-        if pcm_bytes > 65536 {
-            return Err("PCM buffer exceeds 64 KiB capacity");
-        }
+        let mut remaining_ms = clamped_dur;
+        let mut sample_offset = 0usize;
 
-        // Fill buffer with 16-bit signed stereo square wave (+/- 6000 amplitude)
-        let pcm_slice = core::slice::from_raw_parts_mut(self.tx_buf_va as *mut i16, (total_samples as usize) * 2);
-        for t in 0..total_samples as usize {
-            let half = (period_samples / 2) as usize;
-            let val = if (t % (period_samples as usize)) < half {
-                6000i16
-            } else {
-                -6000i16
-            };
-            pcm_slice[t * 2] = val;       // Left channel
-            pcm_slice[t * 2 + 1] = val;   // Right channel
-        }
+        while remaining_ms > 0 {
+            let chunk_ms = remaining_ms.min(250);
+            remaining_ms -= chunk_ms;
+            let chunk_samples = (48_000u64 * (chunk_ms as u64)) / 1000;
+            let pcm_bytes = (chunk_samples as usize) * 4;
 
-        // Setup xfer header (stream_id = 0)
-        let xfer_pa = self.tx_status_pa + 128;
-        let xfer_va = self.tx_status_va + 128;
-        core::ptr::write_volatile(xfer_va as *mut VirtioSndPcmXfer, VirtioSndPcmXfer { stream_id: 0 });
-
-        clean_dcache_range(xfer_va, core::mem::size_of::<VirtioSndPcmXfer>());
-        clean_dcache_range(self.tx_buf_va, pcm_bytes);
-        clean_dcache_range(self.tx_status_va, core::mem::size_of::<VirtioSndPcmStatus>());
-
-        let descs = self.tx_queue_va as *mut VirtqDesc;
-        let avail = (self.tx_queue_va + 2048) as *mut VirtqAvail;
-        let used = (self.tx_queue_va + 4096) as *const VirtqUsed;
-
-        // Desc 0: xfer header (device-read)
-        (*descs.add(0)).addr = xfer_pa;
-        (*descs.add(0)).len = core::mem::size_of::<VirtioSndPcmXfer>() as u32;
-        (*descs.add(0)).flags = VRING_DESC_F_NEXT;
-        (*descs.add(0)).next = 1;
-
-        // Desc 1: PCM audio payload (device-read)
-        (*descs.add(1)).addr = self.tx_buf_pa;
-        (*descs.add(1)).len = pcm_bytes as u32;
-        (*descs.add(1)).flags = VRING_DESC_F_NEXT;
-        (*descs.add(1)).next = 2;
-
-        // Desc 2: status buffer (device-write)
-        (*descs.add(2)).addr = self.tx_status_pa;
-        (*descs.add(2)).len = core::mem::size_of::<VirtioSndPcmStatus>() as u32;
-        (*descs.add(2)).flags = VRING_DESC_F_WRITE;
-        (*descs.add(2)).next = 0;
-
-        clean_dcache_range(self.tx_queue_va, 16 * 3);
-
-        let avail_idx = core::ptr::read_volatile(&(*avail).idx);
-        let ring_slot = (avail_idx % self.tx_queue_size) as usize;
-        core::ptr::write_volatile(&mut (*avail).ring[ring_slot], 0);
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        core::ptr::write_volatile(&mut (*avail).idx, avail_idx.wrapping_add(1));
-
-        clean_dcache_range(avail as u64, 4 + 2 * (self.tx_queue_size as usize));
-
-        self.notify_tx();
-
-        let mut spins = 0u64;
-        while core::ptr::read_volatile(&(*used).idx) == self.tx_last_used {
-            invalidate_dcache_range(used as u64, 4);
-            spins += 1;
-            if spins > 50_000 {
-                // In virtualized QEMU audiodev configurations, tx frames are queued
-                // and drained asynchronously by the host audio backend.
-                break;
+            if pcm_bytes > 65536 {
+                return Err("PCM buffer exceeds 64 KiB capacity");
             }
-            core::hint::spin_loop();
+
+            // Fill buffer with 16-bit signed stereo square wave (+/- 6000 amplitude)
+            let pcm_slice = core::slice::from_raw_parts_mut(self.tx_buf_va as *mut i16, (chunk_samples as usize) * 2);
+            for t in 0..chunk_samples as usize {
+                let current_t = sample_offset + t;
+                let half = (period_samples / 2) as usize;
+                let val = if (current_t % (period_samples as usize)) < half {
+                    6000i16
+                } else {
+                    -6000i16
+                };
+                pcm_slice[t * 2] = val;       // Left channel
+                pcm_slice[t * 2 + 1] = val;   // Right channel
+            }
+            sample_offset += chunk_samples as usize;
+
+            // Setup xfer header (stream_id = 0)
+            let xfer_pa = self.tx_status_pa + 128;
+            let xfer_va = self.tx_status_va + 128;
+            core::ptr::write_volatile(xfer_va as *mut VirtioSndPcmXfer, VirtioSndPcmXfer { stream_id: 0 });
+
+            clean_dcache_range(xfer_va, core::mem::size_of::<VirtioSndPcmXfer>());
+            clean_dcache_range(self.tx_buf_va, pcm_bytes);
+            clean_dcache_range(self.tx_status_va, core::mem::size_of::<VirtioSndPcmStatus>());
+
+            let descs = self.tx_queue_va as *mut VirtqDesc;
+            let avail = (self.tx_queue_va + 2048) as *mut VirtqAvail;
+            let used = (self.tx_queue_va + 4096) as *const VirtqUsed;
+
+            // Desc 0: xfer header (device-read)
+            (*descs.add(0)).addr = xfer_pa;
+            (*descs.add(0)).len = core::mem::size_of::<VirtioSndPcmXfer>() as u32;
+            (*descs.add(0)).flags = VRING_DESC_F_NEXT;
+            (*descs.add(0)).next = 1;
+
+            // Desc 1: PCM audio payload (device-read)
+            (*descs.add(1)).addr = self.tx_buf_pa;
+            (*descs.add(1)).len = pcm_bytes as u32;
+            (*descs.add(1)).flags = VRING_DESC_F_NEXT;
+            (*descs.add(1)).next = 2;
+
+            // Desc 2: status buffer (device-write)
+            (*descs.add(2)).addr = self.tx_status_pa;
+            (*descs.add(2)).len = core::mem::size_of::<VirtioSndPcmStatus>() as u32;
+            (*descs.add(2)).flags = VRING_DESC_F_WRITE;
+            (*descs.add(2)).next = 0;
+
+            clean_dcache_range(self.tx_queue_va, 16 * 3);
+
+            let avail_idx = core::ptr::read_volatile(&(*avail).idx);
+            let ring_slot = (avail_idx % self.tx_queue_size) as usize;
+            core::ptr::write_volatile(&mut (*avail).ring[ring_slot], 0);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            core::ptr::write_volatile(&mut (*avail).idx, avail_idx.wrapping_add(1));
+
+            clean_dcache_range(avail as u64, 4 + 2 * (self.tx_queue_size as usize));
+
+            self.notify_tx();
+
+            let mut spins = 0u64;
+            while core::ptr::read_volatile(&(*used).idx) == self.tx_last_used {
+                invalidate_dcache_range(used as u64, 4);
+                spins += 1;
+                if spins > 50_000 {
+                    // In virtualized QEMU audiodev configurations, tx frames are queued
+                    // and drained asynchronously by the host audio backend.
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+
+            self.tx_last_used = core::ptr::read_volatile(&(*used).idx);
         }
 
-        self.tx_last_used = core::ptr::read_volatile(&(*used).idx);
         self.beeps_played += 1;
         Ok(())
     }
+}
+
+/// Calculates audio chunk sizes for beep playback to ensure buffer safety (<= 64 KiB per chunk).
+/// Returns (number of chunks, total bytes across all chunks).
+pub fn calculate_beep_chunks(duration_ms: u32) -> (usize, usize) {
+    let clamped_dur = duration_ms.max(10).min(1000);
+    let mut chunks = 0;
+    let mut total_bytes = 0;
+    let mut remaining_ms = clamped_dur;
+    while remaining_ms > 0 {
+        let chunk_ms = remaining_ms.min(250);
+        remaining_ms -= chunk_ms;
+        let chunk_samples = (48_000u64 * (chunk_ms as u64)) / 1000;
+        let pcm_bytes = (chunk_samples as usize) * 4;
+        assert!(pcm_bytes <= 65536);
+        total_bytes += pcm_bytes;
+        chunks += 1;
+    }
+    (chunks, total_bytes)
 }
 
 /// Helper to generate synthesized square-wave audio samples into an existing buffer.
@@ -649,5 +679,24 @@ mod tests {
             assert_eq!(pcm_buf[i * 2], -6000);
             assert_eq!(pcm_buf[i * 2 + 1], -6000);
         }
+    }
+
+    #[test]
+    fn test_beep_duration_chunking_up_to_1000ms() {
+        let (chunks_1000, bytes_1000) = calculate_beep_chunks(1000);
+        assert_eq!(chunks_1000, 4);
+        assert_eq!(bytes_1000, 192_000);
+
+        let (chunks_250, bytes_250) = calculate_beep_chunks(250);
+        assert_eq!(chunks_250, 1);
+        assert_eq!(bytes_250, 48_000);
+
+        let (chunks_500, bytes_500) = calculate_beep_chunks(500);
+        assert_eq!(chunks_500, 2);
+        assert_eq!(bytes_500, 96_000);
+
+        let (chunks_100, bytes_100) = calculate_beep_chunks(100);
+        assert_eq!(chunks_100, 1);
+        assert_eq!(bytes_100, 19_200);
     }
 }

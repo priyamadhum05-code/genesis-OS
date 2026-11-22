@@ -28,6 +28,7 @@ impl Gicv3 {
         }
     }
 
+    #[inline(never)]
     pub unsafe fn init(&self) {
         // 1. Initialize Distributor (GICD)
         let ctlr = self.mmio_read_d(GICD_CTLR);
@@ -37,8 +38,14 @@ impl Gicv3 {
         // 2. Wake up Redistributor (GICR) for current CPU
         let waker = self.mmio_read_r(GICR_WAKER);
         self.mmio_write_r(GICR_WAKER, waker & !(1 << 1)); // Clear ProcessorSleep
+
+        let mut spins = 0u64;
         while (self.mmio_read_r(GICR_WAKER) & (1 << 2)) != 0 {
             // Wait for ChildrenAsleep == 0
+            spins += 1;
+            if spins > 100_000 {
+                break;
+            }
             core::hint::spin_loop();
         }
 
@@ -59,22 +66,33 @@ impl Gicv3 {
             asm!("msr ICC_IGRPEN1_EL1, {0}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
             asm!("isb", options(nomem, nostack, preserves_flags));
         }
+
+        #[cfg(target_os = "uefi")]
+        asm!("dsb sy", "isb", options(nomem, nostack, preserves_flags));
     }
 
+    #[inline(never)]
     pub unsafe fn enable_ppi(&self, intid: u32) {
         let sgi_base = self.gicr_base + GICR_SGI_OFFSET;
+
         // Group 1 Non-Secure
         let grp = core::ptr::read_volatile((sgi_base + GICR_IGROUPR0) as *const u32);
         core::ptr::write_volatile((sgi_base + GICR_IGROUPR0) as *mut u32, grp | (1 << intid));
+        let _ = core::ptr::read_volatile((sgi_base + GICR_IGROUPR0) as *const u32); // Flush write
 
         // Priority 0x00 (highest)
         let prio_addr = (sgi_base + GICR_IPRIORITYR + ((intid as usize & !3))) as *mut u32;
         let prio = core::ptr::read_volatile(prio_addr);
         let shift = (intid % 4) * 8;
         core::ptr::write_volatile(prio_addr, prio & !(0xFF << shift));
+        let _ = core::ptr::read_volatile(prio_addr); // Flush write
 
         // Enable interrupt in GICR_ISENABLER0
         core::ptr::write_volatile((sgi_base + GICR_ISENABLER0) as *mut u32, 1 << intid);
+        let _ = core::ptr::read_volatile((sgi_base + GICR_ISENABLER0) as *const u32); // Flush write
+
+        #[cfg(target_os = "uefi")]
+        asm!("dsb sy", "isb", options(nostack));
     }
 
     #[inline]
