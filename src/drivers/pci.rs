@@ -153,11 +153,12 @@ pub unsafe fn pci_write_u32(ecam_va: u64, bus: u8, dev: u8, func: u8, reg: u16, 
     core::ptr::write_volatile(addr, val);
 }
 
-/// Recursively scan a PCI bus and downstream buses via bridges
-pub unsafe fn scan_pci_bus(ecam_va: u64, bus: u8, max_bus: u8) {
-    if bus > max_bus {
+/// Recursively scan a PCI bus and downstream buses via bridges, with visited guard
+pub unsafe fn scan_pci_bus(ecam_va: u64, bus: u8, max_bus: u8, visited: &mut [bool; 256]) {
+    if bus > max_bus || visited[bus as usize] {
         return;
     }
+    visited[bus as usize] = true;
 
     for dev in 0..32u8 {
         let mut max_func = 1u8;
@@ -349,7 +350,7 @@ pub unsafe fn scan_pci_bus(ecam_va: u64, bus: u8, max_bus: u8) {
                 if sec_bus > bus && sec_bus <= max_bus && sub_bus >= sec_bus {
                     let end_bus = sub_bus.min(max_bus);
                     for downstream in sec_bus..=end_bus {
-                        scan_pci_bus(ecam_va, downstream, max_bus);
+                        scan_pci_bus(ecam_va, downstream, max_bus, visited);
                     }
                 }
             }
@@ -360,7 +361,8 @@ pub unsafe fn scan_pci_bus(ecam_va: u64, bus: u8, max_bus: u8) {
 /// Enumerate all devices across PCIe buses up to `max_bus`
 pub unsafe fn scan_pci_buses(ecam_va: u64, max_bus: u8) -> usize {
     PCI_DEVICE_COUNT = 0;
-    scan_pci_bus(ecam_va, 0, max_bus);
+    let mut visited = [false; 256];
+    scan_pci_bus(ecam_va, 0, max_bus, &mut visited);
     PCI_DEVICE_COUNT
 }
 
@@ -628,6 +630,45 @@ mod tests {
             assert_eq!(PCI_DEVICES[1].vendor_id, 0x1AF4);
             assert_eq!(PCI_DEVICES[1].device_id, 0x1050);
             assert_eq!(PCI_DEVICES[1].header_type & 0x7F, 0);
+        }
+    }
+
+    #[test]
+    fn pci_multi_bus_visited_guard_prevents_duplicate_scans() {
+        // Allocate 2 MiB mock ECAM region (Bus 0 and Bus 1)
+        let mut mock_ecam = vec![0u8; 2 * 1024 * 1024];
+        let mock_va = mock_ecam.as_mut_ptr() as u64;
+
+        // Bridge 1 on Bus 0 Dev 1 points to secondary bus 1
+        let b0_d1_off = (0 << 20) | (1 << 15) | (0 << 12);
+        mock_ecam[b0_d1_off..b0_d1_off + 2].copy_from_slice(&0x1B36u16.to_le_bytes());
+        mock_ecam[b0_d1_off + 2..b0_d1_off + 4].copy_from_slice(&0x000Cu16.to_le_bytes());
+        mock_ecam[b0_d1_off + 0x0E] = 1; // Bridge
+        mock_ecam[b0_d1_off + 0x18] = 0;
+        mock_ecam[b0_d1_off + 0x19] = 1; // Secondary bus 1
+        mock_ecam[b0_d1_off + 0x1A] = 1; // Subordinate bus 1
+
+        // Bridge 2 on Bus 0 Dev 2 ALSO points to secondary bus 1 (duplicate bridge)
+        let b0_d2_off = (0 << 20) | (2 << 15) | (0 << 12);
+        mock_ecam[b0_d2_off..b0_d2_off + 2].copy_from_slice(&0x1B36u16.to_le_bytes());
+        mock_ecam[b0_d2_off + 2..b0_d2_off + 4].copy_from_slice(&0x000Cu16.to_le_bytes());
+        mock_ecam[b0_d2_off + 0x0E] = 1; // Bridge
+        mock_ecam[b0_d2_off + 0x18] = 0;
+        mock_ecam[b0_d2_off + 0x19] = 1; // Secondary bus 1
+        mock_ecam[b0_d2_off + 0x1A] = 1; // Subordinate bus 1
+
+        // Bus 1 Dev 0 Func 0: Single Endpoint
+        let b1_d0_off = (1 << 20) | (0 << 15) | (0 << 12);
+        mock_ecam[b1_d0_off..b1_d0_off + 2].copy_from_slice(&0x1AF4u16.to_le_bytes());
+        mock_ecam[b1_d0_off + 2..b1_d0_off + 4].copy_from_slice(&0x1050u16.to_le_bytes());
+        mock_ecam[b1_d0_off + 0x0E] = 0; // Endpoint
+
+        unsafe {
+            let count = scan_pci_buses(mock_va, 1);
+            // 2 bridges on Bus 0 + 1 single endpoint on Bus 1 = 3 devices total (NOT 4!)
+            assert_eq!(count, 3);
+            let bus1_count = (0..count).filter(|&i| PCI_DEVICES[i].bus == 1).count();
+            assert_eq!(bus1_count, 1, "Bus 1 must be visited only once!");
         }
     }
 }

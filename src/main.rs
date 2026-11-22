@@ -30,6 +30,7 @@ use genesis_stage1::{
         usb_hid::{enumerate_usb_devices, get_enumerated_count},
         nvme::{get_global_nvme_ref, register_global_nvme, NvmeDevice, NVME_MMIO_VA_BASE},
         usb_msc::get_global_usb_msc_ref,
+        e1000e::{register_global_e1000e, E1000eDevice, E1000E_MMIO_VA_BASE},
     },
     fs::{locate_volume, FatVolume},
     memory_map,
@@ -1628,6 +1629,40 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
                     }
                 } else {
                     serial_write(uart, b"GENESIS: nvme bar0 map failed\r\n");
+                }
+            }
+        }
+
+        // Stage 22: Probe PCIe Intel e1000e Gigabit NIC (0x8086:0x10D3 or Class 0x02:0x00)
+        let e1000_pci_opt = find_pci_device(0x8086, 0x10D3)
+            .or_else(|| find_pci_by_class(0x02, 0x00, 0x00));
+        if let Some(e1000_pci_dev) = e1000_pci_opt {
+            if e1000_pci_dev.vendor_id == 0x8086 {
+                serial_write(uart, b"GENESIS: pcie intel e1000e nic detected at 00:");
+                serial_decimal(uart, e1000_pci_dev.dev as u64);
+                serial_write(uart, b".");
+                serial_decimal(uart, e1000_pci_dev.func as u64);
+                serial_write(uart, b"\r\n");
+
+                pci_enable_bus_master(PCI_ECAM_VA_BASE, e1000_pci_dev.bus, e1000_pci_dev.dev, e1000_pci_dev.func);
+
+                let bar0_pa = e1000_pci_dev.bars[0];
+                if bar0_pa != 0 {
+                    let bar_pages = ((e1000_pci_dev.bar_sizes[0].max(131072) + 4095) / 4096) as usize;
+                    if let Ok(()) = mapper.map_mmio_range(E1000E_MMIO_VA_BASE, bar0_pa, bar_pages) {
+                        let mut e1000_dev = E1000eDevice::empty();
+                        if let Ok(()) = e1000_dev.init(&e1000_pci_dev, mapper.pmm_mut(), HHDM_BASE, E1000E_MMIO_VA_BASE) {
+                            serial_write(uart, b"GENESIS: stage22 e1000e ok (mac=");
+                            e1000_dev.print_mac(uart);
+                            serial_write(uart, b")\r\n");
+                            register_global_e1000e(e1000_dev);
+                            net::set_active_nic(net::ActiveNic::E1000e);
+                        } else {
+                            serial_write(uart, b"GENESIS: e1000e init returned error\r\n");
+                        }
+                    } else {
+                        serial_write(uart, b"GENESIS: e1000e bar0 map failed\r\n");
+                    }
                 }
             }
         }

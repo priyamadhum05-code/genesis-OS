@@ -10,6 +10,7 @@ pub mod xhci;
 pub mod usb_hid;
 pub mod nvme;
 pub mod usb_msc;
+pub mod e1000e;
 
 pub use fb::{
     global_fb_console_clear, global_fb_console_write, redraw_workspace_sidebar,
@@ -31,3 +32,7 @@ pub use xhci::{
 };
 pub use nvme::{get_global_nvme, get_global_nvme_ref, register_global_nvme, NvmeDevice, NVME_MMIO_VA_BASE};
 pub use usb_msc::{get_global_usb_msc, get_global_usb_msc_ref, register_global_usb_msc, UsbMscDevice};
+pub use e1000e::{
+    get_global_e1000e, get_global_e1000e_ref, register_global_e1000e, E1000eDevice,
+    E1000E_MMIO_VA_BASE,
+};

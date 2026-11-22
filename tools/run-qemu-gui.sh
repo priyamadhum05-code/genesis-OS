@@ -23,6 +23,7 @@ exec "$QEMU" -machine virt-11.1,gic-version=3 -cpu cortex-a76 -smp "${QEMU_SMP:-
   -drive if=none,format=raw,file=fat:rw:build/esp,id=esp \
   -device virtio-blk-device,drive=esp \
   -netdev user,id=net0 -device virtio-net-device,netdev=net0 \
+  -netdev user,id=net1 -device e1000e,netdev=net1 \
   -device virtio-keyboard-device \
   -device virtio-tablet-device \
   -device ramfb \

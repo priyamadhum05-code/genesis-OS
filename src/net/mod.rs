@@ -30,6 +30,39 @@ pub const DNS_SERVER_IP: [u8; 4] = [10, 0, 2, 3];
 pub const DNS_PORT: u16 = 53;
 pub const BROADCAST_MAC: [u8; 6] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveNic {
+    None,
+    VirtIoNet,
+    E1000e,
+}
+
+pub static mut ACTIVE_NIC: ActiveNic = ActiveNic::None;
+
+pub fn set_active_nic(nic: ActiveNic) {
+    unsafe {
+        *core::ptr::addr_of_mut!(ACTIVE_NIC) = nic;
+    }
+}
+
+pub fn get_active_nic() -> ActiveNic {
+    unsafe { *core::ptr::addr_of!(ACTIVE_NIC) }
+}
+
+pub fn get_active_mac(virtio_mac: Option<[u8; 6]>) -> Option<[u8; 6]> {
+    match get_active_nic() {
+        ActiveNic::E1000e => crate::drivers::e1000e::get_global_e1000e_ref().map(|d| d.mac),
+        ActiveNic::VirtIoNet => virtio_mac,
+        ActiveNic::None => {
+            if let Some(d) = crate::drivers::e1000e::get_global_e1000e_ref() {
+                Some(d.mac)
+            } else {
+                virtio_mac
+            }
+        }
+    }
+}
+
 /// Computes the standard Internet Checksum (RFC 1071) over arbitrary byte slices.
 pub fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;

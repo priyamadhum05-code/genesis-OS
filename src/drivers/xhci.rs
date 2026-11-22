@@ -111,6 +111,26 @@ impl UsbSetupPacket {
         }
     }
 
+    pub fn get_ss_hub_descriptor(len: u16) -> Self {
+        Self {
+            request_type: 0xA0,
+            request: 6,
+            value: 0x2A00,
+            index: 0,
+            length: len,
+        }
+    }
+
+    pub fn set_hub_depth(depth: u16) -> Self {
+        Self {
+            request_type: 0x20,
+            request: 12, // SET_HUB_DEPTH
+            value: depth,
+            index: 0,
+            length: 0,
+        }
+    }
+
     pub fn set_hub_port_feature(port: u8, feature: u16) -> Self {
         Self {
             request_type: 0x23,
@@ -1468,6 +1488,18 @@ pub mod tests {
         let set_idle = UsbSetupPacket::set_idle(0, 0);
         assert_eq!(set_idle.request_type, 0x21);
         assert_eq!(set_idle.request, 0x0A);
+
+        let ss_hub_desc = UsbSetupPacket::get_ss_hub_descriptor(12);
+        assert_eq!(ss_hub_desc.request_type, 0xA0);
+        assert_eq!(ss_hub_desc.request, 6);
+        assert_eq!(ss_hub_desc.value, 0x2A00);
+        assert_eq!(ss_hub_desc.length, 12);
+
+        let set_depth = UsbSetupPacket::set_hub_depth(1);
+        assert_eq!(set_depth.request_type, 0x20);
+        assert_eq!(set_depth.request, 12);
+        assert_eq!(set_depth.value, 1);
+        assert_eq!(set_depth.length, 0);
     }
 
     #[test]

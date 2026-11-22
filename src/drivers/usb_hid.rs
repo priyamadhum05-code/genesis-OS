@@ -312,9 +312,14 @@ pub unsafe fn enumerate_usb_devices<const WORDS: usize>(
 
         // Check for USB Hub device (bDeviceClass == 0x09)
         if dev_buf[4] == 0x09 {
-            let get_hub = UsbSetupPacket::get_hub_descriptor(8);
-            if xhci.control_transfer(slot_id, get_hub, ctrl_pa, ctrl_va, 8, true).is_ok() {
-                let hub_slice = core::slice::from_raw_parts(ctrl_va as *const u8, 8);
+            let desc_len: u16 = if speed >= 4 { 12 } else { 8 };
+            let get_hub = if speed >= 4 {
+                UsbSetupPacket::get_ss_hub_descriptor(desc_len)
+            } else {
+                UsbSetupPacket::get_hub_descriptor(desc_len)
+            };
+            if xhci.control_transfer(slot_id, get_hub, ctrl_pa, ctrl_va, desc_len as usize, true).is_ok() {
+                let hub_slice = core::slice::from_raw_parts(ctrl_va as *const u8, desc_len as usize);
                 let num_hub_ports = hub_slice[2];
 
                 write_input_control_context(input_ctx_va, 0, (1 << 0) | (1 << 1));
@@ -325,6 +330,9 @@ pub unsafe fn enumerate_usb_devices<const WORDS: usize>(
                 clean_dcache_range(input_ctx_va, 4096);
                 let _ = xhci.configure_endpoint(slot_id, input_ctx_pa);
                 let _ = xhci.control_transfer(slot_id, UsbSetupPacket::set_configuration(1), 0, 0, 0, false);
+                if speed >= 4 {
+                    let _ = xhci.control_transfer(slot_id, UsbSetupPacket::set_hub_depth(0), 0, 0, 0, false);
+                }
 
                 if ENUMERATED_USB_COUNT < 8 {
                     let hub_dev_info = UsbDeviceInfo {
@@ -357,7 +365,9 @@ pub unsafe fn enumerate_usb_devices<const WORDS: usize>(
                             let _ = xhci.control_transfer(slot_id, rst, 0, 0, 0, false);
                             for _ in 0..20_000 { core::hint::spin_loop(); }
 
-                            let child_speed = if xhci.control_transfer(slot_id, st_pkt, ctrl_pa, ctrl_va, 4, true).is_ok() {
+                            let child_speed = if speed >= 4 {
+                                4 // SuperSpeed hub downstream ports operate at SuperSpeed
+                            } else if xhci.control_transfer(slot_id, st_pkt, ctrl_pa, ctrl_va, 4, true).is_ok() {
                                 let st2 = core::slice::from_raw_parts(ctrl_va as *const u8, 4);
                                 let speed_bits = (st2[1] >> 1) & 0x3;
                                 if speed_bits == 1 { 2 } else if speed_bits == 2 { 3 } else { 1 }
@@ -389,7 +399,7 @@ pub unsafe fn enumerate_usb_devices<const WORDS: usize>(
                             ptr::write_volatile((xhci.dcbaa_va as *mut u64).add(child_slot_id as usize), child_out_pa);
                             clean_dcache_range(xhci.dcbaa_va + (child_slot_id as u64 * 8), 8);
 
-                            let child_max_pkt: u16 = match child_speed { 2 => 8, 1 => 64, 3 => 64, _ => 64 };
+                            let child_max_pkt: u16 = match child_speed { 2 => 8, 1 => 64, 3 => 64, 4 => 512, _ => 64 };
                             let child_route = crate::drivers::xhci::calculate_child_route_string(0, 0, hp);
 
                             write_input_control_context(child_in_va, 0, (1 << 0) | (1 << 1));

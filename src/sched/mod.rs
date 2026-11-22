@@ -413,9 +413,11 @@ pub extern "C" fn task_exit_trampoline() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static TEST_LOCK: crate::mm::heap::SpinLock<()> = crate::mm::heap::SpinLock::new(());
 
     #[test]
     fn scheduler_initialization_and_task_spawning() {
+        let _guard = TEST_LOCK.lock();
         init_scheduler(0xFFFF_FFFF_8000_F000);
         let mut fake_stack = [0u8; 1024];
         let stack_top = (fake_stack.as_mut_ptr() as usize + fake_stack.len()) as u64;
@@ -435,6 +437,7 @@ mod tests {
 
     #[test]
     fn scheduler_user_process_spawning_and_multitask_round_robin() {
+        let _guard = TEST_LOCK.lock();
         init_scheduler(0xFFFF_FFFF_8000_F000);
         let mut fake_stack1 = [0u8; 1024];
         let stack1_top = (fake_stack1.as_mut_ptr() as usize + fake_stack1.len()) as u64;

@@ -5,6 +5,8 @@ build/esp/
 build/edk2-vars.fd
 build/*.sock
 build/*.dtb
+build/*.img
+build/*.bin
 build/serial.log
 build/stage5.serial.log
 build/phase2-validation/

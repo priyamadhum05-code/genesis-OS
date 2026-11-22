@@ -92,6 +92,7 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  info              - Display system status, memory, registers, and framebuffer\r\n");
                 serial_write(self.uart_va, b"  ramstat           - Display kernel memory profile and physical RAM breakdown\r\n");
                 serial_write(self.uart_va, b"  netinfo           - Display VirtIO-Net MAC, IP, gateway, and status\r\n");
+                serial_write(self.uart_va, b"  nicinfo           - Display all network controllers (VirtIO-Net, e1000e) & active NIC\r\n");
                 serial_write(self.uart_va, b"  ping [ip]         - Send ICMP echo request over VirtIO-Net\r\n");
                 serial_write(self.uart_va, b"  dns <hostname>    - Resolve hostname to IPv4 address via DNS\r\n");
                 serial_write(self.uart_va, b"  httpget <host> [port] [path] - Send HTTP/1.0 GET request via TCP\r\n");
@@ -1249,6 +1250,42 @@ impl<'a> Shell<'a> {
                     serial_write(self.uart_va, b"Subnet Mask:  255.255.255.0\r\n");
                 } else {
                     serial_write(self.uart_va, b"VirtIO Network Device not detected\r\n");
+                }
+            }
+            "nicinfo" => {
+                serial_write(self.uart_va, b"=== Network Interface Controllers (NICs) ===\r\n");
+                let mut nic_count = 0;
+                if let Some(ref net) = self.net_dev {
+                    serial_write(self.uart_va, b"[NIC 0] VirtIO-Net (MMIO): MAC=");
+                    net.print_mac(self.uart_va);
+                    serial_write(self.uart_va, b" | Link: UP | IP=10.0.2.15\r\n");
+                    nic_count += 1;
+                }
+                if let Some(e1000) = crate::drivers::e1000e::get_global_e1000e_ref() {
+                    serial_write(self.uart_va, b"[NIC ");
+                    serial_decimal(self.uart_va, nic_count as u64);
+                    serial_write(self.uart_va, b"] Intel 82574L e1000e (PCIe): MAC=");
+                    e1000.print_mac(self.uart_va);
+                    let link_up = unsafe { e1000.is_link_up() };
+                    serial_write(self.uart_va, if link_up { b" | Link: UP" } else { b" | Link: DOWN" });
+                    serial_write(self.uart_va, b" | TX=");
+                    serial_decimal(self.uart_va, e1000.packets_tx);
+                    serial_write(self.uart_va, b" RX=");
+                    serial_decimal(self.uart_va, e1000.packets_rx);
+                    serial_write(self.uart_va, b"\r\n");
+                    nic_count += 1;
+                }
+                if nic_count == 0 {
+                    serial_write(self.uart_va, b"No network interface controllers detected\r\n");
+                } else {
+                    let active = match crate::net::get_active_nic() {
+                        crate::net::ActiveNic::E1000e => "e1000e (PCIe)",
+                        crate::net::ActiveNic::VirtIoNet => "virtio-net (MMIO)",
+                        crate::net::ActiveNic::None => "default",
+                    };
+                    serial_write(self.uart_va, b"Active Default Route: ");
+                    serial_write(self.uart_va, active.as_bytes());
+                    serial_write(self.uart_va, b"\r\n");
                 }
             }
             "dns" => {
