@@ -56,6 +56,13 @@ pub fn stage4_vectors_va() -> u64 {
     0xFFFF_FFFF_8000_B000
 }
 
+/// Validates that a user-space buffer lies entirely within lower-half EL0 memory and does not overflow.
+pub fn validate_user_buffer(buf: u64, count: usize) -> bool {
+    buf >= 4096
+        && buf < 0x0000_8000_0000_0000
+        && buf.checked_add(count as u64).map_or(false, |end| end <= 0x0000_8000_0000_0000)
+}
+
 #[no_mangle]
 pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) -> *mut TrapFrame {
     let uart = STAGE4_UART_VA.load(Ordering::Relaxed) as usize;
@@ -114,6 +121,41 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
             // SVC instruction in AArch64
             let sys_num = frame.x[8];
             match sys_num {
+                63 => {
+                    // SYS_READ (fd = arg0, buf = arg1, count = arg2)
+                    let fd = frame.x[0];
+                    let buf = frame.x[1];
+                    let count = frame.x[2] as usize;
+
+                    if validate_user_buffer(buf, count) {
+                        if fd == 0 {
+                            if count == 0 {
+                                frame.x[0] = 0;
+                            } else if uart != 0 {
+                                let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count) };
+                                let b = unsafe { crate::arch::serial::serial_read_byte(uart) };
+                                slice[0] = b;
+                                let mut read_bytes = 1usize;
+                                while read_bytes < count {
+                                    if let Some(extra) = unsafe { crate::arch::serial::serial_try_read_byte(uart) } {
+                                        slice[read_bytes] = extra;
+                                        read_bytes += 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                frame.x[0] = read_bytes as u64;
+                            } else {
+                                frame.x[0] = 0;
+                            }
+                        } else {
+                            frame.x[0] = (-9i64) as u64; // -EBADF
+                        }
+                    } else {
+                        frame.x[0] = (-14i64) as u64; // -EFAULT
+                    }
+                    return frame as *mut TrapFrame;
+                }
                 1 | 64 => {
                     // SYS_WRITE (fd = arg0, buf = arg1 / arg0, count = arg2 / arg1)
                     // Standard Linux AArch64: x0 = fd, x1 = buf, x2 = count
@@ -126,10 +168,7 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
                         (frame.x[0], frame.x[1] as usize)
                     };
 
-                    if buf >= 4096
-                        && buf < 0x0000_8000_0000_0000
-                        && buf.checked_add(count as u64).map_or(false, |end| end <= 0x0000_8000_0000_0000)
-                    {
+                    if validate_user_buffer(buf, count) {
                         if uart != 0 {
                             let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
                             unsafe {
@@ -471,3 +510,35 @@ pub static stage4_vectors_start: [u8; 0] = [];
 #[cfg(not(target_os = "uefi"))]
 #[allow(non_upper_case_globals)]
 pub static stage4_vectors_end: [u8; 0] = [];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_user_buffer() {
+        // Valid EL0 buffer (within 4096..0x0000_8000_0000_0000)
+        assert!(validate_user_buffer(0x0000_7FFF_E000_0000, 1024));
+        assert!(validate_user_buffer(4096, 64));
+        assert!(validate_user_buffer(0x0000_7FFF_FFFF_FF00, 256));
+
+        // Zero length buffer at valid address
+        assert!(validate_user_buffer(4096, 0));
+
+        // Null pointer and zero-page addresses (< 4096)
+        assert!(!validate_user_buffer(0, 100));
+        assert!(!validate_user_buffer(4095, 1));
+
+        // Upper-half addresses (kernel space >= 0xFFFF_8000_0000_0000)
+        assert!(!validate_user_buffer(0xFFFF_8000_0000_0000, 64));
+        assert!(!validate_user_buffer(0xFFFF_FFFF_8000_0000, 1024));
+
+        // Boundary violations (crossing into upper half or >= 0x0000_8000_0000_0000)
+        assert!(!validate_user_buffer(0x0000_8000_0000_0000, 1));
+        assert!(!validate_user_buffer(0x0000_7FFF_FFFF_FFFF, 2));
+
+        // Integer overflow
+        assert!(!validate_user_buffer(0x0000_7FFF_0000_0000, usize::MAX));
+        assert!(!validate_user_buffer(u64::MAX - 10, 20));
+    }
+}

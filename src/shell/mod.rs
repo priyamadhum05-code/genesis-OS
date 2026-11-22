@@ -40,7 +40,7 @@ pub struct Shell<'a> {
     pub pmm_free_pages: u64,
     pub mapper_tables: usize,
     pub bench_fn: Option<fn(u64) -> (u64, u64)>,
-    pub run_elf_fn: Option<unsafe fn(&[u8], usize) -> Result<i32, &'static str>>,
+    pub run_elf_fn: Option<crate::proc::RunElfFn>,
     pub infer_fn: Option<unsafe fn(&[u8], usize) -> Result<(usize, u64), &'static str>>,
     pub llm_fn: Option<unsafe fn(&[u8], usize) -> Result<u64, &'static str>>,
     pub multitask_fn: Option<unsafe fn(&[u8], &[u8], usize) -> Result<(), &'static str>>,
@@ -114,6 +114,10 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  gpuinfo           - Display VirtIO-GPU 2D/3D VirGL acceleration status\r\n");
                 serial_write(self.uart_va, b"  bench             - Run 4-core SMP NEON 64x64 MatMul benchmark\r\n");
                 serial_write(self.uart_va, b"  draw              - Redraw UEFI GOP framebuffer dashboard\r\n");
+                serial_write(self.uart_va, b"  date              - Display wall-clock RTC date and time in UTC\r\n");
+                serial_write(self.uart_va, b"  reboot            - Reset system via PSCI SYSTEM_RESET\r\n");
+                serial_write(self.uart_va, b"  audioinfo         - Display VirtIO-Sound PCI audio device status\r\n");
+                serial_write(self.uart_va, b"  beep [hz]         - Play synthesized PCM tone via VirtIO-Sound\r\n");
                 serial_write(self.uart_va, b"  exec <file>       - Execute an AArch64 ELF64 binary in EL0 user space\r\n");
                 serial_write(self.uart_va, b"  run <file>        - Alias for exec\r\n");
                 serial_write(self.uart_va, b"  infer [file]      - Run 4-core SMP INT8 NEON neural network inference\r\n");
@@ -452,14 +456,17 @@ impl<'a> Shell<'a> {
             }
             "exec" | "run" => {
                 if arg.is_empty() {
-                    serial_write(self.uart_va, b"Usage: exec <file.elf>\r\n");
+                    serial_write(self.uart_va, b"Usage: exec <file.elf> [args...]\r\n");
                 } else {
+                    let mut parts = arg.splitn(2, ' ');
+                    let file_name = parts.next().unwrap_or("").trim();
+                    let extra_args = parts.next().unwrap_or("").trim();
                     let (eff_fat, mut eff_dev) = unsafe { resolve_fs(self.fat, self.dev.as_deref_mut()) };
                     if let (Some(fat), Some(ref mut dev)) = (eff_fat, eff_dev.as_mut()) {
                         let res = unsafe {
                             fat.read_file(
                                 dev,
-                                arg,
+                                file_name,
                                 self.file_buf_pa,
                                 self.file_buf_va,
                                 self.file_buf_cap,
@@ -473,7 +480,7 @@ impl<'a> Shell<'a> {
                                 match crate::proc::Elf64Header::parse(elf_slice) {
                                     Ok(_hdr) => {
                                         if let Some(run_fn) = self.run_elf_fn {
-                                            match unsafe { run_fn(elf_slice, self.uart_va) } {
+                                            match unsafe { run_fn(elf_slice, extra_args, self.uart_va) } {
                                                 Ok(status) => {
                                                     serial_write(self.uart_va, b"EL0 process exited with status ");
                                                     serial_decimal(self.uart_va, status as u64);
@@ -491,7 +498,7 @@ impl<'a> Shell<'a> {
                                     }
                                     Err(e) => {
                                         serial_write(self.uart_va, b"Invalid ELF header in '");
-                                        serial_write(self.uart_va, arg.as_bytes());
+                                        serial_write(self.uart_va, file_name.as_bytes());
                                         serial_write(self.uart_va, b"': ");
                                         serial_write(self.uart_va, e.as_bytes());
                                         serial_write(self.uart_va, b"\r\n");
@@ -500,7 +507,7 @@ impl<'a> Shell<'a> {
                             }
                             Err(e) => {
                                 serial_write(self.uart_va, b"Error reading file '");
-                                serial_write(self.uart_va, arg.as_bytes());
+                                serial_write(self.uart_va, file_name.as_bytes());
                                 serial_write(self.uart_va, b"': ");
                                 serial_write(self.uart_va, e.as_bytes());
                                 serial_write(self.uart_va, b"\r\n");
@@ -1449,6 +1456,74 @@ impl<'a> Shell<'a> {
                     }
                 } else {
                     serial_write(uart, b"No network interface controller available\r\n");
+                }
+            }
+            "date" => {
+                let mut buf = [0u8; 64];
+                let epoch = crate::arch::rtc::current_utc_epoch_secs();
+                let date_str = crate::arch::rtc::format_utc_datetime(epoch, &mut buf);
+                serial_write(self.uart_va, date_str.as_bytes());
+                serial_write(self.uart_va, b"\r\n");
+            }
+            "reboot" => {
+                serial_write(self.uart_va, b"System rebooting via PSCI...\r\n");
+                crate::arch::psci::psci_system_reset();
+            }
+            "audioinfo" => {
+                if let Some(snd) = crate::drivers::virtio_sound::get_global_virtio_sound_ref() {
+                    serial_write(self.uart_va, b"VirtIO-Sound PCI Audio Device:\r\n");
+                    serial_write(self.uart_va, b"  Status:       ");
+                    if snd.is_active {
+                        serial_write(self.uart_va, b"ACTIVE\r\n");
+                    } else {
+                        serial_write(self.uart_va, b"INACTIVE\r\n");
+                    }
+                    serial_write(self.uart_va, b"  Format:       PCM S16_LE\r\n");
+                    serial_write(self.uart_va, b"  Rate:         ");
+                    serial_decimal(self.uart_va, snd.sample_rate as u64);
+                    serial_write(self.uart_va, b" Hz\r\n");
+                    serial_write(self.uart_va, b"  Channels:     ");
+                    serial_decimal(self.uart_va, snd.channels as u64);
+                    serial_write(self.uart_va, b"\r\n");
+                    serial_write(self.uart_va, b"  Buffer Size:  ");
+                    serial_decimal(self.uart_va, snd.buffer_bytes as u64);
+                    serial_write(self.uart_va, b" bytes\r\n");
+                    serial_write(self.uart_va, b"  Period Size:  ");
+                    serial_decimal(self.uart_va, snd.period_bytes as u64);
+                    serial_write(self.uart_va, b" bytes\r\n");
+                    serial_write(self.uart_va, b"  Beeps Played: ");
+                    serial_decimal(self.uart_va, snd.beeps_played);
+                    serial_write(self.uart_va, b"\r\n");
+                } else {
+                    serial_write(self.uart_va, b"No VirtIO-Sound device detected\r\n");
+                }
+            }
+            "beep" => {
+                let mut freq: u32 = 0;
+                for &b in arg.as_bytes() {
+                    if b >= b'0' && b <= b'9' {
+                        freq = freq * 10 + (b - b'0') as u32;
+                    }
+                }
+                if freq == 0 {
+                    freq = 440;
+                }
+                if let Some(snd) = crate::drivers::virtio_sound::get_global_virtio_sound_mut() {
+                    serial_write(self.uart_va, b"Playing ");
+                    serial_decimal(self.uart_va, freq as u64);
+                    serial_write(self.uart_va, b" Hz tone...\r\n");
+                    match unsafe { snd.play_beep(freq, 200) } {
+                        Ok(()) => {
+                            serial_write(self.uart_va, b"Audio playback complete\r\n");
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Audio playback error: ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"No VirtIO-Sound device detected\r\n");
                 }
             }
             "halt" | "poweroff" => {

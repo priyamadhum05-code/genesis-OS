@@ -31,6 +31,7 @@ exec "$QEMU" -machine virt-11.1,gic-version=3 -cpu cortex-a76 -smp "${QEMU_SMP:-
   -device qemu-xhci,id=xhci \
   -device usb-kbd \
   -device usb-mouse \
+  -audiodev none,id=snd0 -device virtio-sound-pci,audiodev=snd0 \
   -serial stdio \
   -monitor unix:build/qemu-monitor.sock,server=on,wait=off \
   -display default -no-reboot "$@"

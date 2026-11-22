@@ -31,13 +31,16 @@ use genesis_stage1::{
         nvme::{get_global_nvme_ref, register_global_nvme, NvmeDevice, NVME_MMIO_VA_BASE},
         usb_msc::get_global_usb_msc_ref,
         e1000e::{register_global_e1000e, E1000eDevice, E1000E_MMIO_VA_BASE},
+        virtio_sound::{
+            register_global_virtio_sound, VirtIOSoundDevice, SOUND_MMIO_VA_BASE,
+        },
     },
     fs::{locate_volume, FatVolume},
     memory_map,
     mm::heap::SpinLock,
     net,
     pmm::{self, PhysicalPageAllocator, ReservedRange, KERNEL_PMM_WORDS},
-    proc::{destroy_user_process, load_elf64, run_user_process},
+    proc::{destroy_user_process, load_elf64},
     sched,
     shell::{Shell, ShellResult},
     vmm::{
@@ -177,6 +180,22 @@ struct EfiGraphicsOutputProtocol {
     mode: *mut EfiGraphicsOutputProtocolMode,
 }
 #[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+struct EfiTime {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    pad1: u8,
+    nanosecond: u32,
+    time_zone: i16,
+    daylight: u8,
+    pad2: u8,
+}
+
+#[repr(C)]
 struct Handoff {
     magic: [u8; 8],
     version: u32,
@@ -196,6 +215,7 @@ struct Handoff {
     fb_stride: u32,
     fb_pixel_format: u32,
     rsdp_pa: u64,
+    boot_epoch_secs: u64,
 }
 #[repr(C)] #[derive(Clone, Copy)] struct Node { parent_ac: u32, parent_sc: u32, child_ac: u32, child_sc: u32, uart: bool, disabled: bool, reg: usize, reg_size: usize }
 #[repr(C)] struct FdtClient { methods: [usize; 9] }
@@ -221,6 +241,7 @@ static mut HANDOFF: Handoff = Handoff {
     fb_stride: 0,
     fb_pixel_format: 0,
     rsdp_pa: 0,
+    boot_epoch_secs: 0,
 };
 static mut KERNEL_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 static mut KERNEL_PMM: PhysicalPageAllocator<KERNEL_PMM_WORDS> = PhysicalPageAllocator::new();
@@ -344,6 +365,21 @@ pub extern "efiapi" fn efi_main(image: usize, system_table: *mut SystemTable) ->
 
         let map = ptr::addr_of_mut!(MEMORY_MAP) as *mut u8;
 
+        let mut boot_epoch_secs = 0u64;
+        if st._runtime != 0 {
+            let rt = st._runtime as *const usize;
+            let get_time_ptr = *rt.add(3);
+            if get_time_ptr != 0 {
+                let get_time: extern "efiapi" fn(*mut EfiTime, *mut u8) -> usize = core::mem::transmute(get_time_ptr);
+                let mut efi_time = EfiTime::default();
+                if get_time(&mut efi_time, ptr::null_mut()) == 0 {
+                    boot_epoch_secs = genesis_stage1::arch::rtc::calendar_to_epoch(
+                        efi_time.year, efi_time.month, efi_time.day, efi_time.hour, efi_time.minute, efi_time.second,
+                    );
+                }
+            }
+        }
+
         // EFI_BOOT_SERVICES begins with a 24-byte table header (three usize
         // slots on AArch64), followed by RaiseTPL at slot 3.
         // UEFI method indices: GetMemoryMap=4 and ExitBootServices=26.
@@ -382,6 +418,7 @@ pub extern "efiapi" fn efi_main(image: usize, system_table: *mut SystemTable) ->
             fb_stride,
             fb_pixel_format,
             rsdp_pa,
+            boot_epoch_secs,
         };
         let stack_top = (ptr::addr_of_mut!(KERNEL_STACK) as usize + STACK_SIZE) & !15usize;
         asm!("mov sp, {stack}", "mov x0, {handoff}", "bl {kernel}", stack=in(reg) stack_top, handoff=in(reg) ptr::addr_of!(HANDOFF), kernel=sym kernel_entry, options(noreturn));
@@ -996,6 +1033,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         serial_write(uart, b"GENESIS: stage4 phase 4c starting (fdt discovery & gic/timer irq)\r\n");
 
         let handoff = &*(handoff_va as *const Handoff);
+        genesis_stage1::arch::rtc::init_rtc(handoff.boot_epoch_secs);
         let fdt_ptr = if handoff.fdt.is_null() {
             ptr::null()
         } else {
@@ -1672,6 +1710,54 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             }
         }
 
+        // Stage 24: Probe PCIe VirtIO-Sound Audio Controller (0x1AF4:0x1059 or Class 0x04:0x01)
+        let sound_pci_opt = find_pci_device(0x1AF4, 0x1059)
+            .or_else(|| find_pci_by_class(0x04, 0x01, 0x00));
+        if let Some(snd_pci_dev) = sound_pci_opt {
+            if snd_pci_dev.vendor_id == 0x1AF4 {
+                serial_write(uart, b"GENESIS: virtio-sound pci device detected at 00:");
+                serial_decimal(uart, snd_pci_dev.dev as u64);
+                serial_write(uart, b".");
+                serial_decimal(uart, snd_pci_dev.func as u64);
+                serial_write(uart, b"\r\n");
+
+                pci_enable_bus_master(PCI_ECAM_VA_BASE, snd_pci_dev.bus, snd_pci_dev.dev, snd_pci_dev.func);
+
+                let mut common_bar = 0usize;
+                for i in 0..snd_pci_dev.cap_count {
+                    if snd_pci_dev.capabilities[i].cfg_type == genesis_stage1::drivers::pci::VIRTIO_PCI_CAP_COMMON_CFG {
+                        common_bar = snd_pci_dev.capabilities[i].bar as usize;
+                        break;
+                    }
+                }
+
+                let bar_pa = if common_bar < 6 && snd_pci_dev.bars[common_bar] != 0 {
+                    snd_pci_dev.bars[common_bar]
+                } else if snd_pci_dev.bars[4] != 0 {
+                    snd_pci_dev.bars[4]
+                } else if snd_pci_dev.bars[1] != 0 {
+                    snd_pci_dev.bars[1]
+                } else {
+                    snd_pci_dev.bars[0]
+                };
+
+                if bar_pa != 0 {
+                    let bar_pages = ((snd_pci_dev.bar_sizes[common_bar].max(16384) + 4095) / 4096) as usize;
+                    if let Ok(()) = mapper.map_mmio_range(SOUND_MMIO_VA_BASE, bar_pa, bar_pages.max(16)) {
+                        let mut snd_dev = VirtIOSoundDevice::empty();
+                        if let Ok(()) = snd_dev.init(&snd_pci_dev, mapper.pmm_mut(), HHDM_BASE, SOUND_MMIO_VA_BASE) {
+                            serial_write(uart, b"GENESIS: stage24 virtio-sound initialized (pcm 48kHz S16_LE stereo)\r\n");
+                            register_global_virtio_sound(snd_dev);
+                        } else {
+                            serial_write(uart, b"GENESIS: virtio-sound init returned error\r\n");
+                        }
+                    } else {
+                        serial_write(uart, b"GENESIS: virtio-sound bar map failed\r\n");
+                    }
+                }
+            }
+        }
+
         let sig = match blk_dev.read_sector_0(req_pa, req_va) {
             Ok(s) => s,
             Err(e) => {
@@ -2227,7 +2313,7 @@ fn run_smp_matmul_benchmark(_arg: u64) -> (u64, u64) {
     (ticks, us)
 }
 
-unsafe fn kernel_run_elf(elf_data: &[u8], _uart: usize) -> Result<i32, &'static str> {
+unsafe fn kernel_run_elf(elf_data: &[u8], args_str: &str, _uart: usize) -> Result<i32, &'static str> {
     let pmm_va = ensure_higher_half(ptr::addr_of_mut!(KERNEL_PMM) as usize as u64);
     let pmm = &mut *(pmm_va as *mut PhysicalPageAllocator<KERNEL_PMM_WORDS>);
     let max_pa = 1u64 << 48;
@@ -2237,7 +2323,28 @@ unsafe fn kernel_run_elf(elf_data: &[u8], _uart: usize) -> Result<i32, &'static 
     let asid = NEXT_ASID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 254 + 1;
     proc.ttbr0_root = ((asid as u64) << 48) | (proc.ttbr0_root & 0x0000_FFFF_FFFF_FFFF);
 
-    let status = run_user_process(proc.entry_va, proc.user_sp, proc.ttbr0_root);
+    let mut args: [&str; 16] = [""; 16];
+    let mut argc = 0;
+    for token in args_str.split_ascii_whitespace() {
+        if argc < 16 {
+            args[argc] = token;
+            argc += 1;
+        }
+    }
+
+    let (argc_val, argv_va) = if argc > 0 {
+        genesis_stage1::proc::elf::setup_user_stack_args(&mut proc, &args[..argc], HHDM_BASE)?
+    } else {
+        (0, 0)
+    };
+
+    let status = genesis_stage1::proc::run_user_process_with_args(
+        proc.entry_va,
+        proc.user_sp,
+        proc.ttbr0_root,
+        argc_val,
+        argv_va,
+    );
     destroy_user_process(&proc, pmm, HHDM_BASE);
     Ok(status)
 }

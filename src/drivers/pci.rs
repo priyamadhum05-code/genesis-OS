@@ -418,6 +418,10 @@ pub fn pci_class_description(class_code: u8, subclass: u8) -> &'static str {
             0x00 => "VGA compatible controller",
             _ => "Display controller",
         },
+        0x04 => match subclass {
+            0x01 => "Audio controller",
+            _ => "Multimedia controller",
+        },
         0x06 => match subclass {
             0x00 => "Host bridge",
             0x01 => "ISA bridge",

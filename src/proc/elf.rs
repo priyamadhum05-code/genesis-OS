@@ -64,6 +64,7 @@ pub struct ElfProcess {
     pub entry_va: u64,
     pub user_sp: u64,
     pub ttbr0_root: u64,
+    pub stack_top_pa: u64,
 }
 
 impl Elf64Header {
@@ -190,9 +191,13 @@ pub fn load_elf64<const N: usize>(
     }
 
     // Map 16 KiB User Stack at 0x0000_7FFF_F000_0000
+    let mut stack_top_pa = 0u64;
     for p in 0..USER_STACK_PAGES {
         let va = USER_STACK_BASE + (p as u64) * PAGE_SIZE;
         let pa = mapper.pmm_mut().allocate_page().ok_or("PMM out of memory for user stack")?;
+        if p == USER_STACK_PAGES - 1 {
+            stack_top_pa = pa;
+        }
         unsafe {
             let frame_ptr = (hhdm_base + pa) as *mut u8;
             frame_ptr.write_bytes(0, PAGE_SIZE as usize);
@@ -206,7 +211,68 @@ pub fn load_elf64<const N: usize>(
         entry_va: hdr.e_entry,
         user_sp: USER_STACK_TOP,
         ttbr0_root: root_pa,
+        stack_top_pa,
     })
+}
+
+/// Sets up argc / argv strings and pointer array on the top page of the user stack.
+/// Returns (argc, argv_user_va).
+/// The resulting `proc.user_sp` is 16-byte aligned.
+pub unsafe fn setup_user_stack_args(
+    proc: &mut ElfProcess,
+    args: &[&str],
+    hhdm_base: u64,
+) -> Result<(u64, u64), &'static str> {
+    if args.is_empty() {
+        return Ok((0, 0));
+    }
+    if proc.stack_top_pa == 0 {
+        return Err("User stack frame not allocated");
+    }
+
+    let page_va = hhdm_base + proc.stack_top_pa;
+    let page_bytes = core::slice::from_raw_parts_mut(page_va as *mut u8, PAGE_SIZE as usize);
+    let stack_page_base_user_va = USER_STACK_TOP - PAGE_SIZE;
+
+    // We write strings from the top of the page downwards
+    let mut curr_offset = PAGE_SIZE as usize;
+    let mut str_user_vas = [0u64; 32];
+    let argc = args.len().min(32);
+
+    for (i, arg) in args[..argc].iter().enumerate() {
+        let bytes = arg.as_bytes();
+        let needed = bytes.len() + 1; // with null terminator
+        if curr_offset < needed + 256 {
+            return Err("Argument strings exceed user stack page space");
+        }
+        curr_offset -= needed;
+        page_bytes[curr_offset..curr_offset + bytes.len()].copy_from_slice(bytes);
+        page_bytes[curr_offset + bytes.len()] = 0; // null terminator
+        str_user_vas[i] = stack_page_base_user_va + curr_offset as u64;
+    }
+
+    // Below strings, allocate the argv pointer array:
+    // (argc + 1) pointers of 8 bytes each, followed by 16-byte alignment
+    let argv_len = (argc + 1) * core::mem::size_of::<u64>();
+    if curr_offset < argv_len + 128 {
+        return Err("Argument pointers exceed user stack page space");
+    }
+    curr_offset -= argv_len;
+    // Align down to 16-byte boundary
+    curr_offset &= !0xF;
+
+    let argv_user_va = stack_page_base_user_va + curr_offset as u64;
+    let argv_slice = core::slice::from_raw_parts_mut(
+        page_bytes.as_mut_ptr().add(curr_offset) as *mut u64,
+        argc + 1,
+    );
+    for i in 0..argc {
+        argv_slice[i] = str_user_vas[i];
+    }
+    argv_slice[argc] = 0; // NULL terminator
+
+    proc.user_sp = argv_user_va;
+    Ok((argc as u64, argv_user_va))
 }
 
 /// Invalidate TLB entries for a specific ASID across all inner shareable cores.
@@ -433,5 +499,50 @@ mod tests {
         assert_eq!(phdr.p_vaddr, 0x0040_0000);
         assert_eq!(phdr.p_filesz, 120);
         assert_eq!(phdr.p_memsz, 256);
+    }
+
+    #[test]
+    fn test_setup_user_stack_args() {
+        let mut mock_stack_page = [0u8; 4096];
+        let pa = mock_stack_page.as_mut_ptr() as u64;
+        let hhdm = 0u64; // pa is direct pointer
+        let mut proc = ElfProcess {
+            entry_va: 0x400000,
+            user_sp: USER_STACK_TOP,
+            ttbr0_root: 0x1000,
+            stack_top_pa: pa,
+        };
+
+        let args = ["hello", "world", "genesis"];
+        let (argc, argv_va) = unsafe { setup_user_stack_args(&mut proc, &args, hhdm).unwrap() };
+
+        assert_eq!(argc, 3);
+        assert_eq!(argv_va % 16, 0); // 16-byte alignment
+        assert_eq!(proc.user_sp, argv_va);
+
+        // Verify argv array in mock_stack_page
+        let stack_page_base_user_va = USER_STACK_TOP - PAGE_SIZE;
+        let argv_offset = (argv_va - stack_page_base_user_va) as usize;
+        let argv_ptrs = unsafe {
+            core::slice::from_raw_parts(mock_stack_page.as_ptr().add(argv_offset) as *const u64, 4)
+        };
+
+        assert_ne!(argv_ptrs[0], 0);
+        assert_ne!(argv_ptrs[1], 0);
+        assert_ne!(argv_ptrs[2], 0);
+        assert_eq!(argv_ptrs[3], 0); // NULL terminator
+
+        // Check each string
+        for (i, expected) in args.iter().enumerate() {
+            let s_offset = (argv_ptrs[i] - stack_page_base_user_va) as usize;
+            let s_len = expected.len();
+            assert_eq!(&mock_stack_page[s_offset..s_offset + s_len], expected.as_bytes());
+            assert_eq!(mock_stack_page[s_offset + s_len], 0); // Null terminator
+        }
+
+        // Empty args test
+        let (empty_argc, empty_argv) = unsafe { setup_user_stack_args(&mut proc, &[], hhdm).unwrap() };
+        assert_eq!(empty_argc, 0);
+        assert_eq!(empty_argv, 0);
     }
 }

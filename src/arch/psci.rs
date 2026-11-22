@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const PSCI_CPU_ON_64: u64 = 0xC400_0003;
 pub const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+pub const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 
 pub static ONLINE_CPUS: AtomicU64 = AtomicU64::new(1); // CPU 0 is online initially
 
@@ -81,6 +82,25 @@ pub unsafe fn psci_system_off() -> ! {
         core::arch::asm!(
             "hvc #0",
             in("x0") PSCI_SYSTEM_OFF,
+            options(noreturn)
+        );
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Reboots the machine via PSCI SYSTEM_RESET (Function ID 0x8400_0009).
+/// This call never returns.
+pub unsafe fn psci_system_reset() -> ! {
+    #[cfg(target_os = "uefi")]
+    {
+        core::arch::asm!(
+            "hvc #0",
+            in("x0") PSCI_SYSTEM_RESET,
             options(noreturn)
         );
     }

@@ -1045,55 +1045,82 @@ impl DesktopCompositor {
                                 self.save_editor_file(fat, dev, scratch_pa, scratch_va);
                             }
                         } else if win_id == WIN_EXPLORER {
-                            let (eff_fat, mut eff_dev) = resolve_ui_fs(fat, dev.as_deref_mut());
-                            // Check [OPEN IN EDITOR] button in right preview pane
+                            // Check [OPEN IN EDITOR] and [RUN / EXEC] buttons in right preview pane
                             let div_x = win.x + ((win.w as i32 * 38) / 100);
                             let preview_box_w = (win.w as i32).saturating_sub((div_x - win.x) + 24);
                             let btn_w = 120i32;
                             let btn_x = preview_box_w.saturating_sub(btn_w + 8) + div_x + 12;
                             let btn_y = win.y + 24;
-                            if px >= btn_x && px <= btn_x + btn_w && py >= btn_y && py <= btn_y + 18 {
-                                if self.selected_file < self.file_count && !self.files[self.selected_file].is_dir {
-                                    let entry = self.files[self.selected_file];
-                                    let fname = entry.name_str();
-                                    if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
-                                        let mut scratch_buf = [0u8; 1024];
-                                        if let Ok(bytes) = f.read_file(d, fname, scratch_pa, scratch_va, 1024, scratch_pa, scratch_va) {
-                                            core::ptr::copy_nonoverlapping(scratch_va as *const u8, scratch_buf.as_mut_ptr(), bytes.min(1024));
-                                            self.open_file_in_editor(fname, &scratch_buf[..bytes.min(1024)]);
+
+                            let is_elf = if self.selected_file < self.file_count && !self.files[self.selected_file].is_dir {
+                                let n = self.files[self.selected_file].name_str();
+                                n.ends_with(".ELF") || n.ends_with(".elf")
+                            } else {
+                                false
+                            };
+
+                            let exec_w = 90i32;
+                            let exec_x = preview_box_w.saturating_sub(exec_w + 136) + div_x + 12;
+                            if is_elf && px >= exec_x && px <= exec_x + exec_w && py >= btn_y && py <= btn_y + 18 {
+                                let fname = self.files[self.selected_file].name_str();
+                                let mut cmd = [0u8; 48];
+                                let pre = b"exec ";
+                                cmd[..pre.len()].copy_from_slice(pre);
+                                let flen = fname.len().min(40);
+                                cmd[pre.len()..pre.len() + flen].copy_from_slice(&fname.as_bytes()[..flen]);
+                                if let Ok(cmd_str) = core::str::from_utf8(&cmd[..pre.len() + flen]) {
+                                    self.execute_term_command(cmd_str, fat, dev, scratch_pa, scratch_va);
+                                    self.bring_to_front(WIN_TERMINAL);
+                                    self.windows[WIN_TERMINAL].closed = false;
+                                    self.windows[WIN_TERMINAL].minimized = false;
+                                    self.windows[WIN_TERMINAL].focused = true;
+                                    self.windows[WIN_EXPLORER].focused = false;
+                                }
+                            } else {
+                                let (eff_fat, mut eff_dev) = resolve_ui_fs(fat, dev.as_deref_mut());
+                                if px >= btn_x && px <= btn_x + btn_w && py >= btn_y && py <= btn_y + 18 {
+                                    if self.selected_file < self.file_count && !self.files[self.selected_file].is_dir {
+                                        let entry = self.files[self.selected_file];
+                                        let fname = entry.name_str();
+                                        if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
+                                            let mut scratch_buf = [0u8; 1024];
+                                            if let Ok(bytes) = f.read_file(d, fname, scratch_pa, scratch_va, 1024, scratch_pa, scratch_va) {
+                                                core::ptr::copy_nonoverlapping(scratch_va as *const u8, scratch_buf.as_mut_ptr(), bytes.min(1024));
+                                                self.open_file_in_editor(fname, &scratch_buf[..bytes.min(1024)]);
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            // Click in left file list
-                            let rel_y = py - (win.y + 46);
-                            if rel_y >= 0 && px < div_x {
-                                let clicked_idx = self.file_scroll + (rel_y / 15) as usize;
-                                if clicked_idx < self.file_count {
-                                    self.selected_file = clicked_idx;
-                                    let entry = self.files[clicked_idx];
-                                    if entry.is_dir {
-                                        if entry.name_str() == ".." {
-                                            self.set_current_dir("/");
-                                            if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
-                                                self.refresh_explorer(f, d, scratch_pa, scratch_va);
-                                            }
-                                        } else {
-                                            let name = entry.name_str();
-                                            let mut new_dir = [0u8; 32];
-                                            new_dir[0] = b'/';
-                                            let n_len = name.len().min(30);
-                                            new_dir[1..1 + n_len].copy_from_slice(&name.as_bytes()[..n_len]);
-                                            if let Ok(nd_str) = core::str::from_utf8(&new_dir[..1 + n_len]) {
-                                                self.set_current_dir(nd_str);
+                                // Click in left file list
+                                let rel_y = py - (win.y + 46);
+                                if rel_y >= 0 && px < div_x {
+                                    let clicked_idx = self.file_scroll + (rel_y / 15) as usize;
+                                    if clicked_idx < self.file_count {
+                                        self.selected_file = clicked_idx;
+                                        let entry = self.files[clicked_idx];
+                                        if entry.is_dir {
+                                            if entry.name_str() == ".." {
+                                                self.set_current_dir("/");
                                                 if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
                                                     self.refresh_explorer(f, d, scratch_pa, scratch_va);
                                                 }
+                                            } else {
+                                                let name = entry.name_str();
+                                                let mut new_dir = [0u8; 32];
+                                                new_dir[0] = b'/';
+                                                let n_len = name.len().min(30);
+                                                new_dir[1..1 + n_len].copy_from_slice(&name.as_bytes()[..n_len]);
+                                                if let Ok(nd_str) = core::str::from_utf8(&new_dir[..1 + n_len]) {
+                                                    self.set_current_dir(nd_str);
+                                                    if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
+                                                        self.refresh_explorer(f, d, scratch_pa, scratch_va);
+                                                    }
+                                                }
                                             }
+                                        } else if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
+                                            self.update_file_preview(f, d, scratch_pa, scratch_va);
                                         }
-                                    } else if let (Some(f), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
-                                        self.update_file_preview(f, d, scratch_pa, scratch_va);
                                     }
                                 }
                             }
@@ -1201,7 +1228,8 @@ impl DesktopCompositor {
             "help" => {
                 self.append_term_line("Commands: help, ls, cat, write, exec, route, mount, lsblk,");
                 self.append_term_line("  acpiinfo, lspci, lsusb, nicinfo, info, ramstat, bench,");
-                self.append_term_line("  nvmeinfo, nvmeread, usbstorage, cpuinfo, gpuinfo, clear, halt");
+                self.append_term_line("  nvmeinfo, nvmeread, usbstorage, cpuinfo, gpuinfo, clear,");
+                self.append_term_line("  date, reboot, audioinfo, beep, halt");
             }
             "clear" => {
                 self.term_line_count = 0;
@@ -1825,19 +1853,22 @@ impl DesktopCompositor {
             }
             "exec" | "run" => {
                 if arg.is_empty() {
-                    self.append_term_line("Usage: exec <filename.elf>");
+                    self.append_term_line("Usage: exec <filename.elf> [args...]");
                 } else {
+                    let mut parts = arg.splitn(2, ' ');
+                    let file_name = parts.next().unwrap_or("").trim();
+                    let extra_args = parts.next().unwrap_or("").trim();
                     let (eff_fat, mut eff_dev) = resolve_ui_fs(fat, dev.as_deref_mut());
                     if let (Some(fat_vol), Some(ref mut d)) = (eff_fat, eff_dev.as_mut()) {
                         let mut read_buf = [0u8; 1024];
                         let read_va = read_buf.as_mut_ptr() as u64;
-                        match fat_vol.read_file(d, arg, read_va, read_va, 1024, scratch_pa, scratch_va) {
+                        match fat_vol.read_file(d, file_name, read_va, read_va, 1024, scratch_pa, scratch_va) {
                             Ok(bytes_read) => {
                                 let elf_slice = &read_buf[..bytes_read.min(1024)];
                                 match crate::proc::Elf64Header::parse(elf_slice) {
                                     Ok(_hdr) => {
                                         if let Some(run_fn) = crate::proc::get_global_run_elf() {
-                                            match unsafe { run_fn(elf_slice, 0) } {
+                                            match unsafe { run_fn(elf_slice, extra_args, 0) } {
                                                 Ok(status) => {
                                                     let mut out = [0u8; 64];
                                                     let pre = b"EL0 process exited with status ";
@@ -1921,6 +1952,57 @@ impl DesktopCompositor {
                     self.append_term_line(active);
                 }
             }
+            "date" => {
+                let mut buf = [0u8; 64];
+                let epoch = crate::arch::rtc::current_utc_epoch_secs();
+                let date_str = crate::arch::rtc::format_utc_datetime(epoch, &mut buf);
+                self.append_term_line(date_str);
+            }
+            "reboot" => {
+                self.append_term_line("System rebooting via PSCI...");
+                crate::arch::psci::psci_system_reset();
+            }
+            "audioinfo" => {
+                if let Some(snd) = crate::drivers::virtio_sound::get_global_virtio_sound_ref() {
+                    self.append_term_line("=== VirtIO-Sound PCI Audio Device ===");
+                    if snd.is_active {
+                        self.append_term_line("  Status: ACTIVE");
+                    } else {
+                        self.append_term_line("  Status: INACTIVE");
+                    }
+                    self.append_term_line("  Format: PCM S16_LE (48000 Hz, 2 Ch)");
+                    let mut b = [0u8; 64];
+                    let mut p = 0;
+                    let pre = b"  Beeps Played: ";
+                    b[p..p + pre.len()].copy_from_slice(pre); p += pre.len();
+                    p += write_u64_to_buf(snd.beeps_played, &mut b[p..]);
+                    if let Ok(s) = core::str::from_utf8(&b[..p]) {
+                        self.append_term_line(s);
+                    }
+                } else {
+                    self.append_term_line("No VirtIO-Sound device detected");
+                }
+            }
+            "beep" => {
+                let mut freq = 0u32;
+                for &b in arg.as_bytes() {
+                    if b >= b'0' && b <= b'9' {
+                        freq = freq * 10 + (b - b'0') as u32;
+                    }
+                }
+                if freq == 0 {
+                    freq = 440;
+                }
+                if let Some(snd) = crate::drivers::virtio_sound::get_global_virtio_sound_mut() {
+                    self.append_term_line("Playing synthesized audio tone...");
+                    match unsafe { snd.play_beep(freq, 200) } {
+                        Ok(()) => self.append_term_line("Audio playback complete"),
+                        Err(e) => self.append_term_line(e),
+                    }
+                } else {
+                    self.append_term_line("No VirtIO-Sound device detected");
+                }
+            }
             "halt" | "poweroff" => {
                 self.append_term_line("Powering off system...");
                 crate::arch::psci_system_off();
@@ -1990,7 +2072,11 @@ impl DesktopCompositor {
         self.draw_rect_outline(364, 3, 46, 21, col_border);
         self.draw_string(378, 9, "AI", if ai_open { col_cyan } else { col_muted }, None);
 
-        // Right Taskbar Stats (Uptime, SMP, RAM)
+        // Right Taskbar Stats (Time, Uptime, SMP, RAM)
+        let mut time_buf = [0u8; 16];
+        let epoch = crate::arch::rtc::current_utc_epoch_secs();
+        let time_txt = crate::arch::rtc::format_time_hhmmss(epoch, &mut time_buf);
+
         let mut up_buf = [0u8; 16];
         let uptime_sec = get_uptime_seconds();
         let up_txt = format_uptime(uptime_sec, &mut up_buf);
@@ -2001,17 +2087,20 @@ impl DesktopCompositor {
         let mut ram_buf = [0u8; 32];
         let ram_txt = format_ram(self.free_ram_mib, self.total_ram_mib, &mut ram_buf);
 
+        let time_w = (time_txt.len() as u32) * 8;
         let ram_w = (ram_txt.len() as u32) * 8;
         let smp_w = (smp_txt.len() as u32) * 8;
         let up_w = (up_txt.len() as u32) * 8;
 
-        let ram_x = self.width.saturating_sub(ram_w + 12);
+        let time_x = self.width.saturating_sub(time_w + 12);
+        let ram_x = time_x.saturating_sub(ram_w + 16);
         let smp_x = ram_x.saturating_sub(smp_w + 16);
         let up_x = smp_x.saturating_sub(up_w + 16);
 
         self.draw_string(up_x, 10, up_txt, col_muted, None);
         self.draw_string(smp_x, 10, smp_txt, col_green, None);
         self.draw_string(ram_x, 10, ram_txt, col_yellow, None);
+        self.draw_string(time_x, 10, time_txt, col_cyan, None);
 
         // 3. Bottom Status Bar (height - 24 .. height)
         let bot_y = self.height.saturating_sub(24);
@@ -2217,12 +2306,33 @@ impl DesktopCompositor {
                     self.draw_rect_outline(px, cy + 18, preview_box_w, preview_box_h, col_border);
 
                     if file_count > 0 && selected < file_count && !files[selected].is_dir {
-                        let btn_w = 120u32;
-                        let btn_h = 16u32;
-                        let btn_x = preview_box_w.saturating_sub(btn_w + 8) + px;
-                        self.draw_rect(btn_x, cy + 2, btn_w, btn_h, self.rgb(37, 99, 235));
-                        self.draw_rect_outline(btn_x, cy + 2, btn_w, btn_h, col_border);
-                        self.draw_string(btn_x + 6, cy + 6, "[OPEN IN EDITOR]", col_white, None);
+                        let is_elf = {
+                            let n = files[selected].name_str();
+                            n.ends_with(".ELF") || n.ends_with(".elf")
+                        };
+
+                        if is_elf && preview_box_w > 240 {
+                            let exec_w = 90u32;
+                            let exec_h = 16u32;
+                            let exec_x = preview_box_w.saturating_sub(exec_w + 136) + px;
+                            self.draw_rect(exec_x, cy + 2, exec_w, exec_h, self.rgb(16, 149, 74));
+                            self.draw_rect_outline(exec_x, cy + 2, exec_w, exec_h, col_border);
+                            self.draw_string(exec_x + 8, cy + 6, "[RUN / EXEC]", col_white, None);
+
+                            let btn_w = 120u32;
+                            let btn_h = 16u32;
+                            let btn_x = preview_box_w.saturating_sub(btn_w + 8) + px;
+                            self.draw_rect(btn_x, cy + 2, btn_w, btn_h, self.rgb(37, 99, 235));
+                            self.draw_rect_outline(btn_x, cy + 2, btn_w, btn_h, col_border);
+                            self.draw_string(btn_x + 6, cy + 6, "[OPEN IN EDITOR]", col_white, None);
+                        } else {
+                            let btn_w = 120u32;
+                            let btn_h = 16u32;
+                            let btn_x = preview_box_w.saturating_sub(btn_w + 8) + px;
+                            self.draw_rect(btn_x, cy + 2, btn_w, btn_h, self.rgb(37, 99, 235));
+                            self.draw_rect_outline(btn_x, cy + 2, btn_w, btn_h, col_border);
+                            self.draw_string(btn_x + 6, cy + 6, "[OPEN IN EDITOR]", col_white, None);
+                        }
                     }
 
                     if file_count > 0 && selected < file_count {
@@ -2748,6 +2858,9 @@ mod tests {
             comp.execute_term_command("lsblk", None, None, 0, 0);
             comp.execute_term_command("mount", None, None, 0, 0);
             comp.execute_term_command("mount invalid_dev", None, None, 0, 0);
+            comp.execute_term_command("date", None, None, 0, 0);
+            comp.execute_term_command("audioinfo", None, None, 0, 0);
+            comp.execute_term_command("beep 440", None, None, 0, 0);
 
             comp.execute_term_command("clear", None, None, 0, 0);
             assert_eq!(comp.term_line_count, 0);

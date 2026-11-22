@@ -4,12 +4,12 @@ pub mod elf;
 pub mod ipc;
 
 pub use elf::{
-    destroy_user_page_table, destroy_user_process, invalidate_asid, load_elf64, Elf64Header,
-    Elf64Phdr, ElfProcess, USER_STACK_BASE, USER_STACK_PAGES, USER_STACK_TOP,
+    destroy_user_page_table, destroy_user_process, invalidate_asid, load_elf64, setup_user_stack_args,
+    Elf64Header, Elf64Phdr, ElfProcess, USER_STACK_BASE, USER_STACK_PAGES, USER_STACK_TOP,
 };
 pub use ipc::{IpcMailbox, IPC_MAILBOX, SYS_IPC_RECV, SYS_IPC_SEND};
 
-pub type RunElfFn = unsafe fn(&[u8], usize) -> Result<i32, &'static str>;
+pub type RunElfFn = unsafe fn(&[u8], &str, usize) -> Result<i32, &'static str>;
 pub static mut GLOBAL_RUN_ELF_FN: Option<RunElfFn> = None;
 
 pub fn register_global_run_elf(f: RunElfFn) {
@@ -31,7 +31,7 @@ core::arch::global_asm!(
     .global stage9_user_return
 
 stage9_enter_user:
-    // x0 = entry_va, x1 = user_sp, x2 = ttbr0_root
+    // x0 = entry_va, x1 = user_sp, x2 = ttbr0_root, x3 = argc, x4 = argv_va
     // Save EL1 callee-saved registers x19..x30 on SP_EL1 (96 bytes)
     stp     x19, x20, [sp, #-16]!
     stp     x21, x22, [sp, #-16]!
@@ -45,9 +45,9 @@ stage9_enter_user:
     isb
 
     // Clear TCR_EL1.EPD0 (bit 7) to enable translation walks in TTBR0_EL1
-    mrs     x3, tcr_el1
-    bic     x3, x3, #(1 << 7)
-    msr     tcr_el1, x3
+    mrs     x5, tcr_el1
+    bic     x5, x5, #(1 << 7)
+    msr     tcr_el1, x5
     isb
     tlbi    vmalle1is
     dsb     ish
@@ -58,9 +58,9 @@ stage9_enter_user:
     msr     elr_el1, x0
     msr     spsr_el1, xzr       // EL0t mode, interrupts unmasked
 
-    // Zero user registers for clean entry
-    mov     x0, #0
-    mov     x1, #0
+    // Pass argc in x0, argv in x1
+    mov     x0, x3
+    mov     x1, x4
     mov     x2, #0
     mov     x3, #0
     mov     x4, #0
@@ -118,7 +118,7 @@ stage9_user_return:
 
 #[cfg(target_os = "uefi")]
 extern "C" {
-    pub fn stage9_enter_user(entry_va: u64, user_sp: u64, ttbr0_root: u64) -> i32;
+    pub fn stage9_enter_user(entry_va: u64, user_sp: u64, ttbr0_root: u64, argc: u64, argv_va: u64) -> i32;
     pub static stage9_user_return: [u8; 0];
 }
 
@@ -141,13 +141,23 @@ pub fn stage9_user_return_va() -> u64 {
 }
 
 pub unsafe fn run_user_process(entry_va: u64, user_sp: u64, ttbr0_root: u64) -> i32 {
+    run_user_process_with_args(entry_va, user_sp, ttbr0_root, 0, 0)
+}
+
+pub unsafe fn run_user_process_with_args(
+    entry_va: u64,
+    user_sp: u64,
+    ttbr0_root: u64,
+    argc: u64,
+    argv_va: u64,
+) -> i32 {
     #[cfg(target_os = "uefi")]
     {
-        stage9_enter_user(entry_va, user_sp, ttbr0_root)
+        stage9_enter_user(entry_va, user_sp, ttbr0_root, argc, argv_va)
     }
     #[cfg(not(target_os = "uefi"))]
     {
-        let _ = (entry_va, user_sp, ttbr0_root);
+        let _ = (entry_va, user_sp, ttbr0_root, argc, argv_va);
         0
     }
 }
