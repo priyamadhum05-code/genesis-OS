@@ -60,6 +60,56 @@ impl Tokenizer {
         })
     }
 
+    pub fn default_fallback(vocab_size: usize) -> Self {
+        let mut vocab = Vec::with_capacity(vocab_size);
+        let mut scores = Vec::with_capacity(vocab_size);
+        vocab.push(String::from("<unk>"));
+        scores.push(0.0);
+        vocab.push(String::from("<s>"));
+        scores.push(0.0);
+        vocab.push(String::from("</s>"));
+        scores.push(0.0);
+
+        for i in 3..vocab_size {
+            if i < 256 + 3 {
+                let b = (i - 3) as u8;
+                if b.is_ascii_graphic() || b == b' ' {
+                    vocab.push(String::from(b as char));
+                } else {
+                    vocab.push(format_byte_hex(b));
+                }
+            } else {
+                let mut s = String::with_capacity(8);
+                s.push_str("t_");
+                let mut buf = [0u8; 16];
+                let mut val = i;
+                let mut p = 0;
+                if val == 0 { buf[0] = b'0'; p = 1; }
+                else {
+                    while val > 0 {
+                        buf[p] = b'0' + (val % 10) as u8;
+                        val /= 10;
+                        p += 1;
+                    }
+                    buf[..p].reverse();
+                }
+                if let Ok(st) = core::str::from_utf8(&buf[..p]) {
+                    s.push_str(st);
+                }
+                vocab.push(s);
+            }
+            scores.push(0.0);
+        }
+
+        Self {
+            max_token_length: 8,
+            vocab,
+            scores,
+            bos_id: 1,
+            eos_id: 2,
+        }
+    }
+
     /// Finds the vocabulary token ID matching `piece`.
     pub fn find_token(&self, piece: &str) -> Option<usize> {
         for (i, v) in self.vocab.iter().enumerate() {
@@ -155,6 +205,21 @@ impl Tokenizer {
     }
 }
 
+pub static mut GLOBAL_TOKENIZER: Option<Tokenizer> = None;
+
+pub fn set_global_tokenizer(tok: Tokenizer) {
+    unsafe {
+        GLOBAL_TOKENIZER = Some(tok);
+    }
+}
+
+#[allow(static_mut_refs)]
+pub fn get_global_tokenizer() -> Option<&'static Tokenizer> {
+    unsafe {
+        GLOBAL_TOKENIZER.as_ref()
+    }
+}
+
 fn format_byte_hex(b: u8) -> String {
     let mut s = String::with_capacity(6);
     s.push_str("<0x");
@@ -244,5 +309,17 @@ mod tests {
         let mut scratch = [0u8; 8];
         let out_of_bounds = tok.decode(0, 999, &mut scratch);
         assert_eq!(out_of_bounds, b"");
+    }
+
+    #[test]
+    fn tokenizer_default_fallback_test() {
+        let tok = Tokenizer::default_fallback(64);
+        assert_eq!(tok.vocab.len(), 64);
+        assert_eq!(tok.bos_id, 1);
+        assert_eq!(tok.vocab[1], "<s>");
+        assert_eq!(tok.vocab[2], "</s>");
+        let enc = tok.encode("a b", true);
+        assert!(!enc.is_empty());
+        assert_eq!(enc[0], 1); // BOS
     }
 }

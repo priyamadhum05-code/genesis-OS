@@ -990,6 +990,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         asm!("mrs {0}, TTBR1_EL1", out(reg) ttbr1_root, options(nomem, nostack, preserves_flags));
         let pmm_va = ensure_higher_half(ptr::addr_of_mut!(KERNEL_PMM) as usize as u64);
         let pmm = &mut *(pmm_va as *mut PhysicalPageAllocator<KERNEL_PMM_WORDS>);
+        pmm::register_contig_alloc(kernel_alloc_contig_pages);
 
         // Initialize DynamicMapper backed by KERNEL_PMM and HHDM
         let max_pa = 1u64 << 40; // 40-bit PA supported
@@ -2627,6 +2628,12 @@ unsafe fn kernel_http_get(
     net::http_get(net, host_or_ip, port, path, uart)
 }
 
+unsafe fn kernel_alloc_contig_pages(count: usize) -> Option<u64> {
+    let pmm_va = ensure_higher_half(core::ptr::addr_of_mut!(KERNEL_PMM) as usize as u64);
+    let pmm = &mut *(pmm_va as *mut PhysicalPageAllocator<KERNEL_PMM_WORDS>);
+    pmm.allocate_contiguous_pages(count)
+}
+
 unsafe fn kernel_run_llama(
     model_data: &[u8],
     tokenizer_data: Option<&[u8]>,
@@ -2674,6 +2681,12 @@ unsafe fn kernel_run_llama(
     } else {
         None
     };
+
+    if let Some(ref tok) = tokenizer {
+        genesis_stage1::ai::tokenizer::set_global_tokenizer(tok.clone());
+    } else {
+        genesis_stage1::ai::tokenizer::set_global_tokenizer(genesis_stage1::ai::tokenizer::Tokenizer::default_fallback(cfg.vocab_size));
+    }
 
     serial_write(uart, b"Prompt: \"");
     serial_write(uart, prompt_str.as_bytes());

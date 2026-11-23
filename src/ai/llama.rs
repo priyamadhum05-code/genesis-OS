@@ -315,6 +315,10 @@ impl LlamaWeights {
         }
     }
 
+    pub fn is_initialized(&self) -> bool {
+        !self.token_embedding.is_null() && self.total_floats > 0
+    }
+
     pub fn total_floats_for(cfg: &LlamaConfig) -> usize {
         let dim = cfg.dim;
         let hidden = cfg.hidden_dim;
@@ -483,6 +487,10 @@ impl SmpLlamaContext {
         core::ptr::write_bytes(base_ptr as *mut u8, 0, self.total_floats * 4);
     }
 
+    pub fn is_initialized(&self) -> bool {
+        !self.logits.is_null() && self.total_floats > 0
+    }
+
     pub unsafe fn logits_slice(&self) -> &[f32] {
         if self.logits.is_null() {
             &[]
@@ -494,6 +502,80 @@ impl SmpLlamaContext {
 
 pub static mut SMP_LLAMA_CTX: SmpLlamaContext = SmpLlamaContext::empty();
 pub static mut SMP_LLAMA_WEIGHTS: LlamaWeights = LlamaWeights::empty();
+
+/// Ensures that the global hugepage Llama weights, context, and tokenizer are initialized.
+/// If not already loaded from an external file, allocates a compact fallback model.
+pub unsafe fn ensure_global_llama_fallback() {
+    let weights = &mut *core::ptr::addr_of_mut!(SMP_LLAMA_WEIGHTS);
+    let ctx = &mut *core::ptr::addr_of_mut!(SMP_LLAMA_CTX);
+    if weights.is_initialized() && ctx.is_initialized() {
+        return;
+    }
+
+    let cfg = LlamaConfig {
+        dim: LLAMA_DIM,
+        hidden_dim: LLAMA_HIDDEN_DIM,
+        n_layers: LLAMA_LAYERS,
+        n_heads: LLAMA_HEADS,
+        n_kv_heads: LLAMA_KV_HEADS,
+        vocab_size: LLAMA_VOCAB,
+        seq_len: LLAMA_SEQ_LEN,
+        shared_weights: true,
+    };
+
+    let req_weight_floats = LlamaWeights::total_floats_for(&cfg);
+    let req_ctx_floats = SmpLlamaContext::total_floats_for(&cfg);
+
+    #[cfg(target_os = "uefi")]
+    {
+        use crate::vmm::HHDM_BASE;
+
+        if !weights.is_initialized() {
+            let weight_pages = (req_weight_floats * 4 + 4095) / 4096;
+            if let Some(pa) = crate::pmm::allocate_contiguous_pages(weight_pages) {
+                let va = HHDM_BASE + pa;
+                let slice = core::slice::from_raw_parts_mut(va as *mut f32, req_weight_floats);
+                for (i, v) in slice.iter_mut().enumerate() {
+                    *v = (((i % 17) as f32) - 8.0) * 0.01;
+                }
+                weights.init_from_buffer(cfg, va as *mut f32);
+                weights.paddr = pa;
+                weights.page_count = weight_pages;
+            }
+        }
+
+        if !ctx.is_initialized() {
+            let ctx_pages = (req_ctx_floats * 4 + 4095) / 4096;
+            if let Some(pa) = crate::pmm::allocate_contiguous_pages(ctx_pages) {
+                let va = HHDM_BASE + pa;
+                ctx.init_from_buffer(cfg, va as *mut f32);
+                ctx.paddr = pa;
+                ctx.page_count = ctx_pages;
+            }
+        }
+    }
+    #[cfg(not(target_os = "uefi"))]
+    {
+        static mut FALLBACK_WBUF: [f32; 65536] = [0.01; 65536];
+        static mut FALLBACK_CBUF: [f32; 32768] = [0.0; 32768];
+        if !weights.is_initialized() && req_weight_floats <= 65536 {
+            weights.init_from_buffer(cfg, core::ptr::addr_of_mut!(FALLBACK_WBUF) as *mut f32);
+            weights.page_count = 16;
+        }
+        if !ctx.is_initialized() && req_ctx_floats <= 32768 {
+            ctx.init_from_buffer(cfg, core::ptr::addr_of_mut!(FALLBACK_CBUF) as *mut f32);
+            ctx.page_count = 8;
+        }
+    }
+
+    if ctx.is_initialized() {
+        ctx.weights_ptr = weights as *const LlamaWeights;
+    }
+
+    if crate::ai::tokenizer::get_global_tokenizer().is_none() {
+        crate::ai::tokenizer::set_global_tokenizer(crate::ai::tokenizer::Tokenizer::default_fallback(cfg.vocab_size));
+    }
+}
 
 /// 4-core worker: Computes attention heads partitioned dynamically across cores (`cpu_id * heads_per_core`).
 pub extern "C" fn smp_llama_attn_worker(cpu_id: u64, ctx_ptr: u64) {

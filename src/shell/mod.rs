@@ -100,6 +100,10 @@ impl<'a> Shell<'a> {
                 serial_write(self.uart_va, b"  ls [path]         - List directory contents on FAT32 volume\r\n");
                 serial_write(self.uart_va, b"  cat <file>        - Print text contents of a file\r\n");
                 serial_write(self.uart_va, b"  write <file> <text> - Write text contents to a file\r\n");
+                serial_write(self.uart_va, b"  mkdir <dir>       - Create a new directory on FAT32 volume\r\n");
+                serial_write(self.uart_va, b"  rm <file|dir>     - Delete a file or empty directory\r\n");
+                serial_write(self.uart_va, b"  cp <src> <dst>    - Copy a file\r\n");
+                serial_write(self.uart_va, b"  mv <src> <dst>    - Move or rename a file\r\n");
                 serial_write(self.uart_va, b"  hexdump <file>    - Display hexadecimal dump of a file\r\n");
                 serial_write(self.uart_va, b"  desktop           - Launch double-buffered graphical desktop\r\n");
                 serial_write(self.uart_va, b"  lspci             - List all discovered PCIe devices\r\n");
@@ -389,6 +393,112 @@ impl<'a> Shell<'a> {
                             serial_write(self.uart_va, b"Error writing file '");
                             serial_write(self.uart_va, arg.as_bytes());
                             serial_write(self.uart_va, b"': ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                }
+            }
+            "mkdir" => {
+                let (fat, dev) = resolve_fs(self.fat, self.dev.as_deref_mut());
+                if arg.is_empty() {
+                    serial_write(self.uart_va, b"Usage: mkdir <dir>\r\n");
+                } else if let (Some(fat), Some(ref mut dev)) = (fat, dev) {
+                    let res = unsafe { fat.mkdir(dev, arg, self.scratch_pa, self.scratch_va) };
+                    match res {
+                        Ok(()) => {
+                            serial_write(self.uart_va, b"Created directory '");
+                            serial_write(self.uart_va, arg.as_bytes());
+                            serial_write(self.uart_va, b"'\r\n");
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error creating directory '");
+                            serial_write(self.uart_va, arg.as_bytes());
+                            serial_write(self.uart_va, b"': ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                }
+            }
+            "rm" => {
+                let (fat, dev) = resolve_fs(self.fat, self.dev.as_deref_mut());
+                if arg.is_empty() {
+                    serial_write(self.uart_va, b"Usage: rm <file|dir>\r\n");
+                } else if let (Some(fat), Some(ref mut dev)) = (fat, dev) {
+                    let res = unsafe { fat.remove(dev, arg, self.scratch_pa, self.scratch_va) };
+                    match res {
+                        Ok(()) => {
+                            serial_write(self.uart_va, b"Removed '");
+                            serial_write(self.uart_va, arg.as_bytes());
+                            serial_write(self.uart_va, b"'\r\n");
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error removing '");
+                            serial_write(self.uart_va, arg.as_bytes());
+                            serial_write(self.uart_va, b"': ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                }
+            }
+            "cp" => {
+                let (fat, dev) = resolve_fs(self.fat, self.dev.as_deref_mut());
+                let rem = trimmed.strip_prefix(cmd).unwrap_or("").trim_start();
+                let mut parts = rem.split_whitespace();
+                let src = parts.next().unwrap_or("");
+                let dst = parts.next().unwrap_or("");
+                if src.is_empty() || dst.is_empty() {
+                    serial_write(self.uart_va, b"Usage: cp <src> <dst>\r\n");
+                } else if let (Some(fat), Some(ref mut dev)) = (fat, dev) {
+                    let res = unsafe { fat.copy_file(dev, src, dst, self.file_buf_pa, self.file_buf_va, self.file_buf_cap, self.scratch_pa, self.scratch_va) };
+                    match res {
+                        Ok(bytes) => {
+                            serial_write(self.uart_va, b"Copied ");
+                            serial_decimal(self.uart_va, bytes as u64);
+                            serial_write(self.uart_va, b" bytes from '");
+                            serial_write(self.uart_va, src.as_bytes());
+                            serial_write(self.uart_va, b"' to '");
+                            serial_write(self.uart_va, dst.as_bytes());
+                            serial_write(self.uart_va, b"'\r\n");
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error copying: ");
+                            serial_write(self.uart_va, e.as_bytes());
+                            serial_write(self.uart_va, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(self.uart_va, b"FAT32 filesystem not mounted\r\n");
+                }
+            }
+            "mv" => {
+                let (fat, dev) = resolve_fs(self.fat, self.dev.as_deref_mut());
+                let rem = trimmed.strip_prefix(cmd).unwrap_or("").trim_start();
+                let mut parts = rem.split_whitespace();
+                let src = parts.next().unwrap_or("");
+                let dst = parts.next().unwrap_or("");
+                if src.is_empty() || dst.is_empty() {
+                    serial_write(self.uart_va, b"Usage: mv <src> <dst>\r\n");
+                } else if let (Some(fat), Some(ref mut dev)) = (fat, dev) {
+                    let res = unsafe { fat.move_file(dev, src, dst, self.file_buf_pa, self.file_buf_va, self.file_buf_cap, self.scratch_pa, self.scratch_va) };
+                    match res {
+                        Ok(()) => {
+                            serial_write(self.uart_va, b"Moved '");
+                            serial_write(self.uart_va, src.as_bytes());
+                            serial_write(self.uart_va, b"' to '");
+                            serial_write(self.uart_va, dst.as_bytes());
+                            serial_write(self.uart_va, b"'\r\n");
+                        }
+                        Err(e) => {
+                            serial_write(self.uart_va, b"Error moving: ");
                             serial_write(self.uart_va, e.as_bytes());
                             serial_write(self.uart_va, b"\r\n");
                         }

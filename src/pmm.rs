@@ -20,6 +20,23 @@ use crate::memory_map::{self, MapError, EFI_CONVENTIONAL_MEMORY, EFI_PAGE_SIZE};
 pub const KERNEL_PMM_WORDS: usize = 4096;
 pub const KERNEL_PMM_MAX_PAGES: usize = KERNEL_PMM_WORDS * 64;
 
+pub type ContigAllocFn = unsafe fn(usize) -> Option<u64>;
+static mut GLOBAL_CONTIG_ALLOC: Option<ContigAllocFn> = None;
+
+pub fn register_contig_alloc(f: ContigAllocFn) {
+    unsafe {
+        *core::ptr::addr_of_mut!(GLOBAL_CONTIG_ALLOC) = Some(f);
+    }
+}
+
+pub unsafe fn allocate_contiguous_pages(count: usize) -> Option<u64> {
+    if let Some(alloc_fn) = *core::ptr::addr_of!(GLOBAL_CONTIG_ALLOC) {
+        alloc_fn(count)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReservedRange {
     pub start: u64,

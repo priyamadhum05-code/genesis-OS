@@ -63,6 +63,45 @@ pub fn validate_user_buffer(buf: u64, count: usize) -> bool {
         && buf.checked_add(count as u64).map_or(false, |end| end <= 0x0000_8000_0000_0000)
 }
 
+pub const EL0_STDOUT_BUF_SIZE: usize = 4096;
+pub static mut EL0_STDOUT_BUF: [u8; EL0_STDOUT_BUF_SIZE] = [0u8; EL0_STDOUT_BUF_SIZE];
+pub static mut EL0_STDOUT_LEN: usize = 0;
+pub static mut EL0_CAPTURE_ACTIVE: bool = false;
+
+pub fn start_el0_stdout_capture() {
+    unsafe {
+        EL0_STDOUT_LEN = 0;
+        EL0_CAPTURE_ACTIVE = true;
+    }
+}
+
+pub fn stop_el0_stdout_capture() -> usize {
+    unsafe {
+        EL0_CAPTURE_ACTIVE = false;
+        EL0_STDOUT_LEN
+    }
+}
+
+pub fn get_el0_stdout_slice() -> &'static [u8] {
+    unsafe {
+        &EL0_STDOUT_BUF[..EL0_STDOUT_LEN]
+    }
+}
+
+pub fn append_to_el0_stdout(data: &[u8]) {
+    unsafe {
+        if EL0_CAPTURE_ACTIVE {
+            let space = EL0_STDOUT_BUF_SIZE.saturating_sub(EL0_STDOUT_LEN);
+            let to_copy = data.len().min(space);
+            if to_copy > 0 {
+                EL0_STDOUT_BUF[EL0_STDOUT_LEN..EL0_STDOUT_LEN + to_copy]
+                    .copy_from_slice(&data[..to_copy]);
+                EL0_STDOUT_LEN += to_copy;
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) -> *mut TrapFrame {
     let uart = STAGE4_UART_VA.load(Ordering::Relaxed) as usize;
@@ -169,12 +208,13 @@ pub extern "C" fn stage4_exception_dispatch(frame: &mut TrapFrame, kind: u64) ->
                     };
 
                     if validate_user_buffer(buf, count) {
+                        let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
                         if uart != 0 {
-                            let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
                             unsafe {
                                 crate::arch::serial::serial_write(uart, slice);
                             }
                         }
+                        append_to_el0_stdout(slice);
                         frame.x[0] = count as u64;
                     } else {
                         frame.x[0] = (-14i64) as u64; // -EFAULT
@@ -540,5 +580,22 @@ mod tests {
         // Integer overflow
         assert!(!validate_user_buffer(0x0000_7FFF_0000_0000, usize::MAX));
         assert!(!validate_user_buffer(u64::MAX - 10, 20));
+    }
+
+    #[test]
+    fn test_el0_stdout_capture_ring() {
+        start_el0_stdout_capture();
+        assert_eq!(get_el0_stdout_slice().len(), 0);
+
+        append_to_el0_stdout(b"Hello ");
+        append_to_el0_stdout(b"from EL0!\n");
+        assert_eq!(get_el0_stdout_slice(), b"Hello from EL0!\n");
+
+        let len = stop_el0_stdout_capture();
+        assert_eq!(len, 16);
+
+        // Appending while inactive should have no effect
+        append_to_el0_stdout(b"ignored");
+        assert_eq!(get_el0_stdout_slice().len(), 16);
     }
 }
