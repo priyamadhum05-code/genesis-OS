@@ -332,7 +332,10 @@ pub extern "efiapi" fn efi_main(image: usize, system_table: *mut SystemTable) ->
                             let info = &*info_ptr;
                             if info.pixel_format == 0 || info.pixel_format == 1 {
                                 let (w, h) = (info.horizontal_resolution, info.vertical_resolution);
-                                let score = if w == 1280 && h == 800 { 30 }
+                                let score = if w == 1920 && h == 1080 { 60 }
+                                            else if w == 1680 && h == 1050 { 50 }
+                                            else if w == 1440 && h == 900 { 40 }
+                                            else if w == 1280 && h == 800 { 30 }
                                             else if w == 1024 && h == 768 { 20 }
                                             else if (w == 1280 && h == 720) || (w == 1280 && h == 1024) { 15 }
                                             else if w == 800 && h == 600 { 10 }

@@ -3120,17 +3120,17 @@ pub unsafe fn run_desktop_gui(
         let mut need_render = false;
 
         let (new_ptr, ptr_changed) = poll_global_pointer(fb.width, fb.height);
-        if ptr_changed || new_ptr.x != pointer.x || new_ptr.y != pointer.y || new_ptr.left_button != pointer.left_button {
+        if ptr_changed || new_ptr.x != pointer.x || new_ptr.y != pointer.y || new_ptr.left_button != pointer.left_button || new_ptr.scroll_delta != 0 {
             pointer = new_ptr;
-            if comp.handle_pointer_ctx(&pointer, fat, dev.as_deref_mut(), scratch_pa, scratch_va) {
+            if comp.handle_pointer_ctx(&pointer, fat, dev.as_deref_mut(), scratch_pa, scratch_va) || pointer.scroll_delta != 0 {
                 need_render = true;
             }
         }
 
         let (usb_ptr, usb_changed) = crate::drivers::usb_hid::poll_usb_mouse(fb.width, fb.height);
-        if usb_changed {
+        if usb_changed || usb_ptr.scroll_delta != 0 {
             pointer = usb_ptr;
-            if comp.handle_pointer_ctx(&pointer, fat, dev.as_deref_mut(), scratch_pa, scratch_va) {
+            if comp.handle_pointer_ctx(&pointer, fat, dev.as_deref_mut(), scratch_pa, scratch_va) || pointer.scroll_delta != 0 {
                 need_render = true;
             }
         }
@@ -3169,6 +3169,12 @@ pub unsafe fn run_desktop_gui(
             comp.mark_dirty(prev_pointer.x - 2, prev_pointer.y - 2, 24, 24);
             comp.mark_dirty(pointer.x - 2, pointer.y - 2, 24, 24);
             prev_pointer = pointer;
+            need_render = true;
+            if let Some(gpu_ptr) = crate::drivers::virtio_gpu::get_global_virtio_gpu() {
+                if (*gpu_ptr).has_hw_cursor {
+                    let _ = (*gpu_ptr).move_hw_cursor(pointer.x.max(0) as u32, pointer.y.max(0) as u32);
+                }
+            }
         }
 
         if need_render || (comp.frame_count % 30 == 0) {

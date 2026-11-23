@@ -135,14 +135,42 @@ impl E1000eDevice {
 
     #[inline]
     pub unsafe fn read_reg(&self, offset: u32) -> u32 {
-        let ptr = (self.mmio_va + offset as u64) as *const u32;
-        core::ptr::read_volatile(ptr)
+        #[cfg(target_arch = "aarch64")]
+        {
+            let addr = self.mmio_va + offset as u64;
+            let val: u32;
+            core::arch::asm!(
+                "ldr {val:w}, [{addr}]",
+                val = out(reg) val,
+                addr = in(reg) addr,
+                options(nostack, preserves_flags),
+            );
+            val
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let ptr = (self.mmio_va + offset as u64) as *const u32;
+            core::ptr::read_volatile(ptr)
+        }
     }
 
     #[inline]
     pub unsafe fn write_reg(&self, offset: u32, val: u32) {
-        let ptr = (self.mmio_va + offset as u64) as *mut u32;
-        core::ptr::write_volatile(ptr, val);
+        #[cfg(target_arch = "aarch64")]
+        {
+            let addr = self.mmio_va + offset as u64;
+            core::arch::asm!(
+                "str {val:w}, [{addr}]",
+                val = in(reg) val,
+                addr = in(reg) addr,
+                options(nostack, preserves_flags),
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let ptr = (self.mmio_va + offset as u64) as *mut u32;
+            core::ptr::write_volatile(ptr, val);
+        }
     }
 
     /// Checks if physical link is established.

@@ -23,6 +23,13 @@ if [ "${GENESIS_HVF:-0}" = "1" ]; then
 else
   ACCEL_OPTS="-machine virt-11.1,gic-version=3 -cpu cortex-a76"
 fi
+
+if [ "$(uname)" = "Darwin" ]; then
+  DISPLAY_OPTS="-display cocoa,zoom-to-fit=on"
+else
+  DISPLAY_OPTS="-display default"
+fi
+
 exec "$QEMU" $ACCEL_OPTS -smp "${QEMU_SMP:-4}" -m 512M \
   -drive if=pflash,format=raw,unit=0,readonly=on,file="$FW/edk2-aarch64-code.fd" \
   -drive if=pflash,format=raw,unit=1,file=build/edk2-vars.fd \
@@ -32,8 +39,8 @@ exec "$QEMU" $ACCEL_OPTS -smp "${QEMU_SMP:-4}" -m 512M \
   -netdev user,id=net1 -device e1000e,netdev=net1 \
   -device virtio-keyboard-device \
   -device virtio-tablet-device \
+  -device virtio-gpu-pci,xres=1440,yres=900 \
   -device ramfb \
-  -device virtio-gpu-pci \
   -device qemu-xhci,id=xhci \
   -device ich9-ahci,id=ahci0 \
   -device usb-kbd \
@@ -41,4 +48,4 @@ exec "$QEMU" $ACCEL_OPTS -smp "${QEMU_SMP:-4}" -m 512M \
   -audiodev none,id=snd0 -device virtio-sound-pci,audiodev=snd0 \
   -serial stdio \
   -monitor unix:build/qemu-monitor.sock,server=on,wait=off \
-  -display default -no-reboot "$@"
+  $DISPLAY_OPTS -no-reboot "$@"
