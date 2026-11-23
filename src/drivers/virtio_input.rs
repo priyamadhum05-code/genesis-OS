@@ -29,6 +29,7 @@ pub const ABS_X: u16 = 0x00;
 pub const ABS_Y: u16 = 0x01;
 pub const REL_X: u16 = 0x00;
 pub const REL_Y: u16 = 0x01;
+pub const REL_WHEEL: u16 = 0x08;
 
 // Mouse/tablet buttons
 pub const BTN_LEFT: u16 = 0x110;
@@ -109,6 +110,19 @@ pub struct PointerState {
     pub y: i32,
     pub left_button: bool,
     pub right_button: bool,
+    pub scroll_delta: i32,
+}
+
+impl PointerState {
+    pub const fn new(x: i32, y: i32, left_button: bool, right_button: bool) -> Self {
+        Self {
+            x,
+            y,
+            left_button,
+            right_button,
+            scroll_delta: 0,
+        }
+    }
 }
 
 impl Default for PointerState {
@@ -118,6 +132,7 @@ impl Default for PointerState {
             y: 0,
             left_button: false,
             right_button: false,
+            scroll_delta: 0,
         }
     }
 }
@@ -167,6 +182,12 @@ impl PointerState {
                 let new_y = update_rel_coordinate(self.y, ev.value as i32, max_h);
                 if self.y != new_y {
                     self.y = new_y;
+                    return true;
+                }
+            } else if ev.code == REL_WHEEL {
+                let delta = ev.value as i32;
+                if delta != 0 {
+                    self.scroll_delta += delta;
                     return true;
                 }
             }
@@ -517,7 +538,7 @@ pub static mut GLOBAL_VIRTIO_INPUT: Option<*mut VirtIOInputDevice> = None;
 pub const MAX_INPUT_DEVICES: usize = 4;
 pub static mut GLOBAL_INPUT_DEVICES: [*mut VirtIOInputDevice; MAX_INPUT_DEVICES] = [core::ptr::null_mut(); MAX_INPUT_DEVICES];
 pub static mut GLOBAL_INPUT_COUNT: usize = 0;
-pub static mut GLOBAL_POINTER_STATE: PointerState = PointerState { x: 400, y: 300, left_button: false, right_button: false };
+pub static mut GLOBAL_POINTER_STATE: PointerState = PointerState { x: 400, y: 300, left_button: false, right_button: false, scroll_delta: 0 };
 
 pub unsafe fn register_global_virtio_input(dev: *mut VirtIOInputDevice) {
     let global_ptr = core::ptr::addr_of_mut!(GLOBAL_VIRTIO_INPUT);
@@ -571,7 +592,9 @@ pub unsafe fn poll_global_pointer(screen_w: u32, screen_h: u32) -> (PointerState
             }
         }
     }
-    (*state_ptr, any_changed)
+    let res = *state_ptr;
+    (*state_ptr).scroll_delta = 0;
+    (res, any_changed)
 }
 
 #[cfg(test)]
@@ -586,7 +609,7 @@ mod tests {
 
     #[test]
     fn pointer_state_abs_scaling_and_clamping_test() {
-        let mut state = PointerState { x: 400, y: 300, left_button: false, right_button: false };
+        let mut state = PointerState { x: 400, y: 300, left_button: false, right_button: false, scroll_delta: 0 };
 
         // Test scaling 0 -> 0
         let ev_x0 = VirtioInputEvent { type_: EV_ABS, code: ABS_X, value: 0 };
@@ -624,7 +647,7 @@ mod tests {
 
     #[test]
     fn pointer_state_rel_delta_and_clamping_test() {
-        let mut state = PointerState { x: 100, y: 100, left_button: false, right_button: false };
+        let mut state = PointerState { x: 100, y: 100, left_button: false, right_button: false, scroll_delta: 0 };
 
         let ev_rel_x = VirtioInputEvent { type_: EV_REL, code: REL_X, value: 25 as u32 };
         assert!(state.update_event(&ev_rel_x, 800, 600));
@@ -634,6 +657,15 @@ mod tests {
         let ev_rel_neg = VirtioInputEvent { type_: EV_REL, code: REL_X, value: (-500i32) as u32 };
         assert!(state.update_event(&ev_rel_neg, 800, 600));
         assert_eq!(state.x, 0);
+
+        // Test wheel scroll delta accumulation
+        let ev_wheel_up = VirtioInputEvent { type_: EV_REL, code: REL_WHEEL, value: 3 as u32 };
+        assert!(state.update_event(&ev_wheel_up, 800, 600));
+        assert_eq!(state.scroll_delta, 3);
+
+        let ev_wheel_down = VirtioInputEvent { type_: EV_REL, code: REL_WHEEL, value: (-1i32) as u32 };
+        assert!(state.update_event(&ev_wheel_down, 800, 600));
+        assert_eq!(state.scroll_delta, 2);
     }
 
     #[test]

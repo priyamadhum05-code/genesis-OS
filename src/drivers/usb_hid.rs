@@ -62,6 +62,7 @@ static mut MOUSE_STATE: PointerState = PointerState {
     y: 300,
     left_button: false,
     right_button: false,
+    scroll_delta: 0,
 };
 static mut MOUSE_CHANGED: bool = false;
 
@@ -896,6 +897,12 @@ pub unsafe fn poll_usb_events() {
                                     MOUSE_STATE.right_button = (btn & 2) != 0;
                                     MOUSE_STATE.x += dx as i32;
                                     MOUSE_STATE.y += dy as i32;
+                                    if rep.len() >= 4 {
+                                        let wheel = rep[3] as i8;
+                                        if wheel != 0 {
+                                            MOUSE_STATE.scroll_delta += wheel as i32;
+                                        }
+                                    }
                                     MOUSE_CHANGED = true;
                                 }
                                 _ => {}
@@ -932,9 +939,11 @@ pub unsafe fn poll_usb_mouse(screen_w: u32, screen_h: u32) -> (PointerState, boo
         MOUSE_STATE.x = MOUSE_STATE.x.clamp(0, screen_w as i32 - 1);
         MOUSE_STATE.y = MOUSE_STATE.y.clamp(0, screen_h as i32 - 1);
     }
-    let changed = MOUSE_CHANGED;
+    let changed = MOUSE_CHANGED || MOUSE_STATE.scroll_delta != 0;
+    let res = MOUSE_STATE;
+    MOUSE_STATE.scroll_delta = 0;
     MOUSE_CHANGED = false;
-    (MOUSE_STATE, changed)
+    (res, changed)
 }
 
 #[allow(static_mut_refs)]

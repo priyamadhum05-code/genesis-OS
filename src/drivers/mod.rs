@@ -12,6 +12,7 @@ pub mod nvme;
 pub mod usb_msc;
 pub mod e1000e;
 pub mod virtio_sound;
+pub mod ahci;
 
 pub use fb::{
     global_fb_console_clear, global_fb_console_write, redraw_workspace_sidebar,
@@ -43,4 +44,7 @@ pub use e1000e::{
 pub use virtio_sound::{
     get_global_virtio_sound, get_global_virtio_sound_mut, get_global_virtio_sound_ref,
     register_global_virtio_sound, VirtIOSoundDevice, SOUND_MMIO_VA_BASE,
+};
+pub use ahci::{
+    get_global_ahci, get_global_ahci_ref, register_global_ahci, AhciDevice, AHCI_MMIO_VA_BASE,
 };

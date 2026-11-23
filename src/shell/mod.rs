@@ -775,10 +775,29 @@ impl<'a> Shell<'a> {
                         }
                     }
                 }
+
+                // 4. SATA AHCI Disk
+                if let Some(ahci) = crate::drivers::ahci::get_global_ahci_ref() {
+                    if ahci.is_initialized {
+                        let blocks = ahci.total_sectors;
+                        let sec_b = ahci.sector_size as u64;
+                        let mib = (blocks * sec_b) / (1024 * 1024);
+                        serial_write(self.uart_va, b"ahci0  SATA AHCI Disk        ");
+                        serial_decimal(self.uart_va, mib);
+                        serial_write(self.uart_va, b" MiB   ");
+                        serial_decimal(self.uart_va, sec_b);
+                        serial_write(self.uart_va, b"   ");
+                        if active_name == "ahci0" {
+                            serial_write(self.uart_va, b"/\r\n");
+                        } else {
+                            serial_write(self.uart_va, b"-\r\n");
+                        }
+                    }
+                }
             }
             "mount" => {
                 if arg.is_empty() {
-                    serial_write(self.uart_va, b"Usage: mount <dev> (e.g. blk0, nvme0, usb0)\r\n");
+                    serial_write(self.uart_va, b"Usage: mount <dev> (e.g. blk0, nvme0, usb0, ahci0)\r\n");
                 } else {
                     let dev_opt = crate::fs::get_block_device_by_name(arg);
                     if let Some(mut dev) = dev_opt {

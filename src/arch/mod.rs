@@ -10,6 +10,7 @@ pub mod psci;
 pub mod rtc;
 pub mod serial;
 pub mod timer;
+pub mod m1n1;
 
 pub use aic::{AppleInterruptController, AIC_INFO, AIC_WHOAMI, AIC_IACK, AIC_MASK_SET, AIC_MASK_CLR};
 pub use exceptions::{
@@ -17,8 +18,8 @@ pub use exceptions::{
     stage4_vectors_va, TrapFrame,
 };
 pub use fdt::{
-    parse_fdt_aic, parse_fdt_devices, parse_fdt_pci, parse_fdt_simplefb,
-    FdtAicInfo, FdtGicInfo, FdtPciInfo, FdtSimpleFbInfo, FdtTimerInfo,
+    parse_fdt_aic, parse_fdt_apple_uart, parse_fdt_devices, parse_fdt_pci, parse_fdt_simplefb,
+    FdtAicInfo, FdtGicInfo, FdtPciInfo, FdtSimpleFbInfo, FdtTimerInfo, FdtUartInfo,
 };
 pub use gic::{acknowledge_irq, end_of_irq, Gicv3};
 pub use psci::{

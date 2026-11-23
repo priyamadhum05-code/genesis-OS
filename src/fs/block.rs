@@ -1,6 +1,6 @@
 //! Project Genesis — Unified Block Device Trait & Subsystem (Stage 21).
 
-use crate::drivers::{nvme::NvmeDevice, usb_msc::UsbMscDevice, virtio_blk::VirtIOBlockDevice};
+use crate::drivers::{ahci::AhciDevice, nvme::NvmeDevice, usb_msc::UsbMscDevice, virtio_blk::VirtIOBlockDevice};
 
 pub trait BlockDevice {
     /// Read consecutive blocks starting at `lba` into buffer at `buf_pa` / `buf_va`.
@@ -58,6 +58,7 @@ pub enum AnyBlockDev<'a> {
     VirtIO(&'a mut VirtIOBlockDevice),
     Nvme(&'a mut NvmeDevice),
     Usb(&'a mut UsbMscDevice),
+    Ahci(&'a mut AhciDevice),
 }
 
 impl<'a> BlockDevice for AnyBlockDev<'a> {
@@ -66,6 +67,7 @@ impl<'a> BlockDevice for AnyBlockDev<'a> {
             AnyBlockDev::VirtIO(d) => d.read_blocks(lba, count, buf_pa, buf_va),
             AnyBlockDev::Nvme(d) => d.read_blocks(lba, count, buf_pa, buf_va),
             AnyBlockDev::Usb(d) => d.read_blocks(lba, count, buf_pa, buf_va),
+            AnyBlockDev::Ahci(d) => d.read_blocks(lba, count, buf_pa, buf_va),
         }
     }
 
@@ -74,6 +76,7 @@ impl<'a> BlockDevice for AnyBlockDev<'a> {
             AnyBlockDev::VirtIO(d) => d.write_blocks(lba, count, buf_pa, buf_va),
             AnyBlockDev::Nvme(d) => d.write_blocks(lba, count, buf_pa, buf_va),
             AnyBlockDev::Usb(d) => d.write_blocks(lba, count, buf_pa, buf_va),
+            AnyBlockDev::Ahci(d) => d.write_blocks(lba, count, buf_pa, buf_va),
         }
     }
 
@@ -82,6 +85,7 @@ impl<'a> BlockDevice for AnyBlockDev<'a> {
             AnyBlockDev::VirtIO(d) => d.block_size(),
             AnyBlockDev::Nvme(d) => d.block_size(),
             AnyBlockDev::Usb(d) => d.block_size(),
+            AnyBlockDev::Ahci(d) => d.block_size(),
         }
     }
 
@@ -90,6 +94,7 @@ impl<'a> BlockDevice for AnyBlockDev<'a> {
             AnyBlockDev::VirtIO(d) => d.total_blocks(),
             AnyBlockDev::Nvme(d) => d.total_blocks(),
             AnyBlockDev::Usb(d) => d.total_blocks(),
+            AnyBlockDev::Ahci(d) => d.total_blocks(),
         }
     }
 
@@ -98,11 +103,12 @@ impl<'a> BlockDevice for AnyBlockDev<'a> {
             AnyBlockDev::VirtIO(d) => d.name(),
             AnyBlockDev::Nvme(d) => d.name(),
             AnyBlockDev::Usb(d) => d.name(),
+            AnyBlockDev::Ahci(d) => d.name(),
         }
     }
 }
 
-/// Query an active BlockDevice by name ("blk0", "nvme0", "usb0")
+/// Query an active BlockDevice by name ("blk0", "nvme0", "usb0", "ahci0")
 pub unsafe fn get_block_device_by_name(name: &str) -> Option<AnyBlockDev<'static>> {
     if name == "blk0" || name == "virtio-blk" {
         if let Some(ptr) = crate::drivers::virtio_blk::get_global_virtio_blk() {
@@ -118,6 +124,12 @@ pub unsafe fn get_block_device_by_name(name: &str) -> Option<AnyBlockDev<'static
         if let Some(dev) = crate::drivers::usb_msc::get_global_usb_msc() {
             if dev.is_initialized {
                 return Some(AnyBlockDev::Usb(dev));
+            }
+        }
+    } else if name == "ahci0" || name == "sata0" || name == "ahci" || name == "sata" {
+        if let Some(dev) = crate::drivers::ahci::get_global_ahci() {
+            if dev.is_initialized {
+                return Some(AnyBlockDev::Ahci(dev));
             }
         }
     }

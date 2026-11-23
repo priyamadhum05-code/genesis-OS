@@ -34,6 +34,7 @@ use genesis_stage1::{
         virtio_sound::{
             register_global_virtio_sound, VirtIOSoundDevice, SOUND_MMIO_VA_BASE,
         },
+        ahci::{register_global_ahci, AhciDevice, AHCI_MMIO_VA_BASE},
     },
     fs::{locate_volume, FatVolume},
     memory_map,
@@ -1767,6 +1768,48 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             }
         }
 
+        // Scan for PCIe AHCI SATA Controller (Class 0x01, Subclass 0x06, Prog-IF 0x01)
+        let ahci_pci_opt = find_pci_by_class(0x01, 0x06, 0x01)
+            .or_else(|| find_pci_by_class(0x01, 0x06, 0x00));
+
+        if let Some(ahci_pci_dev) = ahci_pci_opt {
+            serial_write(uart, b"GENESIS: stage27 found PCIe AHCI SATA controller at BDF ");
+            serial_decimal(uart, ahci_pci_dev.bus as u64);
+            serial_write(uart, b":");
+            serial_decimal(uart, ahci_pci_dev.dev as u64);
+            serial_write(uart, b".");
+            serial_decimal(uart, ahci_pci_dev.func as u64);
+            serial_write(uart, b"\r\n");
+
+            pci_enable_bus_master(PCI_ECAM_VA_BASE, ahci_pci_dev.bus, ahci_pci_dev.dev, ahci_pci_dev.func);
+
+            let abar_pa = ahci_pci_dev.bars[5];
+            if abar_pa != 0 {
+                let abar_size = ahci_pci_dev.bar_sizes[5].max(4096);
+                let abar_pages = ((abar_size + 4095) / 4096) as usize;
+                if let Ok(()) = mapper.map_mmio_range(AHCI_MMIO_VA_BASE, abar_pa, abar_pages.max(4)) {
+                    let mut ahci_dev = AhciDevice::empty();
+                    match ahci_dev.init(&ahci_pci_dev, mapper.pmm_mut(), HHDM_BASE, AHCI_MMIO_VA_BASE) {
+                        Ok(()) => {
+                            serial_write(uart, b"GENESIS: stage27 ahci sata ok (model=");
+                            serial_write(uart, ahci_dev.model_str().as_bytes());
+                            serial_write(uart, b", sectors=");
+                            serial_decimal(uart, ahci_dev.total_sectors);
+                            serial_write(uart, b")\r\n");
+                            register_global_ahci(ahci_dev);
+                        }
+                        Err(e) => {
+                            serial_write(uart, b"GENESIS: ahci sata init returned error: ");
+                            serial_write(uart, e.as_bytes());
+                            serial_write(uart, b"\r\n");
+                        }
+                    }
+                } else {
+                    serial_write(uart, b"GENESIS: ahci abar map failed\r\n");
+                }
+            }
+        }
+
         let sig = match blk_dev.read_sector_0(req_pa, req_va) {
             Ok(s) => s,
             Err(e) => {
@@ -1947,6 +1990,9 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             if let (Some(gpu), Some(fb)) = (virtio_gpu_opt.as_mut(), fb_opt.as_ref()) {
                 if let Ok(()) = gpu.init_2d_scanout(fb.width, fb.height, handoff.fb_base) {
                     serial_write(uart, b"GENESIS: virtio-gpu 2d scanout initialized ok\r\n");
+                    if let Ok(()) = gpu.init_hw_cursor(mapper.pmm_mut(), HHDM_BASE) {
+                        serial_write(uart, b"GENESIS: stage27 virtio-gpu hardware cursor initialized ok\r\n");
+                    }
                     register_global_virtio_gpu(gpu as *mut VirtIOGpuDevice);
                 }
             }
@@ -2081,11 +2127,11 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             comp.total_ram_mib = total_ram_mib;
 
             // Verify pointer input: drag terminal window
-            let ptr_click = PointerState { x: comp.windows[WIN_TERMINAL].x + 30, y: comp.windows[WIN_TERMINAL].y + 10, left_button: true, right_button: false };
+            let ptr_click = PointerState::new(comp.windows[WIN_TERMINAL].x + 30, comp.windows[WIN_TERMINAL].y + 10, true, false);
             let _ = comp.handle_pointer(&ptr_click);
-            let ptr_drag = PointerState { x: comp.windows[WIN_TERMINAL].x + 60, y: comp.windows[WIN_TERMINAL].y + 30, left_button: true, right_button: false };
+            let ptr_drag = PointerState::new(comp.windows[WIN_TERMINAL].x + 60, comp.windows[WIN_TERMINAL].y + 30, true, false);
             let _ = comp.handle_pointer(&ptr_drag);
-            let ptr_up = PointerState { x: comp.windows[WIN_TERMINAL].x + 60, y: comp.windows[WIN_TERMINAL].y + 30, left_button: false, right_button: false };
+            let ptr_up = PointerState::new(comp.windows[WIN_TERMINAL].x + 60, comp.windows[WIN_TERMINAL].y + 30, false, false);
             let _ = comp.handle_pointer(&ptr_up);
 
             // Verify taskbar and window close/focus
@@ -2138,7 +2184,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
 
             assert!(comp.file_count > 0);
 
-            let ptr_center = PointerState { x: (fb_w / 2) as i32, y: (fb_h / 2) as i32, left_button: false, right_button: false };
+            let ptr_center = PointerState::new((fb_w / 2) as i32, (fb_h / 2) as i32, false, false);
             comp.render_frame(&ptr_center);
             if let Some(ref mut fb) = shell.fb {
                 comp.blit(fb);
@@ -2184,7 +2230,7 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             comp.execute_term_command("lsusb", shell.fat, shell.dev.as_deref_mut(), scratch_pa, scratch_va);
 
             // Render frame and blit
-            let ptr_center = PointerState { x: (fb_w / 2) as i32, y: (fb_h / 2) as i32, left_button: false, right_button: false };
+            let ptr_center = PointerState::new((fb_w / 2) as i32, (fb_h / 2) as i32, false, false);
             comp.render_frame(&ptr_center);
             if let Some(ref mut fb) = shell.fb {
                 comp.blit(fb);

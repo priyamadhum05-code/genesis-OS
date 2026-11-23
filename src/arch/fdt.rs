@@ -39,6 +39,12 @@ pub struct FdtSimpleFbInfo {
     pub format_len: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdtUartInfo {
+    pub base: u64,
+    pub size: u64,
+}
+
 #[derive(Clone, Copy)]
 struct Node {
     parent_ac: u32,
@@ -660,6 +666,140 @@ pub unsafe fn parse_fdt_simplefb(fdt: *const u8, cap: usize) -> Option<FdtSimple
     None
 }
 
+#[derive(Clone, Copy)]
+struct UartNode {
+    parent_ac: u32,
+    parent_sc: u32,
+    child_ac: u32,
+    child_sc: u32,
+    is_uart: bool,
+    disabled: bool,
+    reg_ptr: *const u8,
+    reg_len: usize,
+}
+
+impl UartNode {
+    const fn empty() -> Self {
+        Self {
+            parent_ac: 2,
+            parent_sc: 1,
+            child_ac: 2,
+            child_sc: 1,
+            is_uart: false,
+            disabled: false,
+            reg_ptr: core::ptr::null(),
+            reg_len: 0,
+        }
+    }
+}
+
+pub unsafe fn parse_fdt_apple_uart(fdt: *const u8, cap: usize) -> Option<FdtUartInfo> {
+    if !valid_fdt(fdt, cap) {
+        return None;
+    }
+
+    let total = be32(fdt.add(4)) as usize;
+    let so = be32(fdt.add(8)) as usize;
+    let stro = be32(fdt.add(12)) as usize;
+    let ss = be32(fdt.add(32)) as usize;
+    let sz = be32(fdt.add(36)) as usize;
+    if so.checked_add(sz).unwrap_or(usize::MAX) > total || stro.checked_add(ss).unwrap_or(usize::MAX) > total {
+        return None;
+    }
+
+    let strings = fdt.add(stro);
+    let (mut p, end) = (fdt.add(so), fdt.add(so + sz));
+    let mut nodes = [UartNode::empty(); 32];
+    let mut depth = 0usize;
+
+    while p.add(4) <= end {
+        let token = be32(p);
+        p = p.add(4);
+        match token {
+            1 => {
+                if depth >= nodes.len() {
+                    return None;
+                }
+                let parent = if depth == 0 {
+                    UartNode::empty()
+                } else {
+                    nodes[depth - 1]
+                };
+                nodes[depth] = UartNode {
+                    parent_ac: parent.child_ac,
+                    parent_sc: parent.child_sc,
+                    child_ac: parent.child_ac,
+                    child_sc: parent.child_sc,
+                    is_uart: false,
+                    disabled: false,
+                    reg_ptr: core::ptr::null(),
+                    reg_len: 0,
+                };
+                depth += 1;
+                while p < end && *p != 0 {
+                    p = p.add(1);
+                }
+                p = align4(p.add(1));
+            }
+            2 => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                let n = nodes[depth];
+                if !n.disabled && n.is_uart && !n.reg_ptr.is_null() {
+                    let ac = n.parent_ac as usize;
+                    let sc = n.parent_sc as usize;
+                    let stride = (ac + sc) * 4;
+                    if n.reg_len >= stride {
+                        let base = read_cells(n.reg_ptr, ac);
+                        let size = read_cells(n.reg_ptr.add(ac * 4), sc);
+                        return Some(FdtUartInfo { base, size });
+                    }
+                }
+            }
+            3 => {
+                if depth == 0 || p.add(8) > end {
+                    return None;
+                }
+                let len = be32(p) as usize;
+                let nameoff = be32(p.add(4)) as usize;
+                p = p.add(8);
+                if p.add(len) > end || nameoff >= ss {
+                    return None;
+                }
+                let name = cstr(strings.add(nameoff), ss - nameoff);
+                let val = p;
+                let node = &mut nodes[depth - 1];
+                match name {
+                    b"#address-cells" if len >= 4 => node.child_ac = be32(val),
+                    b"#size-cells" if len >= 4 => node.child_sc = be32(val),
+                    b"compatible" => {
+                        if has_string(val, len, b"apple,s5l-uart") || has_string(val, len, b"apple,uart") {
+                            node.is_uart = true;
+                        }
+                    }
+                    b"status" => {
+                        let status = cstr(val, len);
+                        node.disabled = status == b"disabled" || status == b"fail";
+                    }
+                    b"reg" => {
+                        node.reg_ptr = val;
+                        node.reg_len = len;
+                    }
+                    _ => {}
+                }
+                p = align4(p.add(len));
+            }
+            4 => {}
+            9 => break,
+            _ => return None,
+        }
+    }
+
+    None
+}
+
 unsafe fn valid_fdt(p: *const u8, cap: usize) -> bool {
     if p.is_null() {
         return false;
@@ -839,6 +979,31 @@ mod tests {
             assert_eq!(fb.height, 1080);
             assert_eq!(fb.stride, 1920 * 4);
             assert_eq!(&fb.format[..fb.format_len], b"a8r8g8b8");
+        }
+    }
+
+    #[test]
+    fn parse_fdt_apple_uart_test() {
+        let mut b = MockFdtBuilder::new();
+        b.begin_node("");
+        b.add_prop(b"#address-cells", &2u32.to_be_bytes());
+        b.add_prop(b"#size-cells", &2u32.to_be_bytes());
+
+        b.begin_node("serial@235200000");
+        b.add_prop(b"compatible", b"apple,s5l-uart\0apple,uart\0");
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&0x0000_0002_3520_0000_u64.to_be_bytes());
+        reg.extend_from_slice(&0x0000_0000_0000_4000_u64.to_be_bytes());
+        b.add_prop(b"reg", &reg);
+        b.end_node();
+
+        b.end_node();
+        let fdt = b.build();
+
+        unsafe {
+            let uart = parse_fdt_apple_uart(fdt.as_ptr(), fdt.len()).expect("failed to parse apple_uart");
+            assert_eq!(uart.base, 0x2_3520_0000);
+            assert_eq!(uart.size, 0x4000);
         }
     }
 }
