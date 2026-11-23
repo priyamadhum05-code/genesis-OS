@@ -24,7 +24,9 @@ else
   ACCEL_OPTS="-machine virt-11.1,gic-version=3 -cpu cortex-a76"
 fi
 
-if [ "$(uname)" = "Darwin" ]; then
+if [ "${GENESIS_HEADLESS:-0}" = "1" ] || echo " $* " | grep -q -- " -display none "; then
+  DISPLAY_OPTS=""
+elif [ "$(uname)" = "Darwin" ]; then
   DISPLAY_OPTS="-display cocoa,zoom-to-fit=on"
 else
   DISPLAY_OPTS="-display default"

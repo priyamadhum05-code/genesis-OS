@@ -270,10 +270,8 @@ pub fn run_stage3c1_preflight(
             // Strict W^X: Executable sections are mapped RO, NX in HHDM!
             let perms = if sec.is_executable {
                 PagePermissions::kernel_rodata()
-            } else if sec.is_writable {
-                PagePermissions::kernel_data()
             } else {
-                PagePermissions::kernel_rodata()
+                PagePermissions::kernel_data()
             };
 
             aspace_ttbr1.map_range(HHDM_BASE + KERNEL_IMAGE_PADDR + sec.virtual_address, KERNEL_IMAGE_PADDR + sec.virtual_address, sec.page_count, perms)?;

@@ -454,7 +454,7 @@ impl FatVolume {
         &self,
         dev: &mut impl BlockDevice,
         path: &str,
-        dest_pa: u64,
+        _dest_pa: u64,
         dest_va: u64,
         dest_cap: usize,
         scratch_pa: u64,
@@ -518,38 +518,23 @@ impl FatVolume {
 
         while bytes_left > 0 && curr_clus >= 2 {
             let clus_lba = self.cluster_to_lba(curr_clus);
-            let sectors_to_read = self.sec_per_clus as u16;
+            let mut clus_bytes_left = bytes_left.min(clus_bytes);
+            let mut sec_off = 0u64;
 
-            if dest_offset + clus_bytes <= to_read {
-                dev.read_sectors(
-                    clus_lba,
-                    sectors_to_read,
-                    dest_pa + dest_offset as u64,
-                    dest_va + dest_offset as u64,
-                )?;
-                if bytes_left <= clus_bytes {
-                    dest_offset += bytes_left;
-                    break;
-                }
-                bytes_left -= clus_bytes;
-                dest_offset += clus_bytes;
-            } else {
-                let mut clus_bytes_left = bytes_left.min(clus_bytes);
-                let mut sec_off = 0u64;
-                while clus_bytes_left > 0 {
-                    let chunk = clus_bytes_left.min(4096);
-                    let secs = ((chunk + 511) / 512) as u16;
-                    dev.read_sectors(clus_lba + sec_off, secs, scratch_pa, scratch_va)?;
-                    core::ptr::copy_nonoverlapping(
-                        scratch_va as *const u8,
-                        (dest_va + dest_offset as u64) as *mut u8,
-                        chunk,
-                    );
-                    clus_bytes_left -= chunk;
-                    dest_offset += chunk;
-                    sec_off += secs as u64;
-                }
-                break;
+            while clus_bytes_left > 0 {
+                let chunk = clus_bytes_left.min(4096);
+                let bytes_per_sec = (self.bytes_per_sec as usize).max(512);
+                let secs = ((chunk + bytes_per_sec - 1) / bytes_per_sec) as u16;
+                dev.read_sectors(clus_lba + sec_off, secs, scratch_pa, scratch_va)?;
+                core::ptr::copy_nonoverlapping(
+                    scratch_va as *const u8,
+                    (dest_va + dest_offset as u64) as *mut u8,
+                    chunk,
+                );
+                clus_bytes_left -= chunk;
+                dest_offset += chunk;
+                bytes_left -= chunk;
+                sec_off += secs as u64;
             }
 
             if bytes_left == 0 {
@@ -1605,8 +1590,22 @@ pub struct FatDirEntry {
 }
 
 impl FatDirEntry {
+    pub const fn empty() -> Self {
+        Self {
+            name: [0; 64],
+            name_len: 0,
+            size: 0,
+            is_dir: false,
+            first_clus: 0,
+        }
+    }
+
     pub fn name_str(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("???")
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.is_dir
     }
 }
 
@@ -2186,6 +2185,78 @@ mod tests {
 
             // TESTDIR no longer exists in root
             assert!(vol.find_entry_in_dir(&mut dev, vol.root_clus, "TESTDIR", scratch_va, scratch_va).is_err());
+        }
+    }
+
+    #[test]
+    fn test_read_file_partial_small_cluster_size() {
+        let mut dev = RamDisk::new(2 * 1024 * 1024);
+        let disk_ptr = dev.data.as_mut_ptr();
+
+        // Construct volume with 1 sector per cluster (512 bytes/cluster)
+        let vol = FatVolume {
+            volume_lba: 0,
+            bytes_per_sec: 512,
+            sec_per_clus: 1,                // 512 bytes per cluster
+            rsvd_sec_cnt: 32,
+            num_fats: 2,
+            fat_size: 32,
+            root_clus: 2,
+            fat_start_lba: 32,
+            data_start_lba: 96,
+            is_fat32: true,
+            root_dir_lba: 0,
+            root_dir_sectors: 0,
+        };
+
+        unsafe {
+            for f in 0..2 {
+                let fat_sec = 32 + f * 32;
+                let fat_offset = (fat_sec * 512) as usize;
+                let b0 = 0x0FFF_FFF8u32.to_le_bytes();
+                core::ptr::copy_nonoverlapping(b0.as_ptr(), disk_ptr.add(fat_offset), 4);
+                let b1 = 0x0FFF_FFFFu32.to_le_bytes();
+                core::ptr::copy_nonoverlapping(b1.as_ptr(), disk_ptr.add(fat_offset + 4), 4);
+                let b2 = 0x0FFF_FFFFu32.to_le_bytes();
+                core::ptr::copy_nonoverlapping(b2.as_ptr(), disk_ptr.add(fat_offset + 8), 4);
+            }
+
+            let mut scratch = [0u8; 4096];
+            let scratch_va = scratch.as_mut_ptr() as u64;
+
+            // Write a multi-cluster file (e.g. 1200 bytes across 3 clusters)
+            let mut payload = [0u8; 1200];
+            for i in 0..1200 {
+                payload[i] = ((i * 7 + 13) & 0xFF) as u8;
+            }
+
+            vol.write_file(&mut dev, "DATA.BIN", &payload, scratch_va, scratch_va)
+                .expect("write_file multi-cluster failed");
+
+            // 1. Partial read with dest_cap = 64 bytes (dest_cap < cluster size)
+            let mut read_buf = [0u8; 64];
+            let read_va = read_buf.as_mut_ptr() as u64;
+            // Note: pass 0xDEAD_BEEF as dest_pa to verify it doesn't crash even if dest_pa is invalid stack VA
+            let n = vol.read_file_partial(&mut dev, "DATA.BIN", 0xDEAD_BEEF, read_va, 64, scratch_va, scratch_va)
+                .expect("read_file_partial 64 failed");
+            assert_eq!(n, 64);
+            assert_eq!(&read_buf[..64], &payload[..64]);
+
+            // 2. Partial read with dest_cap = 700 bytes (spans cluster boundary: 512 + 188)
+            let mut read_buf2 = [0u8; 700];
+            let read_va2 = read_buf2.as_mut_ptr() as u64;
+            let n2 = vol.read_file_partial(&mut dev, "DATA.BIN", 0, read_va2, 700, scratch_va, scratch_va)
+                .expect("read_file_partial 700 failed");
+            assert_eq!(n2, 700);
+            assert_eq!(&read_buf2[..700], &payload[..700]);
+
+            // 3. Partial read with dest_cap = 2000 bytes (larger than file: 1200)
+            let mut read_buf3 = [0u8; 2000];
+            let read_va3 = read_buf3.as_mut_ptr() as u64;
+            let n3 = vol.read_file_partial(&mut dev, "DATA.BIN", 0, read_va3, 2000, scratch_va, scratch_va)
+                .expect("read_file_partial 2000 failed");
+            assert_eq!(n3, 1200);
+            assert_eq!(&read_buf3[..1200], &payload[..1200]);
         }
     }
 }

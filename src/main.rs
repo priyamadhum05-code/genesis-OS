@@ -856,6 +856,46 @@ unsafe fn apply_higher_half_relocations(base_paddr: u64, pe: &genesis_stage1::vm
     }
 }
 
+unsafe fn apply_rdata_higher_half_relocations(base_paddr: u64, pe: &genesis_stage1::vmm::ParsedPeImage) {
+    if let (Some(reloc_sec), Some(rdata_sec)) = (pe.find_section(b".reloc"), pe.find_section(b".rdata")) {
+        let reloc_ptr = (HHDM_BASE + base_paddr + reloc_sec.virtual_address) as *const u8;
+        let reloc_size = reloc_sec.virtual_size as usize;
+        let delta = KERNEL_VA_BASE.wrapping_sub(base_paddr);
+
+        let rdata_start = rdata_sec.virtual_address as usize;
+        let rdata_end = rdata_start + rdata_sec.virtual_size as usize;
+
+        let mut p = 0usize;
+        while p + 8 <= reloc_size {
+            let page_rva = core::ptr::read_unaligned(reloc_ptr.add(p) as *const u32) as usize;
+            let block_size = core::ptr::read_unaligned(reloc_ptr.add(p + 4) as *const u32) as usize;
+            if block_size < 8 || p + block_size > reloc_size {
+                break;
+            }
+            let entry_count = (block_size - 8) / 2;
+            let entries = reloc_ptr.add(p + 8) as *const u16;
+            for i in 0..entry_count {
+                let entry = core::ptr::read_unaligned(entries.add(i));
+                let rel_type = entry >> 12;
+                let rel_off = (entry & 0xFFF) as usize;
+                let target_rva = page_rva + rel_off;
+
+                if rel_type == 10 && target_rva >= rdata_start && target_rva < rdata_end {
+                    let target_hhdm_va = HHDM_BASE + base_paddr + target_rva as u64;
+                    let ptr_loc = target_hhdm_va as *mut u64;
+                    let val = core::ptr::read_volatile(ptr_loc);
+                    if val >= base_paddr && val < base_paddr + KERNEL_RESERVE_SIZE {
+                        core::ptr::write_volatile(ptr_loc, val.wrapping_add(delta));
+                        core::arch::asm!("dc civac, {0}", in(reg) target_hhdm_va, options(nomem, nostack));
+                    }
+                }
+            }
+            p += block_size;
+        }
+        core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
+    }
+}
+
 #[inline(always)]
 fn ensure_higher_half(addr: u64) -> u64 {
     if addr >= 0x8000_0000_0000_0000 {
@@ -1007,6 +1047,12 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             let va = HHDM_BASE + dram_ext;
             let _ = mapper.map_l2_block(va, dram_ext, PagePermissions::kernel_data());
             dram_ext += 2 * 1024 * 1024;
+        }
+
+        // Relocate PE .rdata pointers to higher-half virtual addresses via writable HHDM alias
+        if let Ok(pe_higher) = parse_pe_image(KERNEL_VA_BASE) {
+            apply_rdata_higher_half_relocations(KERNEL_IMAGE_PADDR, &pe_higher);
+            serial_write(uart, b"GENESIS: stage4 rdata higher-half relocations ok\r\n");
         }
 
         // --------------------------------------------------------------------
@@ -1991,8 +2037,8 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             register_global_fb_console(fb_console);
             fb_opt = Some(fb);
             if let (Some(gpu), Some(fb)) = (virtio_gpu_opt.as_mut(), fb_opt.as_ref()) {
+                gpu.stride_bytes = fb.stride * 4;
                 if let Ok(()) = gpu.init_2d_scanout(fb.width, fb.height, handoff.fb_base) {
-                    gpu.stride_bytes = fb.stride * 4;
                     serial_write(uart, b"GENESIS: virtio-gpu 2d scanout initialized ok\r\n");
                     register_global_virtio_gpu(gpu as *mut VirtIOGpuDevice);
                 }
@@ -2015,6 +2061,11 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
         let backbuf_pa = mapper.pmm_mut().allocate_contiguous_pages(backbuf_pages).unwrap_or(0);
         let backbuf_va = if backbuf_pa != 0 { HHDM_BASE + backbuf_pa } else { 0 };
         genesis_stage1::ui::register_global_backbuffer(backbuf_va);
+
+        // Stage 31: Allocate Dedicated Write-Back Cached Wallpaper Buffer
+        let wallbuf_pa = mapper.pmm_mut().allocate_contiguous_pages(backbuf_pages).unwrap_or(0);
+        let wallbuf_va = if wallbuf_pa != 0 { HHDM_BASE + wallbuf_pa } else { 0 };
+        genesis_stage1::ui::register_global_wallpaper_buffer(wallbuf_va);
         genesis_stage1::proc::register_global_run_elf(kernel_run_elf);
 
         // 2. Dedicated Buffers for Shell File and Tokenizer Reading

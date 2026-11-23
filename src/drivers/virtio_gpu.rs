@@ -678,7 +678,9 @@ impl VirtIOGpuDevice {
     ) -> Result<(), &'static str> {
         self.width = width;
         self.height = height;
-        self.stride_bytes = width * 4;
+        if self.stride_bytes == 0 {
+            self.stride_bytes = width * 4;
+        }
         self.resource_id = 1;
 
         // 1. RESOURCE_CREATE_2D
@@ -720,7 +722,7 @@ impl VirtIOGpuDevice {
                 nr_entries: 1,
                 entries: [VirtioGpuMemEntry {
                     addr: backing_pa,
-                    length: width * height * 4,
+                    length: self.stride_bytes * height,
                     padding: 0,
                 }],
             },
@@ -1001,8 +1003,13 @@ impl VirtIOGpuDevice {
 
     /// Transfer updated framebuffer rectangular region to host and flush to display
     pub unsafe fn flush_rect(&mut self, _x: u32, y: u32, _width: u32, height: u32) -> Result<(), &'static str> {
+        let cy = y.min(self.height.saturating_sub(1));
+        let ch = height.min(self.height - cy);
+        if ch == 0 || self.width == 0 {
+            return Ok(());
+        }
         let stride = if self.stride_bytes > 0 { self.stride_bytes as u64 } else { (self.width as u64) * 4 };
-        let byte_offset = (y as u64) * stride;
+        let byte_offset = (cy as u64) * stride;
         let w = self.width;
 
         // 1. TRANSFER_TO_HOST_2D
@@ -1019,9 +1026,9 @@ impl VirtIOGpuDevice {
                 },
                 r: VirtioGpuRect {
                     x: 0,
-                    y,
+                    y: cy,
                     width: w,
-                    height,
+                    height: ch,
                 },
                 offset: byte_offset,
                 resource_id: self.resource_id,
@@ -1047,9 +1054,9 @@ impl VirtIOGpuDevice {
                 },
                 r: VirtioGpuRect {
                     x: 0,
-                    y,
+                    y: cy,
                     width: w,
-                    height,
+                    height: ch,
                 },
                 resource_id: self.resource_id,
                 padding: 0,
@@ -1065,7 +1072,8 @@ impl VirtIOGpuDevice {
 
     /// Transfer updated dirty bounding box to host and flush to display (with coordinate clamping)
     pub unsafe fn transfer_and_flush_rect(&mut self, _x: u32, y: u32, _w: u32, h: u32) -> Result<(), &'static str> {
-        let (_cx, cy, _cw, ch) = clamp_rect(0, y, self.width, h, self.width, self.height);
+        let cy = y.min(self.height.saturating_sub(1));
+        let ch = h.min(self.height - cy);
         if ch == 0 || self.width == 0 {
             return Ok(());
         }
@@ -1329,6 +1337,21 @@ mod tests {
         assert_eq!(calculate_flush_offset(10, 0, 1024), 40);
         assert_eq!(calculate_flush_offset(0, 1, 1024), 1024 * 4);
         assert_eq!(calculate_flush_offset(100, 50, 1920), (50 * 1920 + 100) * 4);
+    }
+
+    #[test]
+    fn full_scanline_flush_alignment_and_stride_math() {
+        let width = 1440u32;
+        let height = 900u32;
+        let stride_bytes = width * 4;
+        let y = 50u32;
+        let h = 30u32;
+        let cy = y.min(height.saturating_sub(1));
+        let ch = h.min(height - cy);
+        let offset = (cy as u64) * (stride_bytes as u64);
+        assert_eq!(cy, 50);
+        assert_eq!(ch, 30);
+        assert_eq!(offset, 50 * 1440 * 4);
     }
 
     #[test]
