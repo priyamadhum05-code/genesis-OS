@@ -185,6 +185,11 @@ impl PagePermissions {
         // AF (Access Flag, bit 10): set to 1
         bits |= 1u64 << 10;
 
+        // nG (Non-Global, bit 11): set for EL0 user-space mappings
+        if matches!(self.access, AccessPermission::UserRw | AccessPermission::UserRo) {
+            bits |= 1u64 << 11;
+        }
+
         // PXN (Privileged Execute-Never, bit 53)
         if !self.privileged_execute {
             bits |= 1u64 << 53;

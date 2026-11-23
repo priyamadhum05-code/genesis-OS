@@ -1992,10 +1992,8 @@ extern "C" fn higher_half_entry(uart_va: u64, handoff_va: u64) -> ! {
             fb_opt = Some(fb);
             if let (Some(gpu), Some(fb)) = (virtio_gpu_opt.as_mut(), fb_opt.as_ref()) {
                 if let Ok(()) = gpu.init_2d_scanout(fb.width, fb.height, handoff.fb_base) {
+                    gpu.stride_bytes = fb.stride * 4;
                     serial_write(uart, b"GENESIS: virtio-gpu 2d scanout initialized ok\r\n");
-                    if let Ok(()) = gpu.init_hw_cursor(mapper.pmm_mut(), HHDM_BASE) {
-                        serial_write(uart, b"GENESIS: stage27 virtio-gpu hardware cursor initialized ok\r\n");
-                    }
                     register_global_virtio_gpu(gpu as *mut VirtIOGpuDevice);
                 }
             }

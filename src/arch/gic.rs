@@ -15,6 +15,42 @@ pub const GICR_ICENABLER0: usize = 0x0180;
 pub const GICR_IPRIORITYR: usize = 0x0400;
 pub const GICR_ICFGR1: usize = 0x0C04;
 
+#[inline]
+unsafe fn mmio_read32(addr: usize) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let val: u32;
+        core::arch::asm!(
+            "ldr {val:w}, [{addr}]",
+            val = out(reg) val,
+            addr = in(reg) addr,
+            options(nostack, preserves_flags),
+        );
+        val
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        core::ptr::read_volatile(addr as *const u32)
+    }
+}
+
+#[inline]
+unsafe fn mmio_write32(addr: usize, val: u32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        core::arch::asm!(
+            "str {val:w}, [{addr}]",
+            val = in(reg) val,
+            addr = in(reg) addr,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        core::ptr::write_volatile(addr as *mut u32, val);
+    }
+}
+
 pub struct Gicv3 {
     gicd_base: usize,
     gicr_base: usize,
@@ -76,20 +112,22 @@ impl Gicv3 {
         let sgi_base = self.gicr_base + GICR_SGI_OFFSET;
 
         // Group 1 Non-Secure
-        let grp = core::ptr::read_volatile((sgi_base + GICR_IGROUPR0) as *const u32);
-        core::ptr::write_volatile((sgi_base + GICR_IGROUPR0) as *mut u32, grp | (1 << intid));
-        let _ = core::ptr::read_volatile((sgi_base + GICR_IGROUPR0) as *const u32); // Flush write
+        let grp_addr = sgi_base + GICR_IGROUPR0;
+        let grp = mmio_read32(grp_addr);
+        mmio_write32(grp_addr, grp | (1 << intid));
+        let _ = mmio_read32(grp_addr); // Flush write
 
         // Priority 0x00 (highest)
-        let prio_addr = (sgi_base + GICR_IPRIORITYR + ((intid as usize & !3))) as *mut u32;
-        let prio = core::ptr::read_volatile(prio_addr);
+        let prio_addr = sgi_base + GICR_IPRIORITYR + (intid as usize & !3);
+        let prio = mmio_read32(prio_addr);
         let shift = (intid % 4) * 8;
-        core::ptr::write_volatile(prio_addr, prio & !(0xFF << shift));
-        let _ = core::ptr::read_volatile(prio_addr); // Flush write
+        mmio_write32(prio_addr, prio & !(0xFF << shift));
+        let _ = mmio_read32(prio_addr); // Flush write
 
         // Enable interrupt in GICR_ISENABLER0
-        core::ptr::write_volatile((sgi_base + GICR_ISENABLER0) as *mut u32, 1 << intid);
-        let _ = core::ptr::read_volatile((sgi_base + GICR_ISENABLER0) as *const u32); // Flush write
+        let isenable_addr = sgi_base + GICR_ISENABLER0;
+        mmio_write32(isenable_addr, 1 << intid);
+        let _ = mmio_read32(isenable_addr); // Flush write
 
         #[cfg(target_os = "uefi")]
         asm!("dsb sy", "isb", options(nostack));
@@ -97,22 +135,22 @@ impl Gicv3 {
 
     #[inline]
     unsafe fn mmio_read_d(&self, offset: usize) -> u32 {
-        core::ptr::read_volatile((self.gicd_base + offset) as *const u32)
+        mmio_read32(self.gicd_base + offset)
     }
 
     #[inline]
     unsafe fn mmio_write_d(&self, offset: usize, val: u32) {
-        core::ptr::write_volatile((self.gicd_base + offset) as *mut u32, val)
+        mmio_write32(self.gicd_base + offset, val)
     }
 
     #[inline]
     unsafe fn mmio_read_r(&self, offset: usize) -> u32 {
-        core::ptr::read_volatile((self.gicr_base + offset) as *const u32)
+        mmio_read32(self.gicr_base + offset)
     }
 
     #[inline]
     unsafe fn mmio_write_r(&self, offset: usize, val: u32) {
-        core::ptr::write_volatile((self.gicr_base + offset) as *mut u32, val)
+        mmio_write32(self.gicr_base + offset, val)
     }
 }
 

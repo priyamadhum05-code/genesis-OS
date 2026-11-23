@@ -447,6 +447,126 @@ impl FatVolume {
         Ok(file_size)
     }
 
+    /// Reads up to `dest_cap` bytes from a file identified by `path`.
+    /// Unlike `read_file`, does not fail if `file_size > dest_cap`;
+    /// instead reads up to `dest_cap` bytes and returns the number of bytes read.
+    pub unsafe fn read_file_partial(
+        &self,
+        dev: &mut impl BlockDevice,
+        path: &str,
+        dest_pa: u64,
+        dest_va: u64,
+        dest_cap: usize,
+        scratch_pa: u64,
+        scratch_va: u64,
+    ) -> Result<usize, &'static str> {
+        let mut curr_dir_clus = if self.is_fat32 { self.root_clus } else { 0 };
+
+        // Split path into slash-separated components
+        let mut path_str = path;
+        while path_str.starts_with('/') {
+            path_str = &path_str[1..];
+        }
+
+        let mut components = [""; 8];
+        let mut comp_count = 0;
+        for part in path_str.split('/') {
+            if !part.is_empty() {
+                if comp_count >= components.len() {
+                    return Err("Path exceeds maximum depth of 8 components");
+                }
+                components[comp_count] = part;
+                comp_count += 1;
+            }
+        }
+        if comp_count == 0 {
+            return Err("Empty file path");
+        }
+
+        let mut target_clus = 0u32;
+        let mut file_size = 0usize;
+
+        for (idx, &comp) in components[..comp_count].iter().enumerate() {
+            let is_last = idx == comp_count - 1;
+            let (entry_clus, size, is_dir) =
+                self.find_entry_in_dir(dev, curr_dir_clus, comp, scratch_pa, scratch_va)?;
+
+            if is_last {
+                if is_dir {
+                    return Err("Path references a directory, not a file");
+                }
+                target_clus = entry_clus;
+                file_size = size;
+            } else {
+                if !is_dir {
+                    return Err("Intermediate path component is not a directory");
+                }
+                curr_dir_clus = entry_clus;
+            }
+        }
+
+        let to_read = file_size.min(dest_cap);
+        if to_read == 0 {
+            return Ok(0);
+        }
+
+        // Read file contents by following FAT cluster chain
+        let mut bytes_left = to_read;
+        let mut curr_clus = target_clus;
+        let mut dest_offset = 0usize;
+        let clus_bytes = (self.sec_per_clus as usize) * (self.bytes_per_sec as usize);
+
+        while bytes_left > 0 && curr_clus >= 2 {
+            let clus_lba = self.cluster_to_lba(curr_clus);
+            let sectors_to_read = self.sec_per_clus as u16;
+
+            if dest_offset + clus_bytes <= to_read {
+                dev.read_sectors(
+                    clus_lba,
+                    sectors_to_read,
+                    dest_pa + dest_offset as u64,
+                    dest_va + dest_offset as u64,
+                )?;
+                if bytes_left <= clus_bytes {
+                    dest_offset += bytes_left;
+                    break;
+                }
+                bytes_left -= clus_bytes;
+                dest_offset += clus_bytes;
+            } else {
+                let mut clus_bytes_left = bytes_left.min(clus_bytes);
+                let mut sec_off = 0u64;
+                while clus_bytes_left > 0 {
+                    let chunk = clus_bytes_left.min(4096);
+                    let secs = ((chunk + 511) / 512) as u16;
+                    dev.read_sectors(clus_lba + sec_off, secs, scratch_pa, scratch_va)?;
+                    core::ptr::copy_nonoverlapping(
+                        scratch_va as *const u8,
+                        (dest_va + dest_offset as u64) as *mut u8,
+                        chunk,
+                    );
+                    clus_bytes_left -= chunk;
+                    dest_offset += chunk;
+                    sec_off += secs as u64;
+                }
+                break;
+            }
+
+            if bytes_left == 0 {
+                break;
+            }
+
+            // Lookup next cluster in FAT
+            curr_clus = self.get_next_cluster(dev, curr_clus, scratch_pa, scratch_va)?;
+            let eof = if self.is_fat32 { 0x0FFF_FFF8 } else { 0xFFF8 };
+            if curr_clus >= eof {
+                break;
+            }
+        }
+
+        Ok(dest_offset)
+    }
+
     /// Looks up the next cluster in the FAT for cluster `curr_clus`.
     unsafe fn get_next_cluster(
         &self,

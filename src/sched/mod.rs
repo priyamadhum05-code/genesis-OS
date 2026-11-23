@@ -315,13 +315,16 @@ pub fn scheduler_tick_opt(current_frame: *mut TrapFrame, force_main: bool) -> *m
     #[cfg(target_os = "uefi")]
     unsafe {
         if next_ttbr0 != 0 {
-            // Switch to user TTBR0_EL1 with ASID, clear TCR_EL1.EPD0 (no global TLBI needed due to ASID tagging)
+            // Switch to user TTBR0_EL1 with ASID, clear TCR_EL1.EPD0
             core::arch::asm!(
                 "msr ttbr0_el1, {0}",
                 "isb",
                 "mrs {1}, tcr_el1",
                 "bic {1}, {1}, #(1 << 7)", // EPD0 = 0
                 "msr tcr_el1, {1}",
+                "isb",
+                "tlbi vmalle1is",
+                "dsb ish",
                 "isb",
                 in(reg) next_ttbr0,
                 out(reg) _,
@@ -333,6 +336,9 @@ pub fn scheduler_tick_opt(current_frame: *mut TrapFrame, force_main: bool) -> *m
                 "mrs {0}, tcr_el1",
                 "orr {0}, {0}, #(1 << 7)", // EPD0 = 1
                 "msr tcr_el1, {0}",
+                "isb",
+                "tlbi vmalle1is",
+                "dsb ish",
                 "isb",
                 out(reg) _,
                 options(nostack)

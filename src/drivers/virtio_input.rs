@@ -539,6 +539,35 @@ pub const MAX_INPUT_DEVICES: usize = 4;
 pub static mut GLOBAL_INPUT_DEVICES: [*mut VirtIOInputDevice; MAX_INPUT_DEVICES] = [core::ptr::null_mut(); MAX_INPUT_DEVICES];
 pub static mut GLOBAL_INPUT_COUNT: usize = 0;
 pub static mut GLOBAL_POINTER_STATE: PointerState = PointerState { x: 400, y: 300, left_button: false, right_button: false, scroll_delta: 0 };
+pub static mut GLOBAL_POINTER_CHANGED: bool = false;
+
+const KEY_BUF_CAP: usize = 64;
+static mut KEY_BUF: [u8; KEY_BUF_CAP] = [0; KEY_BUF_CAP];
+static mut KEY_BUF_HEAD: usize = 0;
+static mut KEY_BUF_TAIL: usize = 0;
+
+static mut CURRENT_SCREEN_W: u32 = 1024;
+static mut CURRENT_SCREEN_H: u32 = 768;
+
+#[inline]
+pub unsafe fn push_key(c: u8) {
+    let next = (KEY_BUF_HEAD + 1) % KEY_BUF_CAP;
+    if next != KEY_BUF_TAIL {
+        KEY_BUF[KEY_BUF_HEAD] = c;
+        KEY_BUF_HEAD = next;
+    }
+}
+
+#[inline]
+pub unsafe fn pop_key() -> Option<u8> {
+    if KEY_BUF_TAIL != KEY_BUF_HEAD {
+        let c = KEY_BUF[KEY_BUF_TAIL];
+        KEY_BUF_TAIL = (KEY_BUF_TAIL + 1) % KEY_BUF_CAP;
+        Some(c)
+    } else {
+        None
+    }
+}
 
 pub unsafe fn register_global_virtio_input(dev: *mut VirtIOInputDevice) {
     let global_ptr = core::ptr::addr_of_mut!(GLOBAL_VIRTIO_INPUT);
@@ -558,43 +587,64 @@ pub unsafe fn register_global_virtio_input(dev: *mut VirtIOInputDevice) {
     }
 }
 
-pub unsafe fn poll_global_virtio_input() -> Option<u8> {
-    let count_ptr = core::ptr::addr_of!(GLOBAL_INPUT_COUNT);
-    let dev_arr_ptr = core::ptr::addr_of!(GLOBAL_INPUT_DEVICES) as *const *mut VirtIOInputDevice;
-    for i in 0..*count_ptr {
-        let dev = *dev_arr_ptr.add(i);
-        if !dev.is_null() {
-            if let Some(key) = (*dev).poll_key() {
-                return Some(key);
+pub unsafe fn drain_all_virtio_input_events(screen_w: u32, screen_h: u32) {
+    if screen_w > 0 && screen_h > 0 {
+        CURRENT_SCREEN_W = screen_w;
+        CURRENT_SCREEN_H = screen_h;
+    }
+    let w = CURRENT_SCREEN_W;
+    let h = CURRENT_SCREEN_H;
+
+    let count = GLOBAL_INPUT_COUNT;
+    let state = &mut *core::ptr::addr_of_mut!(GLOBAL_POINTER_STATE);
+
+    let mut drain_dev = |dev: *mut VirtIOInputDevice| {
+        if dev.is_null() {
+            return;
+        }
+        while let Some(event) = (*dev).poll_event() {
+            if event.type_ == EV_KEY {
+                if event.code == BTN_LEFT || event.code == BTN_RIGHT || event.code == BTN_MIDDLE {
+                    if state.update_event(&event, w, h) {
+                        GLOBAL_POINTER_CHANGED = true;
+                    }
+                } else if event.code == KEY_LEFTSHIFT || event.code == KEY_RIGHTSHIFT {
+                    (*dev).shift_pressed = event.value != 0;
+                } else if event.code < 0x100 && (event.value == 1 || event.value == 2) {
+                    if let Some(c) = ev_key_to_ascii(event.code, (*dev).shift_pressed) {
+                        push_key(c);
+                    }
+                }
+            } else if event.type_ == EV_ABS || event.type_ == EV_REL {
+                if state.update_event(&event, w, h) {
+                    GLOBAL_POINTER_CHANGED = true;
+                }
             }
         }
+    };
+
+    for i in 0..count {
+        drain_dev(GLOBAL_INPUT_DEVICES[i]);
     }
-    let global_ptr = core::ptr::addr_of!(GLOBAL_VIRTIO_INPUT);
-    if let Some(ptr) = *global_ptr {
-        if *count_ptr == 0 {
-            return (*ptr).poll_key();
+    if count == 0 {
+        if let Some(dev) = GLOBAL_VIRTIO_INPUT {
+            drain_dev(dev);
         }
     }
-    None
+}
+
+pub unsafe fn poll_global_virtio_input() -> Option<u8> {
+    drain_all_virtio_input_events(0, 0);
+    pop_key()
 }
 
 pub unsafe fn poll_global_pointer(screen_w: u32, screen_h: u32) -> (PointerState, bool) {
-    let mut any_changed = false;
-    let count_ptr = core::ptr::addr_of!(GLOBAL_INPUT_COUNT);
-    let dev_arr_ptr = core::ptr::addr_of!(GLOBAL_INPUT_DEVICES) as *const *mut VirtIOInputDevice;
-    let state_ptr = core::ptr::addr_of_mut!(GLOBAL_POINTER_STATE);
-
-    for i in 0..*count_ptr {
-        let dev = *dev_arr_ptr.add(i);
-        if !dev.is_null() {
-            if (*dev).poll_pointer(screen_w, screen_h, &mut *state_ptr) {
-                any_changed = true;
-            }
-        }
-    }
-    let res = *state_ptr;
-    (*state_ptr).scroll_delta = 0;
-    (res, any_changed)
+    drain_all_virtio_input_events(screen_w, screen_h);
+    let changed = GLOBAL_POINTER_CHANGED;
+    GLOBAL_POINTER_CHANGED = false;
+    let res = *core::ptr::addr_of!(GLOBAL_POINTER_STATE);
+    GLOBAL_POINTER_STATE.scroll_delta = 0;
+    (res, changed)
 }
 
 #[cfg(test)]
@@ -691,5 +741,75 @@ mod tests {
         assert_eq!(ev_key_to_ascii(KEY_SLASH, false), Some(b'/'));
         assert_eq!(ev_key_to_ascii(KEY_SLASH, true), Some(b'?'));
         assert_eq!(ev_key_to_ascii(KEY_MINUS, true), Some(b'_'));
+    }
+
+    #[test]
+    fn interleaved_ev_abs_and_ev_key_events_never_drop_test() {
+        unsafe {
+            let mut queue_mem = [0u8; 8192];
+            let mut events_mem = [VirtioInputEvent::default(); INPUT_QUEUE_SIZE];
+            let mut mmio_dummy = [0u32; 64];
+
+            let mut dev = VirtIOInputDevice {
+                base_va: mmio_dummy.as_mut_ptr() as u64,
+                version: 1,
+                queue_size: INPUT_QUEUE_SIZE as u16,
+                queue_pa: 0,
+                queue_va: queue_mem.as_mut_ptr() as u64,
+                events_pa: 0,
+                events_va: events_mem.as_mut_ptr() as u64,
+                avail_idx: 0,
+                last_used_idx: 0,
+                shift_pressed: false,
+            };
+
+            // Queue 4 interleaved events:
+            // 0: EV_KEY: 'g' press
+            // 1: EV_ABS: ABS_X = 16383
+            // 2: EV_KEY: 'u' press
+            // 3: EV_ABS: ABS_Y = 16383
+            let ev_ptr = events_mem.as_mut_ptr();
+            core::ptr::write_volatile(ev_ptr.add(0), VirtioInputEvent { type_: EV_KEY, code: KEY_G, value: 1 });
+            core::ptr::write_volatile(ev_ptr.add(1), VirtioInputEvent { type_: EV_ABS, code: ABS_X, value: 16383 });
+            core::ptr::write_volatile(ev_ptr.add(2), VirtioInputEvent { type_: EV_KEY, code: KEY_U, value: 1 });
+            core::ptr::write_volatile(ev_ptr.add(3), VirtioInputEvent { type_: EV_ABS, code: ABS_Y, value: 16383 });
+
+            let used = (dev.queue_va + 4096) as *mut VirtqUsed<INPUT_QUEUE_SIZE>;
+            (*used).ring[0].id = 0;
+            (*used).ring[1].id = 1;
+            (*used).ring[2].id = 2;
+            (*used).ring[3].id = 3;
+            (*used).idx = 4;
+
+            // Reset globals
+            GLOBAL_INPUT_COUNT = 0;
+            GLOBAL_VIRTIO_INPUT = None;
+            KEY_BUF_HEAD = 0;
+            KEY_BUF_TAIL = 0;
+            GLOBAL_POINTER_STATE = PointerState::new(0, 0, false, false);
+            GLOBAL_POINTER_CHANGED = false;
+
+            register_global_virtio_input(&mut dev as *mut VirtIOInputDevice);
+
+            // Poll pointer first: should drain all events, update pointer, and buffer keys
+            let (ptr, changed) = poll_global_pointer(800, 600);
+            assert!(changed);
+            assert_eq!(ptr.x, scale_abs_coordinate(16383, 799));
+            assert_eq!(ptr.y, scale_abs_coordinate(16383, 599));
+
+            // Poll keyboard next: keys 'g' and 'u' should be in the buffer, NOT dropped!
+            let key1 = poll_global_virtio_input();
+            assert_eq!(key1, Some(b'g'));
+
+            let key2 = poll_global_virtio_input();
+            assert_eq!(key2, Some(b'u'));
+
+            let key3 = poll_global_virtio_input();
+            assert_eq!(key3, None);
+
+            // Reset globals
+            GLOBAL_INPUT_COUNT = 0;
+            GLOBAL_VIRTIO_INPUT = None;
+        }
     }
 }

@@ -44,7 +44,6 @@ exec "$QEMU" $ACCEL_OPTS -smp "${QEMU_SMP:-4}" -m 512M \
   -device qemu-xhci,id=xhci \
   -device ich9-ahci,id=ahci0 \
   -device usb-kbd \
-  -device usb-mouse \
   -audiodev none,id=snd0 -device virtio-sound-pci,audiodev=snd0 \
   -serial stdio \
   -monitor unix:build/qemu-monitor.sock,server=on,wait=off \

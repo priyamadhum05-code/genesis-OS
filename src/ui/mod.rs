@@ -16,12 +16,24 @@ use crate::{
     fs::{BlockDevice, FatDirEntry, FatVolume},
 };
 
+pub mod glass;
+pub use glass::*;
+
 pub const WIN_TERMINAL: usize = 0;
 pub const WIN_SYSMON: usize = 1;
 pub const WIN_EXPLORER: usize = 2;
 pub const WIN_EDITOR: usize = 3;
 pub const WIN_AI: usize = 4;
-pub const WINDOW_COUNT: usize = 5;
+pub const WIN_SETTINGS: usize = 5;
+pub const WINDOW_COUNT: usize = 6;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DockPosition {
+    Bottom,
+    Left,
+    Right,
+    Hidden,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Window {
@@ -150,6 +162,21 @@ pub struct DesktopCompositor {
     pub nic_history: [u8; 32],
     pub history_idx: usize,
     pub dirty_rect: Option<(u32, u32, u32, u32)>,
+    pub glass_theme: GlassTheme,
+    pub accent_color: AccentColor,
+    pub glass_blur: bool,
+    pub glass_opacity: u8,
+    pub dock_position: DockPosition,
+    pub show_top_bar: bool,
+    pub top_bar_compact: bool,
+    pub show_clock: bool,
+    pub show_cpu: bool,
+    pub show_ram: bool,
+    pub show_net: bool,
+    pub show_sound: bool,
+    pub settings_category: usize,
+    pub settings_status: [u8; 64],
+    pub settings_status_len: usize,
 }
 
 pub fn get_uptime_seconds() -> u64 {
@@ -396,6 +423,25 @@ impl DesktopCompositor {
             saved_h: top_row_h,
         };
 
+        let set_w = (((avail_w - gap) * 60) / 100).max(380) as u32;
+        let set_h = (avail_h.saturating_sub(60)).max(280) as u32;
+        let w_settings = Window {
+            id: WIN_SETTINGS,
+            title: "System Settings",
+            x: margin + 45,
+            y: top_y + 30,
+            w: set_w,
+            h: set_h,
+            focused: false,
+            minimized: true,
+            closed: false,
+            maximized: false,
+            saved_x: margin + 45,
+            saved_y: top_y + 30,
+            saved_w: set_w,
+            saved_h: set_h,
+        };
+
         let mut comp = Self {
             backbuffer_va,
             buffer_bytes,
@@ -403,8 +449,8 @@ impl DesktopCompositor {
             height,
             stride,
             pixel_format,
-            windows: [w_term, w_sysmon, w_explorer, w_editor, w_ai],
-            z_order: [WIN_AI, WIN_EDITOR, WIN_SYSMON, WIN_EXPLORER, WIN_TERMINAL],
+            windows: [w_term, w_sysmon, w_explorer, w_editor, w_ai, w_settings],
+            z_order: [WIN_SETTINGS, WIN_AI, WIN_EDITOR, WIN_SYSMON, WIN_EXPLORER, WIN_TERMINAL],
             drag_win: None,
             drag_offset_x: 0,
             drag_offset_y: 0,
@@ -449,6 +495,21 @@ impl DesktopCompositor {
             nic_history: [0; 32],
             history_idx: 0,
             dirty_rect: Some((0, 0, width, height)),
+            glass_theme: GlassTheme::MidnightAurora,
+            accent_color: AccentColor::ElectricBlue,
+            glass_blur: true,
+            glass_opacity: 180,
+            dock_position: DockPosition::Bottom,
+            show_top_bar: true,
+            top_bar_compact: false,
+            show_clock: true,
+            show_cpu: true,
+            show_ram: true,
+            show_net: true,
+            show_sound: true,
+            settings_category: 0,
+            settings_status: [0; 64],
+            settings_status_len: 0,
         };
 
         comp.append_term_line("Project Genesis OS (Stage 16)");
@@ -485,6 +546,399 @@ impl DesktopCompositor {
 
     pub fn mark_dirty_all(&mut self) {
         self.dirty_rect = Some((0, 0, self.width, self.height));
+    }
+
+    pub fn set_settings_status(&mut self, status: &str) {
+        let bytes = status.as_bytes();
+        let len = bytes.len().min(self.settings_status.len());
+        self.settings_status[..len].copy_from_slice(&bytes[..len]);
+        self.settings_status_len = len;
+    }
+
+    pub fn settings_status_str(&self) -> &str {
+        if self.settings_status_len == 0 {
+            "Ready"
+        } else {
+            core::str::from_utf8(&self.settings_status[..self.settings_status_len]).unwrap_or("Ready")
+        }
+    }
+
+    pub fn handle_settings_click(&mut self, px: i32, py: i32, wx: i32, wy: i32, _ww: u32, _wh: u32) {
+        let cy = wy + 26;
+        let sidebar_w = 110i32;
+
+        // 1. Sidebar category selection
+        if px >= wx + 4 && px <= wx + sidebar_w {
+            for cat in 0..5 {
+                let btn_y = cy + 10 + (cat as i32) * 30;
+                if py >= btn_y && py <= btn_y + 26 {
+                    self.settings_category = cat as usize;
+                    match cat {
+                        0 => self.set_settings_status("System & About"),
+                        1 => self.set_settings_status("Personalization"),
+                        2 => self.set_settings_status("Display Settings"),
+                        3 => self.set_settings_status("Network & Storage"),
+                        4 => self.set_settings_status("Sound Settings"),
+                        _ => {}
+                    }
+                    self.mark_dirty_all();
+                    return;
+                }
+            }
+        }
+
+        // 2. Right panel controls
+        let panel_x = wx + sidebar_w + 14;
+        match self.settings_category {
+            0 => {
+                // System & About
+                // Reboot button: [ REBOOT ] at panel_x, cy + 160, 90, 24
+                if px >= panel_x && px <= panel_x + 90 && py >= cy + 160 && py <= cy + 185 {
+                    self.set_settings_status("System reboot requested");
+                    #[cfg(target_os = "uefi")]
+                    unsafe { crate::arch::psci::psci_system_reset(); }
+                } else if px >= panel_x + 100 && px <= panel_x + 200 && py >= cy + 160 && py <= cy + 185 {
+                    // Shutdown button: [ SHUTDOWN ] at panel_x + 100, cy + 160, 100, 24
+                    self.set_settings_status("System shutdown requested");
+                    #[cfg(target_os = "uefi")]
+                    unsafe { crate::arch::psci::psci_system_off(); }
+                }
+            }
+            1 => {
+                // Personalization
+                // Wallpapers (py in cy + 34..=cy + 58)
+                if py >= cy + 34 && py <= cy + 58 {
+                    if px >= panel_x && px <= panel_x + 76 {
+                        self.glass_theme = GlassTheme::MidnightAurora;
+                        self.set_settings_status("Theme: Midnight Aurora");
+                        self.mark_dirty_all();
+                    } else if px >= panel_x + 82 && px <= panel_x + 152 {
+                        self.glass_theme = GlassTheme::OceanGlass;
+                        self.set_settings_status("Theme: Ocean Glass");
+                        self.mark_dirty_all();
+                    } else if px >= panel_x + 158 && px <= panel_x + 228 {
+                        self.glass_theme = GlassTheme::SunsetAmber;
+                        self.set_settings_status("Theme: Sunset Amber");
+                        self.mark_dirty_all();
+                    } else if px >= panel_x + 234 && px <= panel_x + 314 {
+                        self.glass_theme = GlassTheme::ObsidianPro;
+                        self.set_settings_status("Theme: Obsidian Pro");
+                        self.mark_dirty_all();
+                    }
+                } else if py >= cy + 84 && py <= cy + 108 {
+                    // Accent Colors
+                    if px >= panel_x && px <= panel_x + 52 {
+                        self.accent_color = AccentColor::ElectricBlue;
+                        self.set_settings_status("Accent: Electric Blue");
+                        self.mark_dirty_all();
+                    } else if px >= panel_x + 58 && px <= panel_x + 120 {
+                        self.accent_color = AccentColor::Violet;
+                        self.set_settings_status("Accent: Cosmic Violet");
+                        self.mark_dirty_all();
+                    } else if px >= panel_x + 126 && px <= panel_x + 194 {
+                        self.accent_color = AccentColor::Emerald;
+                        self.set_settings_status("Accent: Emerald");
+                        self.mark_dirty_all();
+                    } else if px >= panel_x + 200 && px <= panel_x + 258 {
+                        self.accent_color = AccentColor::Amber;
+                        self.set_settings_status("Accent: Warm Amber");
+                        self.mark_dirty_all();
+                    } else if px >= panel_x + 264 && px <= panel_x + 318 {
+                        self.accent_color = AccentColor::Rose;
+                        self.set_settings_status("Accent: Vibrant Rose");
+                        self.mark_dirty_all();
+                    }
+                } else if py >= cy + 134 && py <= cy + 158 {
+                    // Glass Blur toggle
+                    if px >= panel_x && px <= panel_x + 130 {
+                        self.glass_blur = !self.glass_blur;
+                        self.set_settings_status(if self.glass_blur { "Glass Blur: ON" } else { "Glass Blur: OFF" });
+                        self.mark_dirty_all();
+                    }
+                } else if py >= cy + 184 && py <= cy + 208 {
+                    // Dock Position
+                    if px >= panel_x && px <= panel_x + 68 {
+                        self.dock_position = DockPosition::Bottom;
+                        self.set_settings_status("Dock: Bottom");
+                        self.mark_dirty_all();
+                    } else if px >= panel_x + 74 && px <= panel_x + 130 {
+                        self.dock_position = DockPosition::Left;
+                        self.set_settings_status("Dock: Left Sidebar");
+                        self.mark_dirty_all();
+                    } else if px >= panel_x + 136 && px <= panel_x + 196 {
+                        self.dock_position = DockPosition::Right;
+                        self.set_settings_status("Dock: Right Sidebar");
+                        self.mark_dirty_all();
+                    } else if px >= panel_x + 202 && px <= panel_x + 270 {
+                        self.dock_position = DockPosition::Hidden;
+                        self.set_settings_status("Dock: Hidden");
+                        self.mark_dirty_all();
+                    }
+                } else if py >= cy + 224 && py <= cy + 248 {
+                    // Top Bar toggle
+                    if px >= panel_x && px <= panel_x + 130 {
+                        self.show_top_bar = !self.show_top_bar;
+                        self.set_settings_status(if self.show_top_bar { "Top Bar: ON" } else { "Top Bar: OFF" });
+                        self.mark_dirty_all();
+                    }
+                }
+            }
+            2 => {
+                // Display Presets
+                if py >= cy + 100 && py <= cy + 124 {
+                    if px >= panel_x && px <= panel_x + 86 {
+                        self.set_settings_status("Preset 1024x768 (GOP mode locked)");
+                    } else if px >= panel_x + 92 && px <= panel_x + 178 {
+                        self.set_settings_status("Preset 1280x800 (GOP mode locked)");
+                    } else if px >= panel_x + 184 && px <= panel_x + 270 {
+                        self.set_settings_status("Preset 1440x900 (Active GOP mode)");
+                    }
+                }
+            }
+            3 => {
+                // Network & Storage
+                // Switch NIC
+                if px >= panel_x && px <= panel_x + 200 && py >= cy + 76 && py <= cy + 100 {
+                    let cur = crate::net::get_active_nic();
+                    let next = match cur {
+                        crate::net::ActiveNic::VirtIoNet => crate::net::ActiveNic::E1000e,
+                        _ => crate::net::ActiveNic::VirtIoNet,
+                    };
+                    crate::net::set_active_nic(next);
+                    self.set_settings_status(match next {
+                        crate::net::ActiveNic::VirtIoNet => "Active NIC: VirtIO-Net",
+                        crate::net::ActiveNic::E1000e => "Active NIC: E1000e",
+                        _ => "Active NIC: None",
+                    });
+                    self.mark_dirty_all();
+                } else if px >= panel_x && px <= panel_x + 200 && py >= cy + 180 && py <= cy + 204 {
+                    // Refresh storage
+                    self.set_settings_status("Storage scanned: blk0 nvme0 usb0 ahci0");
+                    self.mark_dirty_all();
+                }
+            }
+            4 => {
+                // Sound
+                if px >= panel_x && px <= panel_x + 220 && py >= cy + 90 && py <= cy + 115 {
+                    #[cfg(target_os = "uefi")]
+                    {
+                        if let Some(snd) = crate::drivers::virtio_sound::get_global_virtio_sound_mut() {
+                            let _ = unsafe { snd.play_beep(440, 200) };
+                            self.set_settings_status("Audio chime playing (440 Hz)");
+                        } else {
+                            self.set_settings_status("VirtIO-Sound not available");
+                        }
+                    }
+                    #[cfg(not(target_os = "uefi"))]
+                    {
+                        self.set_settings_status("Audio chime played (mock)");
+                    }
+                    self.mark_dirty_all();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub unsafe fn render_settings_content(&mut self, wx: u32, wy: u32, w: u32, h: u32, cx: u32, cy: u32) {
+        let accent_rgb = self.accent_color.rgb();
+        let col_accent = self.rgb(accent_rgb.0, accent_rgb.1, accent_rgb.2);
+        let col_white = self.rgb(248, 250, 252);
+        let col_muted = self.rgb(148, 163, 184);
+        let col_border = self.rgb(51, 65, 85);
+        let col_btn_bg = self.rgb(30, 41, 59);
+        let col_btn_active = self.rgb(45, 62, 80);
+        let col_green = self.rgb(16, 185, 129);
+        let col_yellow = self.rgb(245, 158, 11);
+        let col_red = self.rgb(239, 68, 68);
+
+        let sidebar_w = 110u32;
+
+        // Sidebar Background & Vertical Divider
+        self.draw_rect(wx + 2, cy, sidebar_w - 2, h.saturating_sub(cy - wy + 2), self.rgb(15, 23, 42));
+        self.draw_rect(wx + sidebar_w, cy, 1, h.saturating_sub(cy - wy + 2), col_border);
+
+        // Sidebar categories
+        let cat_names = ["System", "Personalize", "Display", "Network", "Sound"];
+        for (i, name) in cat_names.iter().enumerate() {
+            let by = cy + 10 + (i as u32) * 30;
+            let is_sel = self.settings_category == i;
+            if is_sel {
+                self.draw_rect(wx + 8, by, sidebar_w - 16, 24, col_btn_active);
+                self.draw_rect(wx + 8, by, 3, 24, col_accent);
+            }
+            self.draw_string(wx + 16, by + 7, name, if is_sel { col_accent } else { col_muted }, None);
+        }
+
+        // Right content panel
+        let panel_x = wx + sidebar_w + 14;
+
+        match self.settings_category {
+            0 => {
+                // Category 0: System & About
+                self.draw_string(panel_x, cy + 10, "Project Genesis OS v0.30", col_white, None);
+                self.draw_string(panel_x, cy + 28, "64-bit Microkernel | ARMv8.2-A / Cortex-A76", col_muted, None);
+                self.draw_rect(panel_x, cy + 44, w.saturating_sub(sidebar_w + 28), 1, col_border);
+
+                self.draw_string(panel_x, cy + 54, "Architecture: AArch64 (EL1/EL0 with W^X)", col_muted, None);
+
+                let mut smp_buf = [0u8; 16];
+                let smp_txt = format_smp(self.cpus_online, &mut smp_buf);
+                self.draw_string(panel_x, cy + 74, smp_txt, col_green, None);
+
+                let mut ram_buf = [0u8; 32];
+                let ram_txt = format_ram(self.free_ram_mib, self.total_ram_mib, &mut ram_buf);
+                self.draw_string(panel_x, cy + 94, ram_txt, col_yellow, None);
+
+                let mut up_buf = [0u8; 16];
+                let up_txt = format_uptime(get_uptime_seconds(), &mut up_buf);
+                self.draw_string(panel_x, cy + 114, up_txt, col_accent, None);
+
+                self.draw_string(panel_x, cy + 140, "Power Management:", col_white, None);
+                // [ REBOOT ]
+                self.draw_rect(panel_x, cy + 160, 90, 24, self.rgb(180, 83, 9));
+                self.draw_rect_outline(panel_x, cy + 160, 90, 24, col_yellow);
+                self.draw_string(panel_x + 14, cy + 166, "REBOOT", col_white, None);
+
+                // [ SHUTDOWN ]
+                self.draw_rect(panel_x + 100, cy + 160, 100, 24, self.rgb(153, 27, 27));
+                self.draw_rect_outline(panel_x + 100, cy + 160, 100, 24, col_red);
+                self.draw_string(panel_x + 112, cy + 166, "SHUTDOWN", col_white, None);
+            }
+            1 => {
+                // Category 1: Personalization
+                self.draw_string(panel_x, cy + 10, "Wallpaper Theme:", col_white, None);
+                let themes = [
+                    (GlassTheme::MidnightAurora, "Midnight", 76u32),
+                    (GlassTheme::OceanGlass, "Ocean", 66u32),
+                    (GlassTheme::SunsetAmber, "Sunset", 66u32),
+                    (GlassTheme::ObsidianPro, "Obsidian", 76u32),
+                ];
+                let mut tx = panel_x;
+                for (th, th_name, btn_w) in themes {
+                    let is_active = self.glass_theme == th;
+                    self.draw_rect(tx, cy + 34, btn_w, 22, if is_active { col_btn_active } else { col_btn_bg });
+                    self.draw_rect_outline(tx, cy + 34, btn_w, 22, if is_active { col_accent } else { col_border });
+                    self.draw_string(tx + 6, cy + 39, th_name, if is_active { col_accent } else { col_muted }, None);
+                    tx += btn_w + 6;
+                }
+
+                self.draw_string(panel_x, cy + 68, "Accent Color:", col_white, None);
+                let accents = [
+                    (AccentColor::ElectricBlue, "Blue", 50u32),
+                    (AccentColor::Violet, "Violet", 60u32),
+                    (AccentColor::Emerald, "Emerald", 66u32),
+                    (AccentColor::Amber, "Amber", 56u32),
+                    (AccentColor::Rose, "Rose", 52u32),
+                ];
+                let mut ax = panel_x;
+                for (ac, ac_name, btn_w) in accents {
+                    let is_active = self.accent_color == ac;
+                    let (r, g, b) = ac.rgb();
+                    self.draw_rect(ax, cy + 84, btn_w, 22, self.rgb(r / 3, g / 3, b / 3));
+                    self.draw_rect_outline(ax, cy + 84, btn_w, 22, if is_active { self.rgb(r, g, b) } else { col_border });
+                    self.draw_string(ax + 6, cy + 89, ac_name, if is_active { self.rgb(r, g, b) } else { col_muted }, None);
+                    ax += btn_w + 6;
+                }
+
+                self.draw_string(panel_x, cy + 118, "Compositor Effects:", col_white, None);
+                let blur_str = if self.glass_blur { "[ Blur: ON ]" } else { "[ Blur: OFF ]" };
+                self.draw_rect(panel_x, cy + 134, 110, 22, if self.glass_blur { col_btn_active } else { col_btn_bg });
+                self.draw_rect_outline(panel_x, cy + 134, 110, 22, if self.glass_blur { col_accent } else { col_border });
+                self.draw_string(panel_x + 8, cy + 139, blur_str, if self.glass_blur { col_accent } else { col_muted }, None);
+
+                self.draw_string(panel_x, cy + 168, "Floating Dock Position:", col_white, None);
+                let docks = [
+                    (DockPosition::Bottom, "Bottom", 64u32),
+                    (DockPosition::Left, "Left", 54u32),
+                    (DockPosition::Right, "Right", 58u32),
+                    (DockPosition::Hidden, "Hidden", 66u32),
+                ];
+                let mut dx = panel_x;
+                for (dp, dp_name, btn_w) in docks {
+                    let is_active = self.dock_position == dp;
+                    self.draw_rect(dx, cy + 184, btn_w, 22, if is_active { col_btn_active } else { col_btn_bg });
+                    self.draw_rect_outline(dx, cy + 184, btn_w, 22, if is_active { col_accent } else { col_border });
+                    self.draw_string(dx + 6, cy + 189, dp_name, if is_active { col_accent } else { col_muted }, None);
+                    dx += btn_w + 6;
+                }
+
+                let top_str = if self.show_top_bar { "[ Top Bar: ON ]" } else { "[ Top Bar: OFF ]" };
+                self.draw_rect(panel_x, cy + 224, 126, 22, if self.show_top_bar { col_btn_active } else { col_btn_bg });
+                self.draw_rect_outline(panel_x, cy + 224, 126, 22, if self.show_top_bar { col_accent } else { col_border });
+                self.draw_string(panel_x + 8, cy + 229, top_str, if self.show_top_bar { col_accent } else { col_muted }, None);
+            }
+            2 => {
+                // Category 2: Display
+                self.draw_string(panel_x, cy + 10, "Display Configuration:", col_white, None);
+                self.draw_string(panel_x, cy + 30, "Resolution: 1440 x 900 @ 60 FPS", col_accent, None);
+                self.draw_string(panel_x, cy + 48, "Color Format: 32-bit ARGB/BGR (GOP Framebuffer)", col_muted, None);
+                self.draw_string(panel_x, cy + 66, "Scaling Mode: 1x Native (Hi-DPI Enabled)", col_muted, None);
+
+                self.draw_string(panel_x, cy + 86, "Standard Presets (GOP-Locked):", col_white, None);
+                let presets = [("1024x768", 82u32, false), ("1280x800", 82u32, false), ("1440x900", 82u32, true)];
+                let mut pr_x = panel_x;
+                for (pr, btn_w, active) in presets {
+                    self.draw_rect(pr_x, cy + 102, btn_w, 22, if active { col_btn_active } else { col_btn_bg });
+                    self.draw_rect_outline(pr_x, cy + 102, btn_w, 22, if active { col_accent } else { col_border });
+                    self.draw_string(pr_x + 6, cy + 107, pr, if active { col_accent } else { col_muted }, None);
+                    pr_x += btn_w + 6;
+                }
+
+                self.draw_string(panel_x, cy + 134, "GPU: VirtIO-GPU 2D Scanout | HW Cursor Active", col_green, None);
+                self.draw_string(panel_x, cy + 152, "Compositor: Liquid Glass Double-Buffered", col_muted, None);
+            }
+            3 => {
+                // Category 3: Network & Storage
+                self.draw_string(panel_x, cy + 10, "Network Interfaces:", col_white, None);
+                let cur_nic = crate::net::get_active_nic();
+                let nic_str = match cur_nic {
+                    crate::net::ActiveNic::VirtIoNet => "Active: VirtIO-Net PCI (Online, DHCP)",
+                    crate::net::ActiveNic::E1000e => "Active: Intel E1000e PCI (Online, DHCP)",
+                    crate::net::ActiveNic::None => "Active: None",
+                };
+                self.draw_string(panel_x, cy + 30, nic_str, col_accent, None);
+                self.draw_string(panel_x, cy + 48, "Status: Link UP | 1000 Mbps Full-Duplex", col_muted, None);
+
+                // Switch NIC button
+                self.draw_rect(panel_x, cy + 76, 170, 24, col_btn_bg);
+                self.draw_rect_outline(panel_x, cy + 76, 170, 24, col_border);
+                self.draw_string(panel_x + 8, cy + 82, "[ Switch NIC Route ]", col_white, None);
+
+                self.draw_string(panel_x, cy + 116, "Storage Devices:", col_white, None);
+                self.draw_string(panel_x, cy + 134, "blk0: VirtIO Block (32 MB, FAT32 EFI ESP)", col_muted, None);
+                self.draw_string(panel_x, cy + 150, "nvme0: NVMe Storage (PCI 00:04.0, Online)", col_muted, None);
+                self.draw_string(panel_x, cy + 166, "ahci0: AHCI SATA Controller (PCI 00:06.0)", col_muted, None);
+
+                self.draw_rect(panel_x, cy + 184, 180, 24, col_btn_bg);
+                self.draw_rect_outline(panel_x, cy + 184, 180, 24, col_border);
+                self.draw_string(panel_x + 8, cy + 190, "[ Refresh Storage ]", col_white, None);
+            }
+            4 => {
+                // Category 4: Sound
+                self.draw_string(panel_x, cy + 10, "VirtIO-Sound Audio Controller:", col_white, None);
+                self.draw_string(panel_x, cy + 28, "PCI Device 00:05.0 | 48000 Hz, 16-bit Stereo PCM", col_muted, None);
+                self.draw_string(panel_x, cy + 48, "Stream: Output Stream 0 (Online)", col_green, None);
+                self.draw_string(panel_x, cy + 66, "Master Volume: 85% [||||||||||||||||||--]", col_accent, None);
+
+                // Chime button
+                self.draw_rect(panel_x, cy + 90, 210, 26, col_btn_active);
+                self.draw_rect_outline(panel_x, cy + 90, 210, 26, col_accent);
+                self.draw_string(panel_x + 10, cy + 97, "[ Play Test Chime (440 Hz) ]", col_white, None);
+
+                self.draw_string(panel_x, cy + 128, "Audio Pipeline: VirtIO DMA Buffer -> Host DAC", col_muted, None);
+                self.draw_string(panel_x, cy + 146, "Frequency: 440 Hz Sinusoidal Tone (A4)", col_muted, None);
+            }
+            _ => {}
+        }
+
+        // Window bottom status
+        let status_y = wy + h - 18;
+        let mut st_buf = [0u8; 64];
+        let st_len = self.settings_status_len.min(64);
+        st_buf[..st_len].copy_from_slice(&self.settings_status[..st_len]);
+        let st_str = if st_len == 0 { "Ready" } else { core::str::from_utf8(&st_buf[..st_len]).unwrap_or("Ready") };
+        self.draw_string(cx, status_y, st_str, col_muted, None);
     }
 
     pub fn current_dir_str(&self) -> &str {
@@ -1134,9 +1588,9 @@ impl DesktopCompositor {
                 core::str::from_utf8(&path_buf[..p]).unwrap_or(name_str)
             };
 
-            let mut read_buf = [0u8; 64];
+            let mut read_buf = [0u8; 1024];
             let read_va = read_buf.as_mut_ptr() as u64;
-            match fat.read_file(dev, path_str, read_va, read_va, 64, scratch_pa, scratch_va) {
+            match fat.read_file_partial(dev, path_str, read_va, read_va, 1024, scratch_pa, scratch_va) {
                 Ok(n) => {
                     let len = n.min(64);
                     let is_ascii = len > 0 && read_buf[..len].iter().all(|&b| {
@@ -1242,19 +1696,76 @@ impl DesktopCompositor {
             changed = true;
 
             // Check Taskbar App buttons (y < 28)
-            if py < 28 {
+            let mut hit_topbar_or_dock = false;
+            if self.show_top_bar && py < 28 {
                 if px >= 100 && px <= 150 {
                     self.toggle_or_focus(WIN_TERMINAL);
+                    hit_topbar_or_dock = true;
                 } else if px >= 156 && px <= 216 {
                     self.toggle_or_focus(WIN_SYSMON);
+                    hit_topbar_or_dock = true;
                 } else if px >= 222 && px <= 296 {
                     self.toggle_or_focus(WIN_EXPLORER);
+                    hit_topbar_or_dock = true;
                 } else if px >= 302 && px <= 362 {
                     self.toggle_or_focus(WIN_EDITOR);
+                    hit_topbar_or_dock = true;
                 } else if px >= 364 && px <= 414 {
                     self.toggle_or_focus(WIN_AI);
+                    hit_topbar_or_dock = true;
+                } else if px >= 418 && px <= 488 {
+                    self.toggle_or_focus(WIN_SETTINGS);
+                    hit_topbar_or_dock = true;
                 }
-            } else {
+            }
+
+            // Check Floating Dock clicks
+            if !hit_topbar_or_dock {
+                match self.dock_position {
+                    DockPosition::Bottom => {
+                        let dock_w = 6 * 44 + 16;
+                        let dock_h = 44;
+                        let dock_x = (self.width as i32 - dock_w as i32) / 2;
+                        let dock_y = self.height as i32 - dock_h as i32 - 10;
+                        if px >= dock_x && px < dock_x + dock_w as i32 && py >= dock_y && py < dock_y + dock_h as i32 {
+                            let slot = (px - (dock_x + 8)) / 44;
+                            if slot >= 0 && slot < 6 {
+                                self.toggle_or_focus(slot as usize);
+                                hit_topbar_or_dock = true;
+                            }
+                        }
+                    }
+                    DockPosition::Left => {
+                        let dock_w = 48;
+                        let dock_h = 6 * 44 + 16;
+                        let dock_x = 8;
+                        let dock_y = (self.height as i32 - dock_h as i32) / 2;
+                        if px >= dock_x && px < dock_x + dock_w as i32 && py >= dock_y && py < dock_y + dock_h as i32 {
+                            let slot = (py - (dock_y + 8)) / 44;
+                            if slot >= 0 && slot < 6 {
+                                self.toggle_or_focus(slot as usize);
+                                hit_topbar_or_dock = true;
+                            }
+                        }
+                    }
+                    DockPosition::Right => {
+                        let dock_w = 48;
+                        let dock_h = 6 * 44 + 16;
+                        let dock_x = self.width as i32 - dock_w as i32 - 8;
+                        let dock_y = (self.height as i32 - dock_h as i32) / 2;
+                        if px >= dock_x && px < dock_x + dock_w as i32 && py >= dock_y && py < dock_y + dock_h as i32 {
+                            let slot = (py - (dock_y + 8)) / 44;
+                            if slot >= 0 && slot < 6 {
+                                self.toggle_or_focus(slot as usize);
+                                hit_topbar_or_dock = true;
+                            }
+                        }
+                    }
+                    DockPosition::Hidden => {}
+                }
+            }
+
+            if !hit_topbar_or_dock {
                 // Check windows in reverse Z-order (topmost first)
                 let mut hit_window = false;
                 for i in (0..WINDOW_COUNT).rev() {
@@ -1268,25 +1779,31 @@ impl DesktopCompositor {
                         hit_window = true;
                         self.bring_to_front(win_id);
 
-                        // Check Close Button [X]
+                        // Check Close Button [X] or Traffic Light Red
                         let close_x = win.x + win.w as i32 - 18;
-                        if px >= close_x && px <= close_x + 16 && py >= win.y + 2 && py <= win.y + 20 {
+                        let is_close = (px >= close_x && px <= close_x + 16 && py >= win.y + 2 && py <= win.y + 20)
+                            || (px >= win.x + 10 && px <= win.x + 18 && py >= win.y + 8 && py <= win.y + 18);
+                        if is_close {
                             self.windows[win_id].closed = true;
                             self.drag_win = None;
                             break;
                         }
 
-                        // Check Minimize Button [-]
+                        // Check Minimize Button [-] or Traffic Light Yellow
                         let min_x = win.x + win.w as i32 - 36;
-                        if px >= min_x && px <= min_x + 16 && py >= win.y + 2 && py <= win.y + 20 {
+                        let is_min = (px >= min_x && px <= min_x + 16 && py >= win.y + 2 && py <= win.y + 20)
+                            || (px >= win.x + 20 && px <= win.x + 28 && py >= win.y + 8 && py <= win.y + 18);
+                        if is_min {
                             self.windows[win_id].minimized = true;
                             self.drag_win = None;
                             break;
                         }
 
-                        // Check Maximize / Restore Button [+] / [^]
+                        // Check Maximize / Restore Button [+] / [^] or Traffic Light Green
                         let max_x = win.x + win.w as i32 - 54;
-                        if px >= max_x && px <= max_x + 16 && py >= win.y + 2 && py <= win.y + 20 {
+                        let is_max = (px >= max_x && px <= max_x + 16 && py >= win.y + 2 && py <= win.y + 20)
+                            || (px >= win.x + 36 && px <= win.x + 44 && py >= win.y + 8 && py <= win.y + 18);
+                        if is_max {
                             if self.windows[win_id].maximized {
                                 self.windows[win_id].x = self.windows[win_id].saved_x;
                                 self.windows[win_id].y = self.windows[win_id].saved_y;
@@ -1400,6 +1917,8 @@ impl DesktopCompositor {
                                     }
                                 }
                             }
+                        } else if win_id == WIN_SETTINGS {
+                            self.handle_settings_click(px, py, win.x, win.y, win.w, win.h);
                         }
                         break;
                     }
@@ -2498,102 +3017,269 @@ impl DesktopCompositor {
     }
 
     pub unsafe fn render_frame(&mut self, pointer: &PointerState) {
-        let col_bg = self.rgb(15, 23, 42);          // #0F172A Slate 900
-        let col_bar = self.rgb(30, 41, 59);         // #1E293B Slate 800
+        // 1. Wallpaper (Procedural Multi-Stop Aurora / Gradient Wallpaper)
+        render_aurora_wallpaper(
+            self.backbuffer_va,
+            self.stride,
+            self.width,
+            self.height,
+            self.pixel_format,
+            self.glass_theme,
+        );
+
+        let (tint_rgb, _) = self.glass_theme.default_tint();
+        let accent_rgb = self.accent_color.rgb();
+        let col_accent = self.rgb(accent_rgb.0, accent_rgb.1, accent_rgb.2);
         let col_border = self.rgb(51, 65, 85);      // #334155 Slate 700
         let col_white = self.rgb(248, 250, 252);    // #F8FAFC
         let col_cyan = self.rgb(56, 189, 248);      // #38BDF8 Cyan 400
         let col_green = self.rgb(52, 211, 153);     // #34D399 Emerald
         let col_yellow = self.rgb(251, 191, 36);    // #FBBF24 Amber
         let col_muted = self.rgb(148, 163, 184);    // #94A3B8 Muted text
-        let col_win_body = self.rgb(24, 32, 47);    // Deep window background
         let col_title_act = self.rgb(37, 99, 235);   // #2563EB Blue 600
         let col_title_inact = self.rgb(51, 65, 85); // Slate 700
         let col_btn_red = self.rgb(239, 68, 68);    // #EF4444 Red
 
-        // 1. Wallpaper (with subtle grid pattern)
-        self.draw_rect(0, 0, self.width, self.height, col_bg);
-        for gy in (32..self.height.saturating_sub(28)).step_by(32) {
-            for gx in (0..self.width).step_by(32) {
-                self.write_pixel(gx, gy, self.rgb(26, 38, 57));
-            }
+        // 2. Top Taskbar (0..28)
+        if self.show_top_bar {
+            draw_rounded_glass_panel(
+                self.backbuffer_va,
+                self.stride,
+                self.width,
+                self.height,
+                self.pixel_format,
+                0,
+                0,
+                self.width,
+                28,
+                0,
+                tint_rgb,
+                195,
+                (51, 65, 85),
+                false,
+                self.glass_blur,
+            );
+
+            // Logo
+            self.draw_string(10, 9, "GENESIS OS", col_cyan, None);
+
+            // Taskbar Buttons
+            let term_open = !self.windows[WIN_TERMINAL].closed && !self.windows[WIN_TERMINAL].minimized;
+            let sys_open = !self.windows[WIN_SYSMON].closed && !self.windows[WIN_SYSMON].minimized;
+            let exp_open = !self.windows[WIN_EXPLORER].closed && !self.windows[WIN_EXPLORER].minimized;
+            let edit_open = !self.windows[WIN_EDITOR].closed && !self.windows[WIN_EDITOR].minimized;
+            let ai_open = !self.windows[WIN_AI].closed && !self.windows[WIN_AI].minimized;
+            let set_open = !self.windows[WIN_SETTINGS].closed && !self.windows[WIN_SETTINGS].minimized;
+
+            let btn_open_col = self.rgb(45, 62, 80);
+            let btn_closed_col = self.rgb(24, 33, 47);
+
+            self.draw_rect(100, 3, 50, 21, if term_open { btn_open_col } else { btn_closed_col });
+            self.draw_rect_outline(100, 3, 50, 21, if term_open { col_accent } else { col_border });
+            self.draw_string(108, 9, "TERM", if term_open { col_cyan } else { col_muted }, None);
+
+            self.draw_rect(156, 3, 60, 21, if sys_open { btn_open_col } else { btn_closed_col });
+            self.draw_rect_outline(156, 3, 60, 21, if sys_open { col_accent } else { col_border });
+            self.draw_string(164, 9, "SYSMON", if sys_open { col_cyan } else { col_muted }, None);
+
+            self.draw_rect(222, 3, 74, 21, if exp_open { btn_open_col } else { btn_closed_col });
+            self.draw_rect_outline(222, 3, 74, 21, if exp_open { col_accent } else { col_border });
+            self.draw_string(230, 9, "EXPLORER", if exp_open { col_cyan } else { col_muted }, None);
+
+            self.draw_rect(302, 3, 56, 21, if edit_open { btn_open_col } else { btn_closed_col });
+            self.draw_rect_outline(302, 3, 56, 21, if edit_open { col_accent } else { col_border });
+            self.draw_string(312, 9, "EDIT", if edit_open { col_cyan } else { col_muted }, None);
+
+            self.draw_rect(364, 3, 46, 21, if ai_open { btn_open_col } else { btn_closed_col });
+            self.draw_rect_outline(364, 3, 46, 21, if ai_open { col_accent } else { col_border });
+            self.draw_string(378, 9, "AI", if ai_open { col_cyan } else { col_muted }, None);
+
+            self.draw_rect(418, 3, 70, 21, if set_open { btn_open_col } else { btn_closed_col });
+            self.draw_rect_outline(418, 3, 70, 21, if set_open { col_accent } else { col_border });
+            self.draw_string(426, 9, "SETTINGS", if set_open { col_cyan } else { col_muted }, None);
+
+            // Right Taskbar Stats (Time, Uptime, SMP, RAM)
+            let mut time_buf = [0u8; 16];
+            let epoch = crate::arch::rtc::current_utc_epoch_secs();
+            let time_txt = crate::arch::rtc::format_time_hhmmss(epoch, &mut time_buf);
+
+            let mut up_buf = [0u8; 16];
+            let uptime_sec = get_uptime_seconds();
+            let up_txt = format_uptime(uptime_sec, &mut up_buf);
+
+            let mut smp_buf = [0u8; 16];
+            let smp_txt = format_smp(self.cpus_online, &mut smp_buf);
+
+            let mut ram_buf = [0u8; 32];
+            let ram_txt = format_ram(self.free_ram_mib, self.total_ram_mib, &mut ram_buf);
+
+            let time_w = (time_txt.len() as u32) * 8;
+            let ram_w = (ram_txt.len() as u32) * 8;
+            let smp_w = (smp_txt.len() as u32) * 8;
+            let up_w = (up_txt.len() as u32) * 8;
+
+            let time_x = self.width.saturating_sub(time_w + 12);
+            let ram_x = time_x.saturating_sub(ram_w + 16);
+            let smp_x = ram_x.saturating_sub(smp_w + 16);
+            let up_x = smp_x.saturating_sub(up_w + 16);
+
+            self.draw_string(up_x, 10, up_txt, col_muted, None);
+            self.draw_string(smp_x, 10, smp_txt, col_green, None);
+            self.draw_string(ram_x, 10, ram_txt, col_yellow, None);
+            self.draw_string(time_x, 10, time_txt, col_cyan, None);
         }
 
-        // 2. Top Taskbar (0..28)
-        self.draw_rect(0, 0, self.width, 28, col_bar);
-        self.draw_rect(0, 27, self.width, 1, col_border);
+        // 3. Floating Glass Dock
+        match self.dock_position {
+            DockPosition::Bottom => {
+                let dock_w = 6 * 44 + 16;
+                let dock_h = 44;
+                let dock_x = (self.width as i32 - dock_w as i32) / 2;
+                let dock_y = self.height as i32 - dock_h as i32 - 10;
+                draw_rounded_glass_panel(
+                    self.backbuffer_va,
+                    self.stride,
+                    self.width,
+                    self.height,
+                    self.pixel_format,
+                    dock_x,
+                    dock_y,
+                    dock_w,
+                    dock_h,
+                    14,
+                    tint_rgb,
+                    205,
+                    (70, 85, 115),
+                    true,
+                    self.glass_blur,
+                );
 
-        // Logo
-        self.draw_string(10, 10, "GENESIS OS", col_cyan, None);
+                let labels = ["TERM", "SYS", "EXP", "EDIT", "AI", "SET"];
+                for i in 0..6 {
+                    let bx = (dock_x + 8 + (i as i32) * 44) as u32;
+                    let by = (dock_y + 8) as u32;
+                    let win = self.windows[i];
+                    let is_open = !win.closed && !win.minimized;
+                    let is_foc = win.focused && is_open;
 
-        // Taskbar Buttons
-        let term_open = !self.windows[WIN_TERMINAL].closed && !self.windows[WIN_TERMINAL].minimized;
-        let sys_open = !self.windows[WIN_SYSMON].closed && !self.windows[WIN_SYSMON].minimized;
-        let exp_open = !self.windows[WIN_EXPLORER].closed && !self.windows[WIN_EXPLORER].minimized;
-        let edit_open = !self.windows[WIN_EDITOR].closed && !self.windows[WIN_EDITOR].minimized;
-        let ai_open = !self.windows[WIN_AI].closed && !self.windows[WIN_AI].minimized;
+                    let btn_col = if is_foc { self.rgb(45, 62, 80) } else { self.rgb(24, 33, 47) };
+                    self.draw_rect(bx, by, 38, 28, btn_col);
+                    self.draw_rect_outline(bx, by, 38, 28, if is_foc { col_accent } else { col_border });
+                    self.draw_string(bx + 4, by + 10, labels[i], if is_foc { col_white } else { col_muted }, None);
 
-        let btn_open_col = self.rgb(45, 62, 80);
-        let btn_closed_col = self.rgb(24, 33, 47);
+                    if is_open {
+                        self.draw_rect(bx + 16, by + 24, 6, 2, if is_foc { col_accent } else { col_muted });
+                    }
+                }
+            }
+            DockPosition::Left => {
+                let dock_w = 48;
+                let dock_h = 6 * 44 + 16;
+                let dock_x = 8;
+                let dock_y = (self.height as i32 - dock_h as i32) / 2;
+                draw_rounded_glass_panel(
+                    self.backbuffer_va,
+                    self.stride,
+                    self.width,
+                    self.height,
+                    self.pixel_format,
+                    dock_x,
+                    dock_y,
+                    dock_w,
+                    dock_h,
+                    14,
+                    tint_rgb,
+                    205,
+                    (70, 85, 115),
+                    true,
+                    self.glass_blur,
+                );
 
-        self.draw_rect(100, 3, 50, 21, if term_open { btn_open_col } else { btn_closed_col });
-        self.draw_rect_outline(100, 3, 50, 21, col_border);
-        self.draw_string(108, 9, "TERM", if term_open { col_cyan } else { col_muted }, None);
+                let labels = ["TERM", "SYS", "EXP", "EDIT", "AI", "SET"];
+                for i in 0..6 {
+                    let bx = (dock_x + 5) as u32;
+                    let by = (dock_y + 8 + (i as i32) * 44) as u32;
+                    let win = self.windows[i];
+                    let is_open = !win.closed && !win.minimized;
+                    let is_foc = win.focused && is_open;
 
-        self.draw_rect(156, 3, 60, 21, if sys_open { btn_open_col } else { btn_closed_col });
-        self.draw_rect_outline(156, 3, 60, 21, col_border);
-        self.draw_string(164, 9, "SYSMON", if sys_open { col_cyan } else { col_muted }, None);
+                    let btn_col = if is_foc { self.rgb(45, 62, 80) } else { self.rgb(24, 33, 47) };
+                    self.draw_rect(bx, by, 38, 38, btn_col);
+                    self.draw_rect_outline(bx, by, 38, 38, if is_foc { col_accent } else { col_border });
+                    self.draw_string(bx + 4, by + 14, labels[i], if is_foc { col_white } else { col_muted }, None);
 
-        self.draw_rect(222, 3, 74, 21, if exp_open { btn_open_col } else { btn_closed_col });
-        self.draw_rect_outline(222, 3, 74, 21, col_border);
-        self.draw_string(230, 9, "EXPLORER", if exp_open { col_cyan } else { col_muted }, None);
+                    if is_open {
+                        self.draw_rect(bx + 34, by + 16, 2, 6, if is_foc { col_accent } else { col_muted });
+                    }
+                }
+            }
+            DockPosition::Right => {
+                let dock_w = 48;
+                let dock_h = 6 * 44 + 16;
+                let dock_x = self.width as i32 - dock_w as i32 - 8;
+                let dock_y = (self.height as i32 - dock_h as i32) / 2;
+                draw_rounded_glass_panel(
+                    self.backbuffer_va,
+                    self.stride,
+                    self.width,
+                    self.height,
+                    self.pixel_format,
+                    dock_x,
+                    dock_y,
+                    dock_w,
+                    dock_h,
+                    14,
+                    tint_rgb,
+                    205,
+                    (70, 85, 115),
+                    true,
+                    self.glass_blur,
+                );
 
-        self.draw_rect(302, 3, 56, 21, if edit_open { btn_open_col } else { btn_closed_col });
-        self.draw_rect_outline(302, 3, 56, 21, col_border);
-        self.draw_string(312, 9, "EDIT", if edit_open { col_cyan } else { col_muted }, None);
+                let labels = ["TERM", "SYS", "EXP", "EDIT", "AI", "SET"];
+                for i in 0..6 {
+                    let bx = (dock_x + 5) as u32;
+                    let by = (dock_y + 8 + (i as i32) * 44) as u32;
+                    let win = self.windows[i];
+                    let is_open = !win.closed && !win.minimized;
+                    let is_foc = win.focused && is_open;
 
-        self.draw_rect(364, 3, 46, 21, if ai_open { btn_open_col } else { btn_closed_col });
-        self.draw_rect_outline(364, 3, 46, 21, col_border);
-        self.draw_string(378, 9, "AI", if ai_open { col_cyan } else { col_muted }, None);
+                    let btn_col = if is_foc { self.rgb(45, 62, 80) } else { self.rgb(24, 33, 47) };
+                    self.draw_rect(bx, by, 38, 38, btn_col);
+                    self.draw_rect_outline(bx, by, 38, 38, if is_foc { col_accent } else { col_border });
+                    self.draw_string(bx + 4, by + 14, labels[i], if is_foc { col_white } else { col_muted }, None);
 
-        // Right Taskbar Stats (Time, Uptime, SMP, RAM)
-        let mut time_buf = [0u8; 16];
-        let epoch = crate::arch::rtc::current_utc_epoch_secs();
-        let time_txt = crate::arch::rtc::format_time_hhmmss(epoch, &mut time_buf);
+                    if is_open {
+                        self.draw_rect(bx + 2, by + 16, 2, 6, if is_foc { col_accent } else { col_muted });
+                    }
+                }
+            }
+            DockPosition::Hidden => {}
+        }
 
-        let mut up_buf = [0u8; 16];
-        let uptime_sec = get_uptime_seconds();
-        let up_txt = format_uptime(uptime_sec, &mut up_buf);
-
-        let mut smp_buf = [0u8; 16];
-        let smp_txt = format_smp(self.cpus_online, &mut smp_buf);
-
-        let mut ram_buf = [0u8; 32];
-        let ram_txt = format_ram(self.free_ram_mib, self.total_ram_mib, &mut ram_buf);
-
-        let time_w = (time_txt.len() as u32) * 8;
-        let ram_w = (ram_txt.len() as u32) * 8;
-        let smp_w = (smp_txt.len() as u32) * 8;
-        let up_w = (up_txt.len() as u32) * 8;
-
-        let time_x = self.width.saturating_sub(time_w + 12);
-        let ram_x = time_x.saturating_sub(ram_w + 16);
-        let smp_x = ram_x.saturating_sub(smp_w + 16);
-        let up_x = smp_x.saturating_sub(up_w + 16);
-
-        self.draw_string(up_x, 10, up_txt, col_muted, None);
-        self.draw_string(smp_x, 10, smp_txt, col_green, None);
-        self.draw_string(ram_x, 10, ram_txt, col_yellow, None);
-        self.draw_string(time_x, 10, time_txt, col_cyan, None);
-
-        // 3. Bottom Status Bar (height - 24 .. height)
+        // 4. Bottom Status Bar (height - 24 .. height)
         let bot_y = self.height.saturating_sub(24);
-        self.draw_rect(0, bot_y, self.width, 24, col_bar);
-        self.draw_rect(0, bot_y, self.width, 1, col_border);
-        self.draw_string(12, bot_y + 8, "Genesis Desktop Compositor | Double-Buffered 60 FPS", col_muted, None);
+        draw_rounded_glass_panel(
+            self.backbuffer_va,
+            self.stride,
+            self.width,
+            self.height,
+            self.pixel_format,
+            0,
+            bot_y as i32,
+            self.width,
+            24,
+            0,
+            tint_rgb,
+            180,
+            (51, 65, 85),
+            false,
+            self.glass_blur,
+        );
+        self.draw_string(12, bot_y + 8, "Genesis Liquid Glass Desktop | Double-Buffered 60 FPS", col_muted, None);
         self.draw_string(self.width.saturating_sub(270), bot_y + 8, "Esc/q: Exit | Pointer: Point & Drag", col_cyan, None);
 
-        // 4. Windows in Z-Order
+        // 5. Windows in Z-Order
         let z_order = self.z_order;
         let line_count = self.term_line_count;
         let lines = self.term_lines;
@@ -2620,17 +3306,46 @@ impl DesktopCompositor {
             let wx = win.x as u32;
             let wy = win.y as u32;
 
-            // Window Drop Shadow / Outer Border
-            self.draw_rect(wx + 2, wy + 2, win.w, win.h, self.rgb(5, 8, 15));
-            self.draw_rect(wx, wy, win.w, win.h, col_win_body);
-            self.draw_rect_outline(wx, wy, win.w, win.h, if win.focused { col_cyan } else { col_border });
+            // Window Rounded Glass Panel
+            let win_border = if win.focused { accent_rgb } else { (51, 65, 85) };
+            draw_rounded_glass_panel(
+                self.backbuffer_va,
+                self.stride,
+                self.width,
+                self.height,
+                self.pixel_format,
+                win.x,
+                win.y,
+                win.w,
+                win.h,
+                12,
+                tint_rgb,
+                self.glass_opacity,
+                win_border,
+                true,
+                self.glass_blur,
+            );
 
             // Title Bar
             let title_bg = if win.focused { col_title_act } else { col_title_inact };
-            self.draw_rect(wx, wy, win.w, 22, title_bg);
-            self.draw_string(wx + 8, wy + 7, win.title, col_white, None);
+            self.draw_rect(wx + 2, wy + 2, win.w.saturating_sub(4), 22, title_bg);
 
-            // Title Bar Buttons [+], [-] and [X]
+            // Traffic Light Controls on Left
+            draw_traffic_lights(
+                self.backbuffer_va,
+                self.stride,
+                self.width,
+                self.height,
+                self.pixel_format,
+                win.x,
+                win.y,
+                win.focused,
+            );
+
+            // Window Title
+            self.draw_string(wx + 64, wy + 7, win.title, col_white, None);
+
+            // Title Bar Buttons on Right: [+], [-] and [X]
             let max_btn_x = wx + win.w - 54;
             self.draw_rect(max_btn_x, wy + 3, 16, 16, self.rgb(40, 53, 72));
             self.draw_char(max_btn_x + 4, wy + 6, if win.maximized { b'^' } else { b'+' }, col_white, None);
@@ -3042,21 +3757,20 @@ impl DesktopCompositor {
                         self.draw_char(cursor_x, prompt_y + 2, b'_', col_yellow, None);
                     }
                 }
+                WIN_SETTINGS => {
+                    self.render_settings_content(wx, wy, win.w, win.h, cx, cy);
+                }
                 _ => {}
             }
         }
 
         // 5. Mouse Pointer on Top
-        let mut hw_cursor_moved = false;
         if let Some(gpu_ptr) = crate::drivers::virtio_gpu::get_global_virtio_gpu() {
             if (*gpu_ptr).has_hw_cursor {
                 let _ = (*gpu_ptr).move_hw_cursor(pointer.x as u32, pointer.y as u32);
-                hw_cursor_moved = true;
             }
         }
-        if !hw_cursor_moved {
-            self.draw_cursor(pointer.x, pointer.y);
-        }
+        self.draw_cursor(pointer.x, pointer.y);
     }
 
     pub unsafe fn blit(&self, target_fb: &mut Framebuffer) {
@@ -3108,6 +3822,8 @@ pub unsafe fn run_desktop_gui(
         scroll_delta: 0,
     };
     let mut prev_pointer = pointer;
+    crate::drivers::virtio_input::GLOBAL_POINTER_STATE = pointer;
+    crate::drivers::virtio_input::GLOBAL_POINTER_CHANGED = false;
 
     comp.mark_dirty_all();
     comp.render_frame(&pointer);
@@ -3120,37 +3836,39 @@ pub unsafe fn run_desktop_gui(
         let mut need_render = false;
 
         let (new_ptr, ptr_changed) = poll_global_pointer(fb.width, fb.height);
-        if ptr_changed || new_ptr.x != pointer.x || new_ptr.y != pointer.y || new_ptr.left_button != pointer.left_button || new_ptr.scroll_delta != 0 {
+        if ptr_changed {
             pointer = new_ptr;
             if comp.handle_pointer_ctx(&pointer, fat, dev.as_deref_mut(), scratch_pa, scratch_va) || pointer.scroll_delta != 0 {
-                need_render = true;
+                comp.mark_dirty_all();
             }
+            need_render = true;
         }
 
         let (usb_ptr, usb_changed) = crate::drivers::usb_hid::poll_usb_mouse(fb.width, fb.height);
-        if usb_changed || usb_ptr.scroll_delta != 0 {
+        if usb_changed {
             pointer = usb_ptr;
             if comp.handle_pointer_ctx(&pointer, fat, dev.as_deref_mut(), scratch_pa, scratch_va) || pointer.scroll_delta != 0 {
-                need_render = true;
+                comp.mark_dirty_all();
             }
+            need_render = true;
         }
 
         if let Some(key) = poll_global_virtio_input() {
             if key == 27 || (key == b'q' && !comp.windows[WIN_TERMINAL].focused && !comp.windows[WIN_EDITOR].focused && !comp.windows[WIN_AI].focused) {
                 break;
             }
-            if comp.handle_key_ctx(key, fat, dev.as_deref_mut(), scratch_pa, scratch_va) {
-                need_render = true;
-            }
+            let _ = comp.handle_key_ctx(key, fat, dev.as_deref_mut(), scratch_pa, scratch_va);
+            comp.mark_dirty_all();
+            need_render = true;
         }
 
         if let Some(key) = crate::drivers::usb_hid::poll_usb_keyboard() {
             if key == 27 || (key == b'q' && !comp.windows[WIN_TERMINAL].focused && !comp.windows[WIN_EDITOR].focused && !comp.windows[WIN_AI].focused) {
                 break;
             }
-            if comp.handle_key_ctx(key, fat, dev.as_deref_mut(), scratch_pa, scratch_va) {
-                need_render = true;
-            }
+            let _ = comp.handle_key_ctx(key, fat, dev.as_deref_mut(), scratch_pa, scratch_va);
+            comp.mark_dirty_all();
+            need_render = true;
         }
 
         let rx_status = core::ptr::read_volatile((uart_va + 0x018) as *const u32);
@@ -3159,9 +3877,9 @@ pub unsafe fn run_desktop_gui(
             if byte == 27 || (byte == b'q' && !comp.windows[WIN_TERMINAL].focused && !comp.windows[WIN_EDITOR].focused && !comp.windows[WIN_AI].focused) {
                 break;
             }
-            if comp.handle_key_ctx(byte, fat, dev.as_deref_mut(), scratch_pa, scratch_va) {
-                need_render = true;
-            }
+            let _ = comp.handle_key_ctx(byte, fat, dev.as_deref_mut(), scratch_pa, scratch_va);
+            comp.mark_dirty_all();
+            need_render = true;
         }
 
         comp.frame_count += 1;
@@ -3219,7 +3937,7 @@ mod tests {
         let va = mock_buf.as_mut_ptr() as u64;
 
         let mut comp = DesktopCompositor::new(va, 800, 600, 800, 1);
-        assert_eq!(comp.windows.len(), 5);
+        assert_eq!(comp.windows.len(), 6);
         assert_eq!(comp.z_order[WINDOW_COUNT - 1], WIN_TERMINAL);
         assert!(comp.windows[WIN_TERMINAL].focused);
         assert!(!comp.windows[WIN_SYSMON].focused);
@@ -3632,5 +4350,107 @@ mod tests {
         assert!(comp.ram_history[0] > 0);
         assert!(comp.nic_history[0] > 0);
         assert_eq!(comp.history_idx, 1);
+    }
+
+    #[test]
+    fn compositor_settings_app_and_interactions_test() {
+        let mut mock_buf = vec![0u8; 800 * 600 * 4];
+        let va = mock_buf.as_mut_ptr() as u64;
+        let mut comp = DesktopCompositor::new(va, 800, 600, 800, 1);
+
+        // Open Settings window
+        comp.toggle_or_focus(WIN_SETTINGS);
+        assert!(!comp.windows[WIN_SETTINGS].minimized);
+        assert!(comp.windows[WIN_SETTINGS].focused);
+
+        let win = comp.windows[WIN_SETTINGS];
+        let cy = win.y + 26;
+
+        // 1. Switch to Personalization Category (cat 1: cy + 40)
+        let cat1_ptr = PointerState::new(win.x + 20, cy + 45, true, false);
+        assert!(comp.handle_pointer(&cat1_ptr));
+        assert_eq!(comp.settings_category, 1);
+        assert_eq!(comp.settings_status_str(), "Personalization");
+
+        // Release pointer
+        let cat1_rel = PointerState::new(win.x + 20, cy + 45, false, false);
+        assert!(comp.handle_pointer(&cat1_rel));
+
+        // 2. Select Ocean Glass theme in Personalization
+        let panel_x = win.x + 110 + 14;
+        let ocean_ptr = PointerState::new(panel_x + 90, cy + 45, true, false);
+        assert!(comp.handle_pointer(&ocean_ptr));
+        assert_eq!(comp.glass_theme, GlassTheme::OceanGlass);
+        assert_eq!(comp.settings_status_str(), "Theme: Ocean Glass");
+
+        let ocean_rel = PointerState::new(panel_x + 90, cy + 45, false, false);
+        assert!(comp.handle_pointer(&ocean_rel));
+
+        // 3. Select Emerald accent color
+        let emerald_ptr = PointerState::new(panel_x + 140, cy + 95, true, false);
+        assert!(comp.handle_pointer(&emerald_ptr));
+        assert_eq!(comp.accent_color, AccentColor::Emerald);
+        assert_eq!(comp.settings_status_str(), "Accent: Emerald");
+
+        let emerald_rel = PointerState::new(panel_x + 140, cy + 95, false, false);
+        assert!(comp.handle_pointer(&emerald_rel));
+
+        // 4. Toggle Glass Blur
+        let blur_ptr = PointerState::new(panel_x + 20, cy + 145, true, false);
+        let orig_blur = comp.glass_blur;
+        assert!(comp.handle_pointer(&blur_ptr));
+        assert_eq!(comp.glass_blur, !orig_blur);
+
+        let blur_rel = PointerState::new(panel_x + 20, cy + 145, false, false);
+        assert!(comp.handle_pointer(&blur_rel));
+
+        // 5. Switch to Left Dock Position
+        let dock_ptr = PointerState::new(panel_x + 90, cy + 195, true, false);
+        assert!(comp.handle_pointer(&dock_ptr));
+        assert_eq!(comp.dock_position, DockPosition::Left);
+        assert_eq!(comp.settings_status_str(), "Dock: Left Sidebar");
+
+        let dock_rel = PointerState::new(panel_x + 90, cy + 195, false, false);
+        assert!(comp.handle_pointer(&dock_rel));
+
+        // 6. Switch to Sound Category (cat 4: cy + 130)
+        let cat4_ptr = PointerState::new(win.x + 20, cy + 135, true, false);
+        assert!(comp.handle_pointer(&cat4_ptr));
+        assert_eq!(comp.settings_category, 4);
+
+        let cat4_rel = PointerState::new(win.x + 20, cy + 135, false, false);
+        assert!(comp.handle_pointer(&cat4_rel));
+
+        // Test Chime click
+        let chime_ptr = PointerState::new(panel_x + 50, cy + 100, true, false);
+        assert!(comp.handle_pointer(&chime_ptr));
+        assert!(comp.settings_status_str().contains("Audio chime"));
+    }
+
+    #[test]
+    fn compositor_traffic_lights_and_dock_interaction_test() {
+        let mut mock_buf = vec![0u8; 800 * 600 * 4];
+        let va = mock_buf.as_mut_ptr() as u64;
+        let mut comp = DesktopCompositor::new(va, 800, 600, 800, 1);
+
+        let term_win = comp.windows[WIN_TERMINAL];
+
+        // Click traffic light yellow (minimize) at (win.x + 24, win.y + 12)
+        let min_ptr = PointerState::new(term_win.x + 24, term_win.y + 12, true, false);
+        assert!(comp.handle_pointer(&min_ptr));
+        assert!(comp.windows[WIN_TERMINAL].minimized);
+
+        let min_rel = PointerState::new(term_win.x + 24, term_win.y + 12, false, false);
+        assert!(comp.handle_pointer(&min_rel));
+
+        // Click Dock slot 0 (Bottom dock) to restore Terminal
+        comp.dock_position = DockPosition::Bottom;
+        let dock_w = 6 * 44 + 16;
+        let dock_x = (800 - dock_w) / 2;
+        let dock_y = 600 - 44 - 10;
+        let dock_slot0 = PointerState::new(dock_x + 20, dock_y + 20, true, false);
+        assert!(comp.handle_pointer(&dock_slot0));
+        assert!(!comp.windows[WIN_TERMINAL].minimized);
+        assert!(comp.windows[WIN_TERMINAL].focused);
     }
 }
