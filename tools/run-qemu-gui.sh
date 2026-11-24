@@ -41,8 +41,8 @@ exec "$QEMU" $ACCEL_OPTS -smp "${QEMU_SMP:-4}" -m 512M \
   -netdev user,id=net1 -device e1000e,netdev=net1 \
   -device virtio-keyboard-device \
   -device virtio-tablet-device \
-  -device virtio-gpu-pci,xres=1440,yres=900 \
   -device ramfb \
+  -device virtio-gpu-pci,xres=1440,yres=900 \
   -device qemu-xhci,id=xhci \
   -device ich9-ahci,id=ahci0 \
   -device usb-kbd \

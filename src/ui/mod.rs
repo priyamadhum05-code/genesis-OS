@@ -9,12 +9,14 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
+pub mod font;
 pub mod ryoku_theme;
 pub mod ryoku_bars;
 pub mod ryoku_sidebars;
 pub mod ryoku_overlays;
 pub mod ryoku_apps;
 
+pub use font::*;
 pub use ryoku_theme::*;
 pub use ryoku_bars::*;
 pub use ryoku_sidebars::*;
@@ -565,26 +567,85 @@ impl DesktopCompositor {
             return true;
         }
 
-        // 6. Window dragging and focusing
+        // 6. Window buttons, dragging, and focusing
         if ptr.left_button {
-            // Check top window down
+            // Check top window down in strict Z-order
             for &idx in self.z_order.iter().rev() {
-                let (wx, wy, ww, wh, ws, closed, min) = {
-                    let w = &self.windows[idx];
-                    (w.x, w.y, w.w as i32, w.h as i32, w.workspace, w.closed, w.minimized)
-                };
-                if ws == self.active_workspace && !closed && !min {
-                    if ptr.x >= wx && ptr.x <= wx + ww && ptr.y >= wy && ptr.y <= wy + 30 {
-                        // Title bar hit!
+                let win = self.windows[idx];
+                if win.workspace == self.active_workspace && !win.closed && !win.minimized {
+                    let layout = WindowChromeLayout::compute(&win);
+
+                    // 1. Close button hit
+                    if layout.close_rect.contains(ptr.x, ptr.y) {
+                        self.windows[idx].closed = true;
+                        self.layout_windows();
+                        self.mark_dirty_all();
+                        return true;
+                    }
+
+                    // 2. Maximize/Restore button hit
+                    if layout.max_rect.contains(ptr.x, ptr.y) {
+                        if self.windows[idx].maximized {
+                            self.windows[idx].x = self.windows[idx].saved_x;
+                            self.windows[idx].y = self.windows[idx].saved_y;
+                            self.windows[idx].w = self.windows[idx].saved_w;
+                            self.windows[idx].h = self.windows[idx].saved_h;
+                            self.windows[idx].maximized = false;
+                        } else {
+                            self.windows[idx].saved_x = self.windows[idx].x;
+                            self.windows[idx].saved_y = self.windows[idx].saved_y;
+                            self.windows[idx].saved_w = self.windows[idx].w;
+                            self.windows[idx].saved_h = self.windows[idx].h;
+                            let (wx, wy, ww, wh) = compute_work_area(
+                                self.width,
+                                self.height,
+                                self.bar_cfg.style,
+                                self.bar_cfg.form,
+                                self.bar_cfg.position,
+                            );
+                            self.windows[idx].x = wx;
+                            self.windows[idx].y = wy;
+                            self.windows[idx].w = ww;
+                            self.windows[idx].h = wh;
+                            self.windows[idx].maximized = true;
+                        }
                         self.focus_window(idx);
-                        if self.wm_mode == WmMode::Wayfire {
+                        self.mark_dirty_all();
+                        return true;
+                    }
+
+                    // 3. Minimize button hit
+                    if layout.min_rect.contains(ptr.x, ptr.y) {
+                        self.windows[idx].minimized = true;
+                        self.layout_windows();
+                        self.mark_dirty_all();
+                        return true;
+                    }
+
+                    // 4. Title bar drag hit
+                    if layout.titlebar_rect.contains(ptr.x, ptr.y) {
+                        self.focus_window(idx);
+                        if self.wm_mode == WmMode::Wayfire && !self.windows[idx].maximized {
                             self.dragging_window = Some(idx);
-                            self.drag_off_x = ptr.x - wx;
-                            self.drag_off_y = ptr.y - wy;
+                            self.drag_off_x = ptr.x - win.x;
+                            self.drag_off_y = ptr.y - win.y;
                         }
                         return true;
-                    } else if ptr.x >= wx && ptr.x <= wx + ww && ptr.y >= wy && ptr.y <= wy + wh {
+                    }
+
+                    // 5. Client content hit
+                    if layout.content_rect.contains(ptr.x, ptr.y) {
                         self.focus_window(idx);
+                        if idx == WIN_HUB {
+                            let hub_layout = HubLayout::compute(win.x, win.y, win.w, win.h);
+                            for (p_idx, nav_rect) in hub_layout.nav_item_rects.iter().enumerate() {
+                                if nav_rect.contains(ptr.x, ptr.y) {
+                                    self.hub.active_page = p_idx;
+                                    self.mark_dirty_all();
+                                    return true;
+                                }
+                            }
+                        }
                         return true;
                     }
                 }
@@ -1021,7 +1082,7 @@ impl DesktopCompositor {
         let col_border_inact = rgb(self.pixel_format, self.palette.border_inactive.0, self.palette.border_inactive.1, self.palette.border_inactive.2);
         let col_title_bg = rgb(self.pixel_format, self.palette.surface.0, self.palette.surface.1, self.palette.surface.2);
         let col_fg = rgb(self.pixel_format, self.palette.fg_primary.0, self.palette.fg_primary.1, self.palette.fg_primary.2);
-        let col_muted = rgb(self.pixel_format, self.palette.fg_muted.0, self.palette.fg_muted.1, self.palette.fg_muted.2);
+        let _col_muted = rgb(self.pixel_format, self.palette.fg_muted.0, self.palette.fg_muted.1, self.palette.fg_muted.2);
 
         // 2. Windows on active_workspace in strict Z-order
         for &idx in self.z_order.iter() {
@@ -1029,6 +1090,8 @@ impl DesktopCompositor {
             if win.workspace != self.active_workspace || win.closed || win.minimized {
                 continue;
             }
+
+            let layout = WindowChromeLayout::compute(&win);
 
             // Window container glass panel
             draw_rounded_glass_panel(
@@ -1053,18 +1116,86 @@ impl DesktopCompositor {
                 self.stride,
                 self.width,
                 self.height,
-                win.x,
-                win.y,
-                win.w,
-                28,
+                layout.titlebar_rect.x,
+                layout.titlebar_rect.y,
+                layout.titlebar_rect.w as u32,
+                layout.titlebar_rect.h as u32,
                 10,
                 col_title_bg,
             );
 
-            // Title text & traffic lights
+            // Title text vertically centered & strictly clipped before min button
             let t_col = if win.focused { col_accent } else { col_fg };
-            draw_text(self.backbuffer_va, self.stride, self.width, self.height, win.x + 14, win.y + 7, win.title, t_col);
-            draw_text(self.backbuffer_va, self.stride, self.width, self.height, win.x + win.w as i32 - 48, win.y + 7, "[-] [x]", col_muted);
+            let title_clip = ClipRect::new(
+                layout.title_x,
+                layout.titlebar_rect.y,
+                layout.min_rect.x - 4,
+                layout.titlebar_rect.y + layout.titlebar_rect.h,
+            );
+            draw_text_clipped(
+                self.backbuffer_va,
+                self.stride,
+                self.width,
+                self.height,
+                layout.title_x,
+                layout.title_y,
+                win.title,
+                t_col,
+                Some(title_clip),
+            );
+
+            // 16-sample anti-aliased control buttons:
+            // 1. Minimize button (amber/yellow circle with '-')
+            let min_cx = layout.min_rect.x + layout.min_rect.w / 2;
+            let min_cy = layout.min_rect.y + layout.min_rect.h / 2;
+            draw_circle_aa(
+                self.backbuffer_va,
+                self.stride,
+                self.width,
+                self.height,
+                self.pixel_format,
+                min_cx,
+                min_cy,
+                layout.min_rect.w / 2,
+                (234, 179, 8),
+                230,
+            );
+            draw_char(self.backbuffer_va, self.stride, self.width, self.height, min_cx - 4, min_cy - 8, b'-', rgb(self.pixel_format, 100, 70, 0));
+
+            // 2. Maximize/Restore button (green circle with '+' or '=')
+            let max_cx = layout.max_rect.x + layout.max_rect.w / 2;
+            let max_cy = layout.max_rect.y + layout.max_rect.h / 2;
+            draw_circle_aa(
+                self.backbuffer_va,
+                self.stride,
+                self.width,
+                self.height,
+                self.pixel_format,
+                max_cx,
+                max_cy,
+                layout.max_rect.w / 2,
+                (34, 197, 94),
+                230,
+            );
+            let max_sym = if win.maximized { b'=' } else { b'+' };
+            draw_char(self.backbuffer_va, self.stride, self.width, self.height, max_cx - 4, max_cy - 8, max_sym, rgb(self.pixel_format, 10, 80, 30));
+
+            // 3. Close button (red circle with 'x')
+            let close_cx = layout.close_rect.x + layout.close_rect.w / 2;
+            let close_cy = layout.close_rect.y + layout.close_rect.h / 2;
+            draw_circle_aa(
+                self.backbuffer_va,
+                self.stride,
+                self.width,
+                self.height,
+                self.pixel_format,
+                close_cx,
+                close_cy,
+                layout.close_rect.w / 2,
+                (239, 68, 68),
+                230,
+            );
+            draw_char(self.backbuffer_va, self.stride, self.width, self.height, close_cx - 4, close_cy - 8, b'x', rgb(self.pixel_format, 90, 10, 10));
 
             // App client contents
             match win.id {

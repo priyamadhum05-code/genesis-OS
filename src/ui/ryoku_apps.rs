@@ -9,7 +9,7 @@ use super::ryoku_bars::BarConfig;
 use super::ryoku_sidebars::SidebarsState;
 use super::ryoku_theme::{
     draw_pill, draw_rounded_rect_outline, draw_text, fill_rect, fill_rounded_rect, rgb,
-    RyokuPalette, RyokuThemeId, StrBuf,
+    Rect, RyokuPalette, RyokuThemeId, StrBuf, WindowChromeLayout,
 };
 use crate::fs::FatDirEntry;
 
@@ -470,6 +470,43 @@ pub unsafe fn render_editor_app(
     fill_rect(buf, stride, screen_w, screen_h, win_x + 4, stat_y, win_w.saturating_sub(8), 18, col_pill);
     if let Ok(st_str) = core::str::from_utf8(&state.status_msg[..state.status_len]) {
         draw_text(buf, stride, screen_w, screen_h, win_x + 14, stat_y + 2, st_str, col_accent);
+    }
+}
+
+/// Unified layout geometry for Ryoku Hub navigation rail & pages
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HubLayout {
+    pub rail_rect: Rect,
+    pub search_rect: Rect,
+    pub nav_item_rects: [Rect; 8],
+    pub content_rect: Rect,
+}
+
+impl HubLayout {
+    pub const RAIL_W: i32 = 170;
+
+    pub fn compute(win_x: i32, win_y: i32, win_w: u32, win_h: u32) -> Self {
+        let titlebar_h = WindowChromeLayout::TITLEBAR_H;
+        let rail_rect = Rect::new(win_x + 2, win_y + titlebar_h, Self::RAIL_W, (win_h as i32 - titlebar_h - 2).max(0));
+        let search_rect = Rect::new(win_x + 8, win_y + titlebar_h + 6, Self::RAIL_W - 16, 26);
+
+        let mut nav_item_rects = [Rect::new(0, 0, 0, 0); 8];
+        let mut ny = win_y + titlebar_h + 40;
+        for i in 0..8 {
+            nav_item_rects[i] = Rect::new(win_x + 8, ny, Self::RAIL_W - 16, 26);
+            ny += 32;
+        }
+
+        let content_w = (win_w as i32 - Self::RAIL_W - 20).max(0);
+        let content_h = (win_h as i32 - titlebar_h - 8).max(0);
+        let content_rect = Rect::new(win_x + Self::RAIL_W + 16, win_y + titlebar_h + 8, content_w, content_h);
+
+        Self {
+            rail_rect,
+            search_rect,
+            nav_item_rects,
+            content_rect,
+        }
     }
 }
 

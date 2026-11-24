@@ -6,7 +6,8 @@
 
 extern crate alloc;
 
-use crate::drivers::fb::{get_glyph, rgb_format};
+pub use crate::ui::font::{get_glyph_8x16, FONT_H, FONT_W};
+use crate::drivers::fb::rgb_format;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RyokuThemeId {
@@ -660,6 +661,324 @@ pub fn blend_pixel(fmt: u32, dst_color: u32, r: u8, g: u8, b: u8, alpha: u8) -> 
     rgb(fmt, out_r, out_g, out_b)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl Rect {
+    pub const fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        Self { x, y, w, h }
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, px: i32, py: i32) -> bool {
+        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipRect {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
+impl ClipRect {
+    pub const fn new(x0: i32, y0: i32, x1: i32, y1: i32) -> Self {
+        Self { x0, y0, x1, y1 }
+    }
+
+    pub fn from_rect(r: &Rect) -> Self {
+        Self {
+            x0: r.x,
+            y0: r.y,
+            x1: r.x + r.w,
+            y1: r.y + r.h,
+        }
+    }
+
+    pub const fn screen(w: u32, h: u32) -> Self {
+        Self {
+            x0: 0,
+            y0: 0,
+            x1: w as i32,
+            y1: h as i32,
+        }
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, px: i32, py: i32) -> bool {
+        px >= self.x0 && px < self.x1 && py >= self.y0 && py < self.y1
+    }
+
+    pub fn intersect(&self, other: &ClipRect) -> Self {
+        Self {
+            x0: self.x0.max(other.x0),
+            y0: self.y0.max(other.y0),
+            x1: self.x1.min(other.x1),
+            y1: self.y1.min(other.y1),
+        }
+    }
+}
+
+/// Unified window chrome geometry and hit-boxes (used identically by drawing and mouse hit-testing)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowChromeLayout {
+    pub titlebar_rect: Rect,
+    pub close_rect: Rect,
+    pub max_rect: Rect,
+    pub min_rect: Rect,
+    pub title_x: i32,
+    pub title_y: i32,
+    pub max_title_w: i32,
+    pub content_rect: Rect,
+    pub clip: ClipRect,
+}
+
+impl WindowChromeLayout {
+    pub const TITLEBAR_H: i32 = 32;
+    pub const CORNER_R: i32 = 10;
+    pub const BTN_SIZE: i32 = 14;
+    pub const BTN_GAP: i32 = 8;
+    pub const PAD_X: i32 = 12;
+
+    pub fn compute_from_bounds(win_x: i32, win_y: i32, win_w: u32, win_h: u32) -> Self {
+        let btn_y = win_y + (Self::TITLEBAR_H - Self::BTN_SIZE) / 2;
+        let close_x = win_x + win_w as i32 - Self::PAD_X - Self::BTN_SIZE;
+        let max_x = close_x - Self::BTN_GAP - Self::BTN_SIZE;
+        let min_x = max_x - Self::BTN_GAP - Self::BTN_SIZE;
+
+        let close_rect = Rect::new(close_x, btn_y, Self::BTN_SIZE, Self::BTN_SIZE);
+        let max_rect = Rect::new(max_x, btn_y, Self::BTN_SIZE, Self::BTN_SIZE);
+        let min_rect = Rect::new(min_x, btn_y, Self::BTN_SIZE, Self::BTN_SIZE);
+        let titlebar_rect = Rect::new(win_x, win_y, win_w as i32, Self::TITLEBAR_H);
+
+        let title_x = win_x + Self::PAD_X;
+        let title_y = win_y + (Self::TITLEBAR_H - FONT_H as i32) / 2;
+        let max_title_w = (min_x - Self::BTN_GAP - title_x).max(0);
+
+        let content_w = (win_w as i32 - 4).max(0);
+        let content_h = (win_h as i32 - Self::TITLEBAR_H - 3).max(0);
+        let content_rect = Rect::new(win_x + 2, win_y + Self::TITLEBAR_H + 1, content_w, content_h);
+        let clip = ClipRect::from_rect(&content_rect);
+
+        Self {
+            titlebar_rect,
+            close_rect,
+            max_rect,
+            min_rect,
+            title_x,
+            title_y,
+            max_title_w,
+            content_rect,
+            clip,
+        }
+    }
+
+    #[inline(always)]
+    pub fn compute(win: &crate::ui::Window) -> Self {
+        Self::compute_from_bounds(win.x, win.y, win.w, win.h)
+    }
+}
+
+pub const SUBPIXEL_OFFSETS: [i32; 4] = [1, 3, 5, 7];
+
+/// Computes coverage (0..=16) of a rounded rectangle at pixel (px, py) using 4x4 subpixel supersampling.
+#[inline(always)]
+pub fn coverage_rounded_rect_4x4(
+    px: i32,
+    py: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    radius: i32,
+) -> u32 {
+    if px < x || px >= x + w || py < y || py >= y + h || w <= 0 || h <= 0 {
+        return 0;
+    }
+    let r = radius.min(w / 2).min(h / 2);
+    if r <= 0 {
+        return 16;
+    }
+
+    let in_left_corner = px < x + r;
+    let in_right_corner = px >= x + w - r;
+    let in_top_corner = py < y + r;
+    let in_bottom_corner = py >= y + h - r;
+
+    if (!in_left_corner && !in_right_corner) || (!in_top_corner && !in_bottom_corner) {
+        return 16;
+    }
+
+    let cx = if in_left_corner { x + r } else { x + w - r };
+    let cy = if in_top_corner { y + r } else { y + h - r };
+
+    let r_fixed = r * 8;
+    let r_sq = r_fixed * r_fixed;
+
+    let mut hits = 0u32;
+    for &sy in &SUBPIXEL_OFFSETS {
+        let sub_y = py * 8 + sy;
+        let dy = sub_y - cy * 8;
+        let dy_sq = dy * dy;
+
+        for &sx in &SUBPIXEL_OFFSETS {
+            let sub_x = px * 8 + sx;
+            let dx = sub_x - cx * 8;
+            if dx * dx + dy_sq <= r_sq {
+                hits += 1;
+            }
+        }
+    }
+    hits
+}
+
+/// Computes coverage (0..=16) of a circle centered at (cx, cy) with radius r.
+#[inline(always)]
+pub fn coverage_circle_4x4(px: i32, py: i32, cx: i32, cy: i32, r: i32) -> u32 {
+    if r <= 0 {
+        return 0;
+    }
+    let r_fixed = r * 8;
+    let r_sq = r_fixed * r_fixed;
+
+    let mut hits = 0u32;
+    for &sy in &SUBPIXEL_OFFSETS {
+        let sub_y = py * 8 + sy;
+        let dy = sub_y - cy * 8;
+        let dy_sq = dy * dy;
+
+        for &sx in &SUBPIXEL_OFFSETS {
+            let sub_x = px * 8 + sx;
+            let dx = sub_x - cx * 8;
+            if dx * dx + dy_sq <= r_sq {
+                hits += 1;
+            }
+        }
+    }
+    hits
+}
+
+/// Draws an anti-aliased solid filled circle using 4x4 subpixel supersampling.
+pub unsafe fn draw_circle_aa(
+    buf: u64,
+    stride: u32,
+    screen_w: u32,
+    screen_h: u32,
+    fmt: u32,
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    color: (u8, u8, u8),
+    alpha: u8,
+) {
+    if radius <= 0 || alpha == 0 {
+        return;
+    }
+    let x0 = (cx - radius - 1).max(0) as u32;
+    let y0 = (cy - radius - 1).max(0) as u32;
+    let x1 = ((cx + radius + 2).max(0) as u32).min(screen_w);
+    let y1 = ((cy + radius + 2).max(0) as u32).min(screen_h);
+
+    let ptr = buf as *mut u32;
+    for py in y0..y1 {
+        let row_ptr = ptr.add((py as usize) * (stride as usize));
+        for px in x0..x1 {
+            let cov = coverage_circle_4x4(px as i32, py as i32, cx, cy, radius);
+            if cov > 0 {
+                let eff_alpha = (((cov * alpha as u32) / 16).min(255)) as u8;
+                let cur = *row_ptr.add(px as usize);
+                *row_ptr.add(px as usize) = blend_pixel(fmt, cur, color.0, color.1, color.2, eff_alpha);
+            }
+        }
+    }
+}
+
+/// Draws an anti-aliased hollow circle ring with thickness using 4x4 subpixel supersampling.
+pub unsafe fn draw_circle_ring_aa(
+    buf: u64,
+    stride: u32,
+    screen_w: u32,
+    screen_h: u32,
+    fmt: u32,
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    thickness: i32,
+    color: (u8, u8, u8),
+    alpha: u8,
+) {
+    if radius <= 0 || thickness <= 0 || alpha == 0 {
+        return;
+    }
+    let in_r = (radius - thickness).max(0);
+    let x0 = (cx - radius - 1).max(0) as u32;
+    let y0 = (cy - radius - 1).max(0) as u32;
+    let x1 = ((cx + radius + 2).max(0) as u32).min(screen_w);
+    let y1 = ((cy + radius + 2).max(0) as u32).min(screen_h);
+
+    let ptr = buf as *mut u32;
+    for py in y0..y1 {
+        let row_ptr = ptr.add((py as usize) * (stride as usize));
+        for px in x0..x1 {
+            let cov_out = coverage_circle_4x4(px as i32, py as i32, cx, cy, radius);
+            let cov_in = if in_r > 0 { coverage_circle_4x4(px as i32, py as i32, cx, cy, in_r) } else { 0 };
+            let cov = (cov_out as i32 - cov_in as i32).max(0) as u32;
+            if cov > 0 {
+                let eff_alpha = (((cov * alpha as u32) / 16).min(255)) as u8;
+                let cur = *row_ptr.add(px as usize);
+                *row_ptr.add(px as usize) = blend_pixel(fmt, cur, color.0, color.1, color.2, eff_alpha);
+            }
+        }
+    }
+}
+
+/// Fast filled rectangle with optional strict clipping
+pub unsafe fn fill_rect_clipped(
+    buf: u64,
+    stride: u32,
+    screen_w: u32,
+    screen_h: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    color: u32,
+    clip: Option<ClipRect>,
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let effective_clip = match clip {
+        Some(cp) => cp.intersect(&ClipRect::screen(screen_w, screen_h)),
+        None => ClipRect::screen(screen_w, screen_h),
+    };
+
+    let x0 = (x.max(effective_clip.x0)).max(0) as u32;
+    let y0 = (y.max(effective_clip.y0)).max(0) as u32;
+    let x1 = ((x + w as i32).min(effective_clip.x1).max(0) as u32).min(screen_w);
+    let y1 = ((y + h as i32).min(effective_clip.y1).max(0) as u32).min(screen_h);
+
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    let count = (x1 - x0) as usize;
+    let ptr = buf as *mut u32;
+    for py in y0..y1 {
+        let row_ptr = ptr.add((py as usize) * (stride as usize) + (x0 as usize));
+        for px in 0..count {
+            *row_ptr.add(px) = color;
+        }
+    }
+}
+
 /// Fast filled rectangle
 pub unsafe fn fill_rect(
     buf: u64,
@@ -672,59 +991,52 @@ pub unsafe fn fill_rect(
     h: u32,
     color: u32,
 ) {
-    if x >= screen_w as i32 || y >= screen_h as i32 || w == 0 || h == 0 {
-        return;
-    }
-    let x0 = x.max(0) as u32;
-    let y0 = y.max(0) as u32;
-    let x1 = ((x + w as i32).max(0) as u32).min(screen_w);
-    let y1 = ((y + h as i32).max(0) as u32).min(screen_h);
-    let count = (x1.saturating_sub(x0)) as usize;
-    if count == 0 {
-        return;
-    }
-
-    let ptr = buf as *mut u32;
-    for py in y0..y1 {
-        let row_ptr = ptr.add((py as usize) * (stride as usize) + (x0 as usize));
-        for px in 0..count {
-            *row_ptr.add(px) = color;
-        }
-    }
+    fill_rect_clipped(buf, stride, screen_w, screen_h, x, y, w, h, color, None);
 }
 
-/// Fast filled rounded rectangle with interior row-fill fast path
-pub unsafe fn fill_rounded_rect(
+/// Filled rounded rectangle with 4x4 subpixel anti-aliased corners and fast interior fill
+pub unsafe fn fill_rounded_rect_clipped(
     buf: u64,
     stride: u32,
     screen_w: u32,
     screen_h: u32,
+    fmt: u32,
     x: i32,
     y: i32,
     w: u32,
     h: u32,
     radius: u32,
     color: u32,
+    clip: Option<ClipRect>,
 ) {
     if x >= screen_w as i32 || y >= screen_h as i32 || w == 0 || h == 0 {
         return;
     }
     let r = radius.min(w / 2).min(h / 2);
     if r <= 1 {
-        fill_rect(buf, stride, screen_w, screen_h, x, y, w, h, color);
+        fill_rect_clipped(buf, stride, screen_w, screen_h, x, y, w, h, color, clip);
         return;
     }
 
-    let x0 = x.max(0) as u32;
-    let y0 = y.max(0) as u32;
-    let x1 = ((x + w as i32).max(0) as u32).min(screen_w);
-    let y1 = ((y + h as i32).max(0) as u32).min(screen_h);
-    let r_sq = (r * r) as i32;
+    let effective_clip = match clip {
+        Some(cp) => cp.intersect(&ClipRect::screen(screen_w, screen_h)),
+        None => ClipRect::screen(screen_w, screen_h),
+    };
 
-    let int_y0 = ((y + r as i32).max(0) as u32).min(screen_h);
-    let int_y1 = ((y + h as i32 - r as i32).max(0) as u32).min(screen_h);
+    let x0 = (x.max(effective_clip.x0)).max(0) as u32;
+    let y0 = (y.max(effective_clip.y0)).max(0) as u32;
+    let x1 = ((x + w as i32).min(effective_clip.x1).max(0) as u32).min(screen_w);
+    let y1 = ((y + h as i32).min(effective_clip.y1).max(0) as u32).min(screen_h);
+
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
 
     let ptr = buf as *mut u32;
+    let (cr, cg, cb) = unpack_rgb(fmt, color);
+
+    let int_y0 = ((y + r as i32).max(y0 as i32)) as u32;
+    let int_y1 = ((y + h as i32 - r as i32).min(y1 as i32).max(y0 as i32)) as u32;
 
     for py in y0..y1 {
         let row_ptr = ptr.add((py as usize) * (stride as usize));
@@ -738,31 +1050,45 @@ pub unsafe fn fill_rounded_rect(
             continue;
         }
 
-        // Top or bottom rounded rows: check rounded corner quadrants
-        let dy = if py < int_y0 {
-            (y + r as i32) - py as i32
-        } else {
-            py as i32 - (y + h as i32 - 1 - r as i32)
-        };
-        let dy_sq = dy * dy;
+        let left_corner_x = ((x + r as i32).min(x1 as i32).max(x0 as i32)) as u32;
+        let right_corner_x = ((x + w as i32 - r as i32).min(x1 as i32).max(x0 as i32)) as u32;
 
         for px in x0..x1 {
-            let dx = if px < (x + r as i32) as u32 {
-                (x + r as i32) - px as i32
-            } else if px >= ((x + w as i32 - r as i32) as u32) {
-                px as i32 - (x + w as i32 - 1 - r as i32)
-            } else {
-                0
-            };
-
-            if dx == 0 || (dx * dx + dy_sq <= r_sq) {
+            if px >= left_corner_x && px < right_corner_x {
+                // Flat interior of top/bottom row
                 *row_ptr.add(px as usize) = color;
+            } else {
+                // Corner with 4x4 subpixel supersampling
+                let cov = coverage_rounded_rect_4x4(px as i32, py as i32, x, y, w as i32, h as i32, r as i32);
+                if cov == 16 {
+                    *row_ptr.add(px as usize) = color;
+                } else if cov > 0 {
+                    let alpha = ((cov * 255) / 16) as u8;
+                    let cur = *row_ptr.add(px as usize);
+                    *row_ptr.add(px as usize) = blend_pixel(fmt, cur, cr, cg, cb, alpha);
+                }
             }
         }
     }
 }
 
-/// Draws an alpha-blended frosted glass panel with drop shadow, specular highlight, and crisp border
+/// Fast filled rounded rectangle with 16-sample anti-aliased corners
+pub unsafe fn fill_rounded_rect(
+    buf: u64,
+    stride: u32,
+    screen_w: u32,
+    screen_h: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    radius: u32,
+    color: u32,
+) {
+    fill_rounded_rect_clipped(buf, stride, screen_w, screen_h, 1, x, y, w, h, radius, color, None);
+}
+
+/// Draws an alpha-blended frosted glass panel with drop shadow, specular highlight, and 16-sample AA corners
 pub unsafe fn draw_rounded_glass_panel(
     buf: u64,
     stride: u32,
@@ -816,7 +1142,7 @@ pub unsafe fn draw_rounded_glass_panel(
         }
     }
 
-    // 2. Alpha Tint Panel & Specular Highlight
+    // 2. Alpha Tint Panel & Specular Highlight with 16-sample AA
     let x0 = x.max(0) as u32;
     let y0 = y.max(0) as u32;
     let x1 = ((x + w as i32).max(0) as u32).min(screen_w);
@@ -824,7 +1150,6 @@ pub unsafe fn draw_rounded_glass_panel(
 
     let int_y0 = ((y + r as i32).max(0) as u32).min(screen_h);
     let int_y1 = ((y + h as i32 - r as i32).max(0) as u32).min(screen_h);
-    let r_sq = (r * r) as i32;
 
     for py in y0..y1 {
         let row_ptr = ptr.add((py as usize) * (stride as usize));
@@ -838,40 +1163,42 @@ pub unsafe fn draw_rounded_glass_panel(
             continue;
         }
 
-        let dy = if py < int_y0 {
-            (y + r as i32) - py as i32
-        } else {
-            py as i32 - (y + h as i32 - 1 - r as i32)
-        };
-        let dy_sq = dy * dy;
+        let left_corner_x = ((x + r as i32).min(x1 as i32).max(x0 as i32)) as u32;
+        let right_corner_x = ((x + w as i32 - r as i32).min(x1 as i32).max(x0 as i32)) as u32;
 
         for px in x0..x1 {
-            let dx = if px < (x + r as i32) as u32 {
-                (x + r as i32) - px as i32
-            } else if px >= ((x + w as i32 - r as i32) as u32) {
-                px as i32 - (x + w as i32 - 1 - r as i32)
-            } else {
-                0
-            };
-
-            if dx == 0 || (dx * dx + dy_sq <= r_sq) {
+            if px >= left_corner_x && px < right_corner_x {
                 let cur = *row_ptr.add(px as usize);
-                // Subtle 1px specular top highlight
-                let pixel = if py == y0 && dy == 0 {
+                let pixel = if py == y0 {
                     blend_pixel(fmt, cur, 255, 255, 255, 80)
                 } else {
                     blend_pixel(fmt, cur, tint_rgb.0, tint_rgb.1, tint_rgb.2, alpha)
                 };
                 *row_ptr.add(px as usize) = pixel;
+            } else {
+                let cov = coverage_rounded_rect_4x4(px as i32, py as i32, x, y, w as i32, h as i32, r as i32);
+                if cov > 0 {
+                    let eff_alpha = (((cov * alpha as u32) / 16).min(255)) as u8;
+                    let cur = *row_ptr.add(px as usize);
+                    let pixel = if py == y0 {
+                        blend_pixel(fmt, cur, 255, 255, 255, 80)
+                    } else {
+                        blend_pixel(fmt, cur, tint_rgb.0, tint_rgb.1, tint_rgb.2, eff_alpha)
+                    };
+                    *row_ptr.add(px as usize) = pixel;
+                }
             }
         }
     }
 
     // 3. Crisp Rounded Border
-    draw_rounded_rect_outline(buf, stride, screen_w, screen_h, x, y, w, h, r, border_color);
+    if border_color != 0 {
+        let (br, bg, bb) = unpack_rgb(fmt, border_color);
+        draw_gradient_border_rect(buf, stride, screen_w, screen_h, fmt, x, y, w, h, r, 1, (br, bg, bb), (br, bg, bb));
+    }
 }
 
-/// Draws 1px outline for rounded rectangle
+/// Draws 1px outline for rounded rectangle with 16-sample anti-aliased edges
 pub unsafe fn draw_rounded_rect_outline(
     buf: u64,
     stride: u32,
@@ -884,57 +1211,12 @@ pub unsafe fn draw_rounded_rect_outline(
     radius: u32,
     color: u32,
 ) {
-    if x >= screen_w as i32 || y >= screen_h as i32 || w == 0 || h == 0 {
-        return;
-    }
-    let r = radius.min(w / 2).min(h / 2);
-    let x0 = x.max(0) as u32;
-    let y0 = y.max(0) as u32;
-    let x1 = ((x + w as i32).max(0) as u32).min(screen_w);
-    let y1 = ((y + h as i32).max(0) as u32).min(screen_h);
-    let r_sq_outer = (r * r) as i32;
-    let r_sq_inner = if r > 0 { ((r - 1) * (r - 1)) as i32 } else { 0 };
-
-    let ptr = buf as *mut u32;
-
-    for py in y0..y1 {
-        let is_edge_y = py == y0 || py == y1 - 1;
-        let dy = if py < (y + r as i32) as u32 {
-            (y + r as i32) - py as i32
-        } else if py >= (y + h as i32 - r as i32) as u32 {
-            py as i32 - (y + h as i32 - 1 - r as i32)
-        } else {
-            0
-        };
-        let dy_sq = dy * dy;
-
-        let row_ptr = ptr.add((py as usize) * (stride as usize));
-
-        for px in x0..x1 {
-            let is_edge_x = px == x0 || px == x1 - 1;
-            let dx = if px < (x + r as i32) as u32 {
-                (x + r as i32) - px as i32
-            } else if px >= (x + w as i32 - r as i32) as u32 {
-                px as i32 - (x + w as i32 - 1 - r as i32)
-            } else {
-                0
-            };
-
-            if dx == 0 && dy == 0 {
-                if is_edge_x || is_edge_y {
-                    *row_ptr.add(px as usize) = color;
-                }
-            } else {
-                let dist_sq = dx * dx + dy_sq;
-                if dist_sq <= r_sq_outer && dist_sq >= r_sq_inner {
-                    *row_ptr.add(px as usize) = color;
-                }
-            }
-        }
-    }
+    let (r, g, b) = unpack_rgb(1, color);
+    draw_gradient_border_rect(buf, stride, screen_w, screen_h, 1, x, y, w, h, radius, 1, (r, g, b), (r, g, b));
 }
 
-/// Hyprland's signature rounded gradient border interpolating color_a -> color_b diagonally
+/// Hyprland's signature rounded gradient border interpolating color_a -> color_b diagonally.
+/// Uses outer minus inner coverage (cov_out - cov_in) with 4x4 subpixel supersampling for zero gaps.
 pub unsafe fn draw_gradient_border_rect(
     buf: u64,
     stride: u32,
@@ -959,73 +1241,61 @@ pub unsafe fn draw_gradient_border_rect(
     let x1 = ((x + w as i32).max(0) as u32).min(screen_w);
     let y1 = ((y + h as i32).max(0) as u32).min(screen_h);
 
+    let in_x = x + thickness as i32;
+    let in_y = y + thickness as i32;
+    let in_w = (w as i32 - 2 * thickness as i32).max(0);
+    let in_h = (h as i32 - 2 * thickness as i32).max(0);
+    let in_r = (r as i32 - thickness as i32).max(0);
+
+    let in_int_x0 = (in_x + in_r).max(0) as u32;
+    let in_int_x1 = (in_x + in_w - in_r).max(0) as u32;
+    let in_int_y0 = (in_y + in_r).max(0) as u32;
+    let in_int_y1 = (in_y + in_h - in_r).max(0) as u32;
+
     let span = (w + h).max(1) as i32;
     let ptr = buf as *mut u32;
 
-    for t in 0..thickness {
-        let cur_r = r.saturating_sub(t);
-        let cur_x0 = x0 + t;
-        let cur_y0 = y0 + t;
-        let cur_x1 = x1.saturating_sub(t);
-        let cur_y1 = y1.saturating_sub(t);
+    for py in y0..y1 {
+        let is_in_int_y = in_w > 0 && in_h > 0 && py >= in_int_y0 && py < in_int_y1;
+        let row_ptr = ptr.add((py as usize) * (stride as usize));
 
-        if cur_x0 >= cur_x1 || cur_y0 >= cur_y1 {
-            break;
-        }
+        for px in x0..x1 {
+            // Fast skip interior non-border pixels
+            if is_in_int_y && px >= in_int_x0 && px < in_int_x1 {
+                continue;
+            }
 
-        for py in cur_y0..cur_y1 {
-            let is_edge_y = py == cur_y0 || py == cur_y1 - 1;
-            let dy = if py < (y + t as i32 + cur_r as i32) as u32 {
-                (y + t as i32 + cur_r as i32) - py as i32
-            } else if py >= (y + h as i32 - t as i32 - cur_r as i32) as u32 {
-                py as i32 - (y + h as i32 - 1 - t as i32 - cur_r as i32)
+            let cov_out = coverage_rounded_rect_4x4(px as i32, py as i32, x, y, w as i32, h as i32, r as i32);
+            let cov_in = if in_w > 0 && in_h > 0 {
+                coverage_rounded_rect_4x4(px as i32, py as i32, in_x, in_y, in_w, in_h, in_r)
             } else {
                 0
             };
 
-            let row_ptr = ptr.add((py as usize) * (stride as usize));
+            let border_cov = (cov_out as i32 - cov_in as i32).max(0) as u32;
+            if border_cov > 0 {
+                let border_alpha = ((border_cov * 255) / 16) as u8;
+                let dist = (px as i32 - x + py as i32 - y).clamp(0, span);
+                let ratio = (dist * 255) / span;
+                let inv = 255 - ratio;
+                let r_col = ((color_a.0 as i32 * inv + color_b.0 as i32 * ratio) / 255) as u8;
+                let g_col = ((color_a.1 as i32 * inv + color_b.1 as i32 * ratio) / 255) as u8;
+                let b_col = ((color_a.2 as i32 * inv + color_b.2 as i32 * ratio) / 255) as u8;
 
-            for px in cur_x0..cur_x1 {
-                let is_edge_x = px == cur_x0 || px == cur_x1 - 1;
-                let dx = if px < (x + t as i32 + cur_r as i32) as u32 {
-                    (x + t as i32 + cur_r as i32) - px as i32
-                } else if px >= (x + w as i32 - t as i32 - cur_r as i32) as u32 {
-                    px as i32 - (x + w as i32 - 1 - t as i32 - cur_r as i32)
-                } else {
-                    0
-                };
-
-                let should_draw = if dx == 0 && dy == 0 {
-                    is_edge_x || is_edge_y
-                } else {
-                    let d_sq = dx * dx + dy * dy;
-                    let r_sq = (cur_r * cur_r) as i32;
-                    let in_sq = if cur_r > 0 { ((cur_r - 1) * (cur_r - 1)) as i32 } else { 0 };
-                    d_sq <= r_sq && d_sq >= in_sq
-                };
-
-                if should_draw {
-                    // Linear interpolation across diagonal (px - x + py - y) / (w + h)
-                    let dist = (px as i32 - x + py as i32 - y).clamp(0, span);
-                    let ratio = (dist * 255) / span;
-                    let inv = 255 - ratio;
-                    let r_col = ((color_a.0 as i32 * inv + color_b.0 as i32 * ratio) / 255) as u8;
-                    let g_col = ((color_a.1 as i32 * inv + color_b.1 as i32 * ratio) / 255) as u8;
-                    let b_col = ((color_a.2 as i32 * inv + color_b.2 as i32 * ratio) / 255) as u8;
-                    *row_ptr.add(px as usize) = rgb(fmt, r_col, g_col, b_col);
-                }
+                let cur = *row_ptr.add(px as usize);
+                *row_ptr.add(px as usize) = blend_pixel(fmt, cur, r_col, g_col, b_col, border_alpha);
             }
         }
     }
 }
 
-/// Draws a pill button with radius = h / 2
+/// Draws a pill button with radius = h / 2 and anti-aliased edges
 pub unsafe fn draw_pill(
     buf: u64,
     stride: u32,
     screen_w: u32,
     screen_h: u32,
-    _fmt: u32,
+    fmt: u32,
     x: i32,
     y: i32,
     w: u32,
@@ -1034,13 +1304,14 @@ pub unsafe fn draw_pill(
     border_color: u32,
 ) {
     let r = h / 2;
-    fill_rounded_rect(buf, stride, screen_w, screen_h, x, y, w, h, r, bg_color);
+    fill_rounded_rect_clipped(buf, stride, screen_w, screen_h, fmt, x, y, w, h, r, bg_color, None);
     if border_color != 0 {
-        draw_rounded_rect_outline(buf, stride, screen_w, screen_h, x, y, w, h, r, border_color);
+        let (br, bg, bb) = unpack_rgb(fmt, border_color);
+        draw_gradient_border_rect(buf, stride, screen_w, screen_h, fmt, x, y, w, h, r, 1, (br, bg, bb), (br, bg, bb));
     }
 }
 
-/// Midpoint integer circle ring & progress arc (for Orbital Lockscreen)
+/// Midpoint anti-aliased circle ring (for Orbital Lockscreen)
 pub unsafe fn draw_circle_arc(
     buf: u64,
     stride: u32,
@@ -1052,31 +1323,51 @@ pub unsafe fn draw_circle_arc(
     thickness: u32,
     color: u32,
 ) {
-    if radius == 0 || thickness == 0 {
+    let (r, g, b) = unpack_rgb(1, color);
+    draw_circle_ring_aa(buf, stride, screen_w, screen_h, 1, cx, cy, radius as i32, thickness as i32, (r, g, b), 255);
+}
+
+/// Renders 8x16 font character with optional strict clipping
+pub unsafe fn draw_char_clipped(
+    buf: u64,
+    stride: u32,
+    screen_w: u32,
+    screen_h: u32,
+    x: i32,
+    y: i32,
+    c: u8,
+    color: u32,
+    clip: Option<ClipRect>,
+) {
+    let effective_clip = match clip {
+        Some(cp) => cp.intersect(&ClipRect::screen(screen_w, screen_h)),
+        None => ClipRect::screen(screen_w, screen_h),
+    };
+
+    if x + 8 <= effective_clip.x0 || y + 16 <= effective_clip.y0 || x >= effective_clip.x1 || y >= effective_clip.y1 {
         return;
     }
+
+    let glyph = get_glyph_8x16(c);
     let ptr = buf as *mut u32;
-    let r_outer = radius as i32;
-    let r_inner = (radius.saturating_sub(thickness)) as i32;
-    let r_out_sq = r_outer * r_outer;
-    let r_in_sq = r_inner * r_inner;
 
-    let y_min = (cy - r_outer).max(0) as u32;
-    let y_max = (cy + r_outer).min(screen_h as i32 - 1).max(0) as u32;
-
-    for py in y_min..=y_max {
-        let dy = py as i32 - cy;
-        let dy_sq = dy * dy;
+    for row in 0..16 {
+        let py = y + row as i32;
+        if py < effective_clip.y0 || py >= effective_clip.y1 {
+            continue;
+        }
+        let bits = glyph[row];
+        if bits == 0 {
+            continue;
+        }
         let row_ptr = ptr.add((py as usize) * (stride as usize));
 
-        let x_min = (cx - r_outer).max(0) as u32;
-        let x_max = (cx + r_outer).min(screen_w as i32 - 1).max(0) as u32;
-
-        for px in x_min..=x_max {
-            let dx = px as i32 - cx;
-            let d_sq = dx * dx + dy_sq;
-            if d_sq <= r_out_sq && d_sq >= r_in_sq {
-                *row_ptr.add(px as usize) = color;
+        for col in 0..8 {
+            let px = x + col as i32;
+            if px >= effective_clip.x0 && px < effective_clip.x1 {
+                if (bits & (0x80 >> col)) != 0 {
+                    *row_ptr.add(px as usize) = color;
+                }
             }
         }
     }
@@ -1093,28 +1384,28 @@ pub unsafe fn draw_char(
     c: u8,
     color: u32,
 ) {
-    if x + 8 <= 0 || y + 16 <= 0 || x >= screen_w as i32 || y >= screen_h as i32 {
-        return;
-    }
-    let glyph = get_glyph(c);
-    let ptr = buf as *mut u32;
+    draw_char_clipped(buf, stride, screen_w, screen_h, x, y, c, color, None);
+}
 
-    for row in 0..16 {
-        let py = y + row as i32;
-        if py < 0 || py >= screen_h as i32 {
-            continue;
+/// Draws ASCII text with optional strict clipping
+pub unsafe fn draw_text_clipped(
+    buf: u64,
+    stride: u32,
+    screen_w: u32,
+    screen_h: u32,
+    x: i32,
+    y: i32,
+    text: &str,
+    color: u32,
+    clip: Option<ClipRect>,
+) {
+    let mut cx = x;
+    for &b in text.as_bytes() {
+        if b == b'\n' {
+            break;
         }
-        let bits = glyph[row / 2];
-        let row_ptr = ptr.add((py as usize) * (stride as usize));
-
-        for col in 0..8 {
-            let px = x + col as i32;
-            if px >= 0 && px < screen_w as i32 {
-                if (bits & (0x80 >> col)) != 0 {
-                    *row_ptr.add(px as usize) = color;
-                }
-            }
-        }
+        draw_char_clipped(buf, stride, screen_w, screen_h, cx, y, b, color, clip);
+        cx += 8;
     }
 }
 
@@ -1129,14 +1420,21 @@ pub unsafe fn draw_text(
     text: &str,
     color: u32,
 ) {
-    let mut cx = x;
-    for &b in text.as_bytes() {
-        if b == b'\n' {
-            break;
-        }
-        draw_char(buf, stride, screen_w, screen_h, cx, y, b, color);
-        cx += 8;
-    }
+    draw_text_clipped(buf, stride, screen_w, screen_h, x, y, text, color, None);
+}
+
+/// Draws ASCII string (alias to draw_text)
+pub unsafe fn draw_string(
+    buf: u64,
+    stride: u32,
+    screen_w: u32,
+    screen_h: u32,
+    x: i32,
+    y: i32,
+    text: &str,
+    color: u32,
+) {
+    draw_text_clipped(buf, stride, screen_w, screen_h, x, y, text, color, None);
 }
 
 /// Measures text width in pixels (8px per char)
@@ -1379,6 +1677,68 @@ impl core::ops::Deref for StrBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_window_chrome_layout_symmetry() {
+        let win = crate::ui::Window::new(0, "Test", 100, 50, 600, 400, 1);
+        let layout = WindowChromeLayout::compute(&win);
+        // Buttons must be inside titlebar
+        assert!(layout.titlebar_rect.contains(layout.close_rect.x, layout.close_rect.y));
+        assert!(layout.titlebar_rect.contains(layout.max_rect.x, layout.max_rect.y));
+        assert!(layout.titlebar_rect.contains(layout.min_rect.x, layout.min_rect.y));
+
+        // Non-overlapping bounds from left to right: min -> max -> close
+        assert!(layout.min_rect.x + layout.min_rect.w <= layout.max_rect.x);
+        assert!(layout.max_rect.x + layout.max_rect.w <= layout.close_rect.x);
+        assert!(layout.close_rect.x + layout.close_rect.w <= 100 + 600);
+
+        // Title text origin and max width must not collide with min button
+        assert!(layout.title_x >= 100);
+        assert!(layout.title_x + layout.max_title_w <= layout.min_rect.x);
+
+        // Content viewport must be below titlebar
+        assert_eq!(layout.content_rect.x, 102);
+        assert_eq!(layout.content_rect.y, 50 + 32 + 1);
+        assert_eq!(layout.content_rect.w, 600 - 4);
+        assert_eq!(layout.content_rect.h, 400 - 32 - 3);
+    }
+
+    #[test]
+    fn test_subpixel_aa_corner_coverage() {
+        // Test 100x100 box with corner radius 10 at (0, 0)
+        // Center pixel (50, 50) is 100% inside
+        assert_eq!(coverage_rounded_rect_4x4(50, 50, 0, 0, 100, 100, 10), 16);
+        // Pixel far outside (-5, -5) is 0% inside
+        assert_eq!(coverage_rounded_rect_4x4(-5, -5, 0, 0, 100, 100, 10), 0);
+        // Outer tip pixel (0, 0) is outside the rounded corner arc
+        assert_eq!(coverage_rounded_rect_4x4(0, 0, 0, 0, 100, 100, 10), 0);
+        // Boundary corner pixel (0, 6) has smooth partial coverage (0 < hits < 16)
+        let corner_cov = coverage_rounded_rect_4x4(0, 6, 0, 0, 100, 100, 10);
+        assert!(corner_cov > 0 && corner_cov < 16);
+
+        // Test circle coverage
+        assert_eq!(coverage_circle_4x4(20, 20, 20, 20, 10), 16);
+        assert_eq!(coverage_circle_4x4(50, 50, 20, 20, 10), 0);
+        let border_cov = coverage_circle_4x4(15, 28, 20, 20, 10);
+        assert!(border_cov > 0 && border_cov < 16);
+    }
+
+    #[test]
+    fn test_clip_rect_clamping() {
+        let clip = ClipRect::new(10, 20, 50, 60);
+        assert!(clip.contains(10, 20));
+        assert!(clip.contains(49, 59));
+        assert!(!clip.contains(9, 20));
+        assert!(!clip.contains(50, 60));
+        assert!(!clip.contains(20, 70));
+
+        let other = ClipRect::new(0, 0, 30, 40);
+        let inter = clip.intersect(&other);
+        assert_eq!(inter.x0, 10);
+        assert_eq!(inter.y0, 20);
+        assert_eq!(inter.x1, 30);
+        assert_eq!(inter.y1, 40);
+    }
 
     #[test]
     fn test_all_19_themes_valid_and_distinct() {

@@ -8,7 +8,7 @@ extern crate alloc;
 
 use super::ryoku_theme::{
     draw_pill, draw_rounded_glass_panel, draw_rounded_rect_outline, draw_text, fill_rect,
-    fill_rounded_rect, measure_text, rgb, RyokuPalette, StrBuf,
+    fill_rounded_rect, measure_text, rgb, Rect, RyokuPalette, StrBuf,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -264,6 +264,73 @@ pub enum BarClickAction {
     LaunchApp(usize), // WIN_TERMINAL..WIN_AI
 }
 
+/// Unified layout geometry for the active bar and paired dock
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BarLayout {
+    pub bar_rect: Rect,
+    pub launcher_rect: Rect,
+    pub workspaces_rect: Rect,
+    pub wm_mode_rect: Rect,
+    pub clock_rect: Rect,
+    pub vitals_rect: Rect,
+    pub net_rect: Rect,
+    pub audio_rect: Rect,
+    pub capture_rect: Rect,
+    pub hub_rect: Rect,
+    pub lock_rect: Rect,
+    pub controls_rect: Rect,
+    pub dock_rect: Option<Rect>,
+}
+
+impl BarLayout {
+    pub fn compute(screen_w: u32, screen_h: u32, cfg: &BarConfig) -> Self {
+        let bar_y = if cfg.position == BarPosition::Top { 4 } else { screen_h as i32 - 38 };
+        let bar_h = 32i32;
+        let bar_rect = Rect::new(4, bar_y, screen_w as i32 - 8, bar_h);
+
+        let launcher_rect = Rect::new(6, bar_y + (bar_h - 26) / 2, 40, 26);
+        let workspaces_rect = Rect::new(52, bar_y + (bar_h - 26) / 2, 88, 26);
+        let wm_mode_rect = Rect::new(144, bar_y + (bar_h - 26) / 2, 60, 26);
+
+        let cx = screen_w as i32 / 2;
+        let clock_rect = Rect::new(cx - 90, bar_y + (bar_h - 26) / 2, 180, 26);
+
+        let rx = screen_w as i32 - 6;
+        let controls_rect = Rect::new(rx - 36, bar_y + (bar_h - 26) / 2, 36, 26);
+        let lock_rect = Rect::new(rx - 70, bar_y + (bar_h - 26) / 2, 30, 26);
+        let hub_rect = Rect::new(rx - 106, bar_y + (bar_h - 26) / 2, 32, 26);
+        let capture_rect = Rect::new(rx - 146, bar_y + (bar_h - 26) / 2, 36, 26);
+        let audio_rect = Rect::new(rx - 186, bar_y + (bar_h - 26) / 2, 36, 26);
+        let net_rect = Rect::new(rx - 230, bar_y + (bar_h - 26) / 2, 40, 26);
+        let vitals_rect = Rect::new(rx - 350, bar_y + (bar_h - 26) / 2, 116, 26);
+
+        let dock_rect = if cfg.style == BarStyle::Shima {
+            let dock_w = 340i32;
+            let dock_x = (screen_w as i32 - dock_w) / 2;
+            let dock_y = screen_h as i32 - 48;
+            Some(Rect::new(dock_x, dock_y, dock_w, 44))
+        } else {
+            None
+        };
+
+        Self {
+            bar_rect,
+            launcher_rect,
+            workspaces_rect,
+            wm_mode_rect,
+            clock_rect,
+            vitals_rect,
+            net_rect,
+            audio_rect,
+            capture_rect,
+            hub_rect,
+            lock_rect,
+            controls_rect,
+            dock_rect,
+        }
+    }
+}
+
 /// Dispatches clicks inside the top/bottom bar or Shima dock
 pub fn handle_bar_click_event(
     px: i32,
@@ -272,68 +339,56 @@ pub fn handle_bar_click_event(
     screen_h: u32,
     cfg: &BarConfig,
 ) -> BarClickAction {
-    let bar_y = if cfg.position == BarPosition::Top { 4 } else { screen_h as i32 - 40 };
+    let layout = BarLayout::compute(screen_w, screen_h, cfg);
 
     // Check Shima bottom dock click
-    if cfg.style == BarStyle::Shima {
-        let dock_y = screen_h as i32 - 48;
-        if py >= dock_y && py <= dock_y + 44 {
-            let dock_w = 340i32;
-            let dock_x = (screen_w as i32 - dock_w) / 2;
-            if px >= dock_x && px <= dock_x + dock_w {
-                let slot = (px - dock_x - 8) / 52;
-                if slot >= 0 && slot < 6 {
-                    return BarClickAction::LaunchApp(slot as usize);
-                }
+    if let Some(dock) = layout.dock_rect {
+        if dock.contains(px, py) {
+            let slot = (px - dock.x - 8) / 52;
+            if slot >= 0 && slot < 6 {
+                return BarClickAction::LaunchApp(slot as usize);
             }
         }
     }
 
-    if py < bar_y || py > bar_y + 36 {
+    if !layout.bar_rect.contains(px, py) {
         return BarClickAction::None;
     }
 
-    // Left area: Launcher pill & Workspace strip
-    if px >= 6 && px <= 46 {
+    if layout.launcher_rect.contains(px, py) {
         return BarClickAction::OpenLauncher;
     }
-    if px >= 52 && px <= 140 {
-        let ws = ((px - 52) / 22) as usize + 1;
+    if layout.workspaces_rect.contains(px, py) {
+        let ws = ((px - layout.workspaces_rect.x) / 22) as usize + 1;
         if ws >= 1 && ws <= 4 {
             return BarClickAction::SwitchWorkspace(ws);
         }
     }
-    if px >= 144 && px <= 204 {
+    if layout.wm_mode_rect.contains(px, py) {
         return BarClickAction::CycleWm;
     }
-
-    // Center area: Clock / Title
-    let cx = screen_w as i32 / 2;
-    if px >= cx - 90 && px <= cx + 90 {
+    if layout.clock_rect.contains(px, py) {
         return BarClickAction::ToggleClockPopout;
     }
-
-    // Right area: Vitals | Net | Audio | Shot | Hub | Lock | Controls
-    let rx = screen_w as i32 - 6;
-    if px >= rx - 36 && px <= rx {
+    if layout.controls_rect.contains(px, py) {
         return BarClickAction::ToggleControlsSidebar;
     }
-    if px >= rx - 70 && px <= rx - 40 {
+    if layout.lock_rect.contains(px, py) {
         return BarClickAction::OpenLock;
     }
-    if px >= rx - 106 && px <= rx - 74 {
+    if layout.hub_rect.contains(px, py) {
         return BarClickAction::OpenHub;
     }
-    if px >= rx - 146 && px <= rx - 110 {
+    if layout.capture_rect.contains(px, py) {
         return BarClickAction::OpenCapture;
     }
-    if px >= rx - 186 && px <= rx - 150 {
+    if layout.audio_rect.contains(px, py) {
         return BarClickAction::ToggleAudioPopout;
     }
-    if px >= rx - 230 && px <= rx - 190 {
+    if layout.net_rect.contains(px, py) {
         return BarClickAction::ToggleNetPopout;
     }
-    if px >= rx - 350 && px <= rx - 234 {
+    if layout.vitals_rect.contains(px, py) {
         return BarClickAction::ToggleVitalsPopout;
     }
 
